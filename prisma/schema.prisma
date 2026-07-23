@@ -49,11 +49,11 @@ model File {
 model User {
   id         Int      @id @default(autoincrement())
   role_id    Int
-  name       String   @db.VarChar(175)
-  last_name  String   @db.VarChar(175)
+  name       String   @db.VarChar(50)
+  last_name  String   @db.VarChar(50)
   dni        String   @db.VarChar(20)
-  email      String   @db.VarChar(175)
-  password   String   @db.VarChar(255)
+  email      String   @db.VarChar(75)
+  password   String   @db.Text
   file_id    Int?
   birth_date DateTime
 

@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import jwt from "jsonwebtoken";
 import prisma from "../lib/prisma";
+import { registerSchema } from "../lib/validation";
 
 const JWT_SECRET =
   process.env.JWT_SECRET || "your-secret-key-change-in-production";
@@ -135,24 +136,28 @@ authRouter.get("/verify", (req: Request, res: Response) => {
  */
 authRouter.post("/register", async (req: Request, res: Response) => {
   try {
-    const { name, last_name, dni, email, password, birth_date } =
-      req.body ?? {};
+    const validationResult = registerSchema.safeParse(req.body ?? {});
 
-    if (!name || !last_name || !dni || !email || !password || !birth_date) {
+    if (!validationResult.success) {
+      const errors: Record<string, string> = {};
+      validationResult.error.issues.forEach((err) => {
+        const path = err.path[0] as string;
+        errors[path] = err.message;
+      });
       return res
         .status(400)
-        .json({ success: false, error: "Todos los campos son requeridos" });
+        .json({ success: false, error: "Validación fallida", errors });
     }
 
+    const { name, last_name, dni, email, password, birth_date } =
+      validationResult.data;
+
+    // ponytail: solo se valida DNI duplicado (espeja a main). email no tiene @unique
+    // en el schema; si se quiere unicidad, agregar constraint + check acá.
     if (await prisma.user.findFirst({ where: { dni } })) {
       return res
         .status(409)
         .json({ success: false, error: "El DNI ya está registrado" });
-    }
-    if (await prisma.user.findFirst({ where: { email } })) {
-      return res
-        .status(409)
-        .json({ success: false, error: "El email ya está registrado" });
     }
 
     const socioRole = await prisma.role.findFirst({ where: { name: "Socio" } });

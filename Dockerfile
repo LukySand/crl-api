@@ -9,8 +9,10 @@ FROM base AS release
 COPY --from=install /usr/src/app/node_modules node_modules
 COPY . .
 RUN bunx --bun prisma generate
+RUN chmod +x ./entrypoint.sh
 
 ENV NODE_ENV=production
 USER bun
 EXPOSE 3001/tcp
-ENTRYPOINT ["bun", "run", "start"]
+# entrypoint corre migrate deploy + seed y luego arranca el server
+CMD ["./entrypoint.sh"]
