@@ -1,0 +1,32 @@
+services:
+  db:
+    image: mysql:8
+    container_name: mysql-dev
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ponytail: servicio api opcional (prod/full-docker). En dev usás `bun dev` local.
+  api:
+    build: .
+    container_name: crl-api
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "3001:3001"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  mysql_data:

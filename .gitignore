@@ -1,0 +1,9 @@
+node_modules/
+prisma/generated
+dist
+*.log
+
+# env (nunca commitear secretos)
+.env
+.env.local
+.env.*.local

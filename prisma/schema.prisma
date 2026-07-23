@@ -1,0 +1,76 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider   = "prisma-client"
+  output     = "./generated"
+  engineType = "client"
+  runtime    = "bun"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+enum RoleType {
+  Administrador
+  Profesor
+  Socio
+}
+
+model Role {
+  id   Int      @id @default(autoincrement())
+  name RoleType @unique
+
+  users User[]
+
+  @@map("roles")
+}
+
+model File {
+  id            Int      @id @default(autoincrement())
+  name          String   @db.VarChar(255)
+  created_at    DateTime
+  last_modified DateTime
+  etag          Int
+  location      String   @db.VarChar(255)
+  raw_location  String?  @db.VarChar(255)
+  optimized     Boolean  @default(false)
+  size          BigInt
+  mime          String   @db.VarChar(255)
+
+  users User[]
+
+  @@map("files")
+}
+
+model User {
+  id         Int      @id @default(autoincrement())
+  role_id    Int
+  name       String   @db.VarChar(175)
+  last_name  String   @db.VarChar(175)
+  dni        String   @db.VarChar(20)
+  email      String   @db.VarChar(175)
+  password   String   @db.VarChar(255)
+  file_id    Int?
+  birth_date DateTime
+
+  role Role  @relation(fields: [role_id], references: [id])
+  file File? @relation(fields: [file_id], references: [id])
+
+  families Family[]
+
+  @@map("users")
+}
+
+model Family {
+  id          Int     @id @default(autoincrement())
+  parent_id   Int
+  responsible Boolean @default(false) @db.TinyInt
+
+  parent User @relation(fields: [parent_id], references: [id])
+
+  @@map("families")
+}
