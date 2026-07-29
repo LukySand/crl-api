@@ -23,6 +23,7 @@
     "express": "^5.2.1",
     "google-auth-library": "^10.9.0",
     "jsonwebtoken": "^9.0.3",
+    "libphonenumber-js": "^1.13.9",
     "zod": "^4.4.3"
   },
   "devDependencies": {
