@@ -53,6 +53,7 @@ model User {
   last_name  String   @db.VarChar(50)
   dni        String   @db.VarChar(20)
   email      String   @db.VarChar(75)
+  celular    String?  @db.VarChar(20)
   password   String   @db.Text
   file_id    Int?
   birth_date DateTime

@@ -156,7 +156,7 @@ authRouter.post("/register", async (req: Request, res: Response) => {
         .json({ success: false, error: "Validación fallida", errors });
     }
 
-    const { name, last_name, dni, email, password, birth_date } =
+    const { name, last_name, dni, email, celular, password, birth_date } =
       validationResult.data;
 
     // ponytail: solo se valida DNI duplicado (espeja a main). email no tiene @unique
@@ -183,6 +183,7 @@ authRouter.post("/register", async (req: Request, res: Response) => {
         last_name,
         dni,
         email,
+        celular,
         password: hashedPassword,
         birth_date: new Date(birth_date),
         role_id: socioRole.id,
