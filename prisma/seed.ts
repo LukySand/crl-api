@@ -15,6 +15,7 @@ const prisma = new PrismaClient({ adapter });
 async function main() {
     // Crear roles
     const roles = [
+        { name: RoleType.SuperAdmin },
         { name: RoleType.Administrador },
         { name: RoleType.Profesor },
         { name: RoleType.Socio },
