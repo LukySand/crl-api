@@ -75,3 +75,25 @@ model Family {
 
   @@map("families")
 }
+
+model Log {
+  id          Int      @id @default(autoincrement())
+  topic       String
+  level       LogLevel
+  date        DateTime @default(now())
+  text        String
+  user_id     Int?
+  request_url String?
+  data        Json?
+  error       String?
+  stack_trace String?
+  metadata    Json?
+
+  @@map("logs")
+}
+
+enum LogLevel {
+  DEBUG
+  INFO
+  ERROR
+}
