@@ -243,9 +243,6 @@ export namespace Storage {
                         created_at: now,
                         last_modified: now,
                         etag: Math.floor(now.getTime() / 1000),
-                        users: {
-                            connect: { id: arg.userId },
-                        },
                         size: arg.file.size,
                         mime: fileType.mime
                     }
