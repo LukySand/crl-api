@@ -30,7 +30,7 @@ model Role {
 }
 
 model File {
-  id            Int      @id @default(autoincrement())
+  id            String   @id @default(uuid())
   name          String   @db.VarChar(255)
   created_at    DateTime
   last_modified DateTime
@@ -47,7 +47,7 @@ model File {
 }
 
 model User {
-  id         Int      @id @default(autoincrement())
+  id         String   @id @default(uuid())
   role_id    Int
   name       String   @db.VarChar(50)
   last_name  String   @db.VarChar(50)
@@ -55,7 +55,7 @@ model User {
   email      String   @db.VarChar(75)
   celular    String?  @db.VarChar(20)
   password   String   @db.Text
-  file_id    Int?
+  file_id    String?  @db.Char(128)
   birth_date DateTime
 
   role Role  @relation(fields: [role_id], references: [id])
@@ -67,8 +67,8 @@ model User {
 }
 
 model Family {
-  id          Int     @id @default(autoincrement())
-  parent_id   Int
+  id          String  @id @default(uuid())
+  parent_id   String  @db.Char(128)
   responsible Boolean @default(false) @db.TinyInt
 
   parent User @relation(fields: [parent_id], references: [id])
