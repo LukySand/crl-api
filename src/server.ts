@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import { authRouter } from "./routes/auth";
+import { adminRouter } from "./routes/admin";
 import { placesRouter } from "./routes/places";
 import { schedulesRouter } from "./routes/schedules";
 import { feesRouter } from "./routes/fees";
@@ -14,6 +15,7 @@ app.get("/api/health", (_req, res) => {
 });
 
 app.use("/api/auth", authRouter);
+app.use("/api/admin", adminRouter);
 app.use("/api/places", placesRouter);
 app.use("/api/schedules", schedulesRouter);
 app.use("/api/fees", feesRouter);

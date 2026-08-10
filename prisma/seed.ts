@@ -132,16 +132,16 @@ function dateForDayOfWeek(dayOfWeek: number, weeksAhead = 0): Date {
 }
 
 async function seedRoles() {
-  const roles = [RoleType.Administrador, RoleType.Profesor, RoleType.Socio];
+    const roles = [RoleType.SuperAdmin, RoleType.Administrador, RoleType.Profesor, RoleType.Socio];
 
-  for (const name of roles) {
-    await prisma.role.upsert({
-      where: { name },
-      update: {},
-      create: { name },
-    });
-  }
-  console.log(`Roles listos (${roles.length}).`);
+    for (const name of roles) {
+        await prisma.role.upsert({
+            where: { name },
+            update: {},
+            create: { name },
+        });
+    }
+    console.log(`Roles listos (${roles.length}).`);
 
   const rows = await prisma.role.findMany();
   return new Map<string, number>(rows.map((r) => [r.name, r.id]));
