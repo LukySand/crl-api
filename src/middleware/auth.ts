@@ -5,7 +5,7 @@ const JWT_SECRET =
   process.env.JWT_SECRET || "your-secret-key-change-in-production";
 
 export interface AuthUser {
-  id: number;
+  id: string;
   dni: string;
   email: string;
   role: string;

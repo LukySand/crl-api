@@ -111,8 +111,8 @@ adminRouter.post("/users", async (req: AuthedRequest, res: Response) => {
  */
 adminRouter.put("/users/:id", async (req: AuthedRequest, res: Response) => {
   try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) {
+    const id = req.params.id;
+    if (typeof id !== "string") {
       return res.status(400).json({ success: false, error: "ID inválido" });
     }
     const parsed = adminUpdateUserSchema.safeParse(req.body ?? {});
@@ -178,8 +178,8 @@ adminRouter.put("/users/:id", async (req: AuthedRequest, res: Response) => {
  */
 adminRouter.delete("/users/:id", async (req: AuthedRequest, res: Response) => {
   try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) {
+    const id = req.params.id;
+    if (typeof id !== "string") {
       return res.status(400).json({ success: false, error: "ID inválido" });
     }
     if (req.user?.id === id) {
