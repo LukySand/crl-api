@@ -25,6 +25,7 @@ const userSelect = {
   dni: true,
   celular: true,
   birth_date: true,
+  active: true,
   role: { select: { name: true } },
 } as const;
 
@@ -171,10 +172,9 @@ adminRouter.put("/users/:id", async (req: AuthedRequest, res: Response) => {
 });
 
 /**
- * DELETE /api/admin/users/:id — baja definitiva.
- * No podés borrarte a vos mismo; solo un SuperAdmin borra cuentas SuperAdmin.
- * ponytail: baja física. La baja lógica con reactivación es la issue #46
- * (necesita un campo `active`/`deleted_at` en el schema).
+ * DELETE /api/admin/users/:id — baja lógica (active = false), conserva el registro
+ * y su historial. No podés darte de baja a vos mismo; solo un SuperAdmin da de baja
+ * cuentas SuperAdmin. Se reactiva con PATCH /users/:id/reactivate.
  */
 adminRouter.delete("/users/:id", async (req: AuthedRequest, res: Response) => {
   try {
@@ -185,7 +185,7 @@ adminRouter.delete("/users/:id", async (req: AuthedRequest, res: Response) => {
     if (req.user?.id === id) {
       return res
         .status(400)
-        .json({ success: false, error: "No podés eliminar tu propia cuenta" });
+        .json({ success: false, error: "No podés darte de baja a vos mismo" });
     }
     const target = await prisma.user.findUnique({
       where: { id },
@@ -197,22 +197,54 @@ adminRouter.delete("/users/:id", async (req: AuthedRequest, res: Response) => {
     if (target.role.name === "SuperAdmin" && req.user?.role !== "SuperAdmin") {
       return res.status(403).json({
         success: false,
-        error: "Solo un SuperAdmin puede eliminar cuentas SuperAdmin",
+        error: "Solo un SuperAdmin puede dar de baja cuentas SuperAdmin",
       });
     }
 
-    try {
-      await prisma.user.delete({ where: { id } });
-    } catch {
-      // FK: el usuario tiene registros asociados (ej. familias)
-      return res.status(409).json({
+    const user = await prisma.user.update({
+      where: { id },
+      data: { active: false },
+      select: userSelect,
+    });
+    res.json({ success: true, user: flatten(user) });
+  } catch (error) {
+    console.error("Deactivate user error:", error);
+    res.status(500).json({ success: false, error: "Error al dar de baja al usuario" });
+  }
+});
+
+/**
+ * PATCH /api/admin/users/:id/reactivate — reactiva una cuenta dada de baja.
+ * Solo un SuperAdmin puede reactivar cuentas SuperAdmin.
+ */
+adminRouter.patch("/users/:id/reactivate", async (req: AuthedRequest, res: Response) => {
+  try {
+    const id = req.params.id;
+    if (typeof id !== "string") {
+      return res.status(400).json({ success: false, error: "ID inválido" });
+    }
+    const target = await prisma.user.findUnique({
+      where: { id },
+      include: { role: true },
+    });
+    if (!target) {
+      return res.status(404).json({ success: false, error: "Usuario no encontrado" });
+    }
+    if (target.role.name === "SuperAdmin" && req.user?.role !== "SuperAdmin") {
+      return res.status(403).json({
         success: false,
-        error: "No se puede eliminar: el usuario tiene registros asociados",
+        error: "Solo un SuperAdmin puede reactivar cuentas SuperAdmin",
       });
     }
-    res.json({ success: true });
+
+    const user = await prisma.user.update({
+      where: { id },
+      data: { active: true },
+      select: userSelect,
+    });
+    res.json({ success: true, user: flatten(user) });
   } catch (error) {
-    console.error("Delete user error:", error);
-    res.status(500).json({ success: false, error: "Error al eliminar usuario" });
+    console.error("Reactivate user error:", error);
+    res.status(500).json({ success: false, error: "Error al reactivar al usuario" });
   }
 });

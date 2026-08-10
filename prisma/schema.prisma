@@ -59,6 +59,7 @@ model User {
   password   String   @db.Text
   file_id    String?  @db.Char(128)
   birth_date DateTime
+  active     Boolean  @default(true) // baja lógica: false = dado de baja (#46)
 
   role Role  @relation(fields: [role_id], references: [id])
   file File? @relation(fields: [file_id], references: [id])
