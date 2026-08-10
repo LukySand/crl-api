@@ -58,6 +58,50 @@ const BOOKING = {
 
 const DIRECCION = "Av. Libertador 1234, Posadas, Misiones";
 
+/**
+ * Las tres canchas de ejemplo, con su grilla semanal.
+ *
+ * A partir de las 20:00 la hora sale `RECARGO_NOCHE` más cara: son dos tarifas
+ * distintas, no un cálculo. Fee es inmutable y `Schedule.fee_id` es lo que define
+ * el precio de cada turno, así que el turno de las 21 apunta a la tarifa noche y
+ * el de las 18 a la de día. Un turno que arranca 20:00 ya cuenta como noche.
+ */
+const RECARGO_NOCHE = 1000;
+const DESDE_NOCHE = "20:00";
+
+const CANCHAS = [
+    {
+        place: "Cancha de fútbol 5 «A»",
+        fee: "Cancha de fútbol 5 — 1 hora",
+        base: 12000,
+        dias: [1, 3, 5, 6], // lunes, miércoles, viernes, sábado
+        horas: ["10:00", "18:00", "19:00", "20:00", "21:00"],
+    },
+    {
+        place: "Cancha de vóley",
+        fee: "Cancha de vóley — 1 hora",
+        base: 9000,
+        dias: [2, 4, 6],
+        horas: ["18:00", "19:00", "20:00", "21:00"],
+    },
+    {
+        place: "Cancha de hockey",
+        fee: "Cancha de hockey — 1 hora",
+        base: 15000,
+        dias: [3, 5, 6],
+        horas: ["17:00", "18:00", "20:00", "21:00"],
+    },
+] as const;
+
+const esNoche = (hhmm: string) => hhmm >= DESDE_NOCHE;
+
+/** Nombre de la tarifa nocturna a partir de la diurna. */
+const feeNoche = (fee: string) => `${fee} (noche)`;
+
+/** Turnos de 1 hora: "20:00" → "21:00". */
+const horaSiguiente = (hhmm: string) =>
+    `${String(Number(hhmm.slice(0, 2)) + 1).padStart(2, "0")}:${hhmm.slice(3)}`;
+
 /** Prisma guarda TIME como DateTime: la fecha es fija, solo importa la hora. */
 function toTime(hhmm: string): Date {
     return new Date(`1970-01-01T${hhmm}:00Z`);
@@ -304,6 +348,14 @@ async function seedFamilies() {
  * seed nunca le pisa el precio a una reserva vieja que apunta a esa fila.
  */
 async function seedFees() {
+    // Una tarifa noche por cancha, derivada de la base: si cambia el recargo,
+    // se toca RECARGO_NOCHE y nada más.
+    const nocturnas = CANCHAS.map((c) => ({
+        name: feeNoche(c.fee),
+        amount: (c.base + RECARGO_NOCHE).toFixed(2),
+        description: `Tarifa a partir de las ${DESDE_NOCHE}. $${RECARGO_NOCHE.toLocaleString("es-AR")} más que la de día.`,
+    }));
+
     const fees = [
         {
             name: "Cancha de fútbol 5 — 1 hora",
@@ -341,6 +393,7 @@ async function seedFees() {
             description:
                 "Tarifa histórica, reemplazada por la de 2026. Queda para no pisar el precio de las reservas viejas.",
         },
+        ...nocturnas,
     ];
 
     const byName = new Map<string, number>();
@@ -414,19 +467,28 @@ async function seedPlaces() {
 
 /** Horarios. Acá sí hay unique natural (place_id, day_of_week, start_time) → upsert. */
 async function seedSchedules(placeIds: Map<string, number>, feeIds: Map<string, number>) {
+    // Las tres canchas de ejemplo salen generadas de CANCHAS: cada día × cada hora,
+    // con la tarifa noche si el turno arranca 20:00 o más tarde.
+    const grillaCanchas = CANCHAS.flatMap((c) =>
+        c.dias.flatMap((dia) =>
+            c.horas.map(
+                (desde): [string, string, number, string, string] => [
+                    c.place,
+                    esNoche(desde) ? feeNoche(c.fee) : c.fee,
+                    dia,
+                    desde,
+                    horaSiguiente(desde),
+                ],
+            ),
+        ),
+    );
+
     // [espacio, tarifa, día (0=domingo…6=sábado), desde, hasta]
     const schedules: [string, string, number, string, string][] = [
-        ["Cancha de fútbol 5 «A»", "Cancha de fútbol 5 — 1 hora", 1, "18:00", "19:00"],
-        ["Cancha de fútbol 5 «A»", "Cancha de fútbol 5 — 1 hora", 1, "19:00", "20:00"],
-        ["Cancha de fútbol 5 «A»", "Cancha de fútbol 5 — 1 hora", 3, "20:00", "21:00"],
-        ["Cancha de fútbol 5 «A»", "Cancha de fútbol 5 — 1 hora", 6, "10:00", "11:00"],
+        ...grillaCanchas,
         ["Cancha de fútbol 11", "Cancha de fútbol 11 — 1 hora", 2, "19:00", "20:00"],
         ["Cancha de fútbol 11", "Cancha de fútbol 11 — 1 hora", 6, "16:00", "17:00"],
         ["Cancha de fútbol 11", "Cancha de fútbol 11 — 1 hora", 0, "10:00", "11:00"],
-        ["Cancha de vóley", "Cancha de vóley — 1 hora", 2, "18:00", "19:00"],
-        ["Cancha de vóley", "Cancha de vóley — 1 hora", 4, "18:00", "19:00"],
-        ["Cancha de hockey", "Cancha de hockey — 1 hora", 3, "17:00", "18:00"],
-        ["Cancha de hockey", "Cancha de hockey — 1 hora", 5, "17:00", "18:00"],
         ["Pista de patín", "Pista de patín — 1 hora", 1, "16:00", "17:00"],
         ["Pista de patín", "Pista de patín — 1 hora", 4, "16:00", "17:00"],
         ["Salón de eventos", "Salón de eventos — turno", 6, "20:00", "23:00"],
