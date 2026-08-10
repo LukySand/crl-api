@@ -86,7 +86,7 @@ function dateForDayOfWeek(dayOfWeek: number, weeksAhead = 0): Date {
 }
 
 async function seedRoles() {
-    const roles = [RoleType.Administrador, RoleType.Profesor, RoleType.Socio];
+    const roles = [RoleType.SuperAdmin, RoleType.Administrador, RoleType.Profesor, RoleType.Socio];
 
     for (const name of roles) {
         await prisma.role.upsert({

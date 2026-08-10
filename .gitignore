@@ -7,3 +7,6 @@ dist
 .env
 .env.local
 .env.*.local
+
+# helper local para poblar datos de demo (tiene passwords de prueba)
+scripts/seed-demo-users.ts
