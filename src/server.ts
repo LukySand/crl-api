@@ -6,6 +6,7 @@ import { placesRouter } from "./routes/places";
 import { schedulesRouter } from "./routes/schedules";
 import { feesRouter } from "./routes/fees";
 import { bookingsRouter } from "./routes/bookings";
+import { disciplinesRouter } from "./routes/disciplines";
 
 const app = express();
 app.use(express.json());
@@ -20,6 +21,7 @@ app.use("/api/places", placesRouter);
 app.use("/api/schedules", schedulesRouter);
 app.use("/api/fees", feesRouter);
 app.use("/api/bookings", bookingsRouter);
+app.use("/api/disciplines", disciplinesRouter);
 
 const port = Number(process.env.PORT ?? 3001);
 app.listen(port, () => {
