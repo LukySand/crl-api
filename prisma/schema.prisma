@@ -30,7 +30,7 @@ model Role {
 }
 
 model File {
-  id            Int      @id @default(autoincrement())
+  id            String   @id @default(uuid())
   name          String   @db.VarChar(255)
   created_at    DateTime
   last_modified DateTime
@@ -41,13 +41,14 @@ model File {
   size          BigInt
   mime          String   @db.VarChar(255)
 
-  users User[]
+  users  User[]
+  places Place[]
 
   @@map("files")
 }
 
 model User {
-  id         Int      @id @default(autoincrement())
+  id         String   @id @default(uuid())
   role_id    Int
   name       String   @db.VarChar(50)
   last_name  String   @db.VarChar(50)
@@ -55,23 +56,102 @@ model User {
   email      String   @db.VarChar(75)
   celular    String?  @db.VarChar(20)
   password   String   @db.Text
-  file_id    Int?
+  file_id    String?  @db.Char(128)
   birth_date DateTime
 
   role Role  @relation(fields: [role_id], references: [id])
   file File? @relation(fields: [file_id], references: [id])
 
   families Family[]
+  bookings Booking[]
 
   @@map("users")
 }
 
 model Family {
-  id          Int     @id @default(autoincrement())
-  parent_id   Int
+  id          String  @id @default(uuid())
+  parent_id   String  @db.Char(128)
   responsible Boolean @default(false) @db.TinyInt
 
   parent User @relation(fields: [parent_id], references: [id])
 
   @@map("families")
+}
+
+enum BookingStatus {
+  Pendiente
+  Confirmada
+  Cancelada
+}
+
+// ponytail: inmutable — no hay endpoint de update. Cambiar precio = crear una
+// fila nueva y repuntar Schedule.fee_id. Así el historial de Booking (que
+// guarda su propio fee_id) nunca queda pisado por un cambio de precio.
+model Fee {
+  id          Int      @id @default(autoincrement())
+  name        String   @db.VarChar(255)
+  amount      Decimal  @db.Decimal(10, 2)
+  description String?  @db.Text
+  created_at  DateTime @default(now())
+
+  schedules Schedule[]
+  bookings  Booking[]
+
+  @@map("fees")
+}
+
+model Place {
+  id          Int     @id @default(autoincrement())
+  name        String  @db.VarChar(255)
+  address     String? @db.VarChar(170)
+  capacity    Int?    @db.SmallInt
+  description String? @db.Text
+  file_id     String? @db.Char(128)
+
+  file      File?      @relation(fields: [file_id], references: [id])
+  schedules Schedule[]
+
+  @@map("places")
+}
+
+model Schedule {
+  id          Int      @id @default(autoincrement())
+  place_id    Int
+  fee_id      Int
+  day_of_week Int      @db.UnsignedTinyInt // 0=domingo … 6=sábado
+  start_time  DateTime @db.Time()
+  end_time    DateTime @db.Time()
+
+  place    Place     @relation(fields: [place_id], references: [id])
+  fee      Fee       @relation(fields: [fee_id], references: [id])
+  bookings Booking[]
+
+  @@unique([place_id, day_of_week, start_time])
+  @@map("schedules")
+}
+
+model Booking {
+  id          String        @id @default(uuid())
+  schedule_id Int
+  fee_id      Int
+  user_id     String        @db.Char(128)
+  date        DateTime      @db.Date
+  status      BookingStatus @default(Pendiente)
+  notes       String?       @db.Text
+  created_at  DateTime      @default(now())
+
+  // ponytail: true mientras la reserva está viva (Pendiente/Confirmada), NULL
+  // al cancelar. MySQL no soporta índices únicos parciales, pero sí ignora
+  // NULL en índices únicos — por eso una reserva cancelada libera el turno
+  // sola sin dejar de existir la fila (se conserva el historial). El código
+  // que cancela es el único que toca este campo: siempre en el mismo update
+  // que pone status = Cancelada, así nunca queda desincronizado.
+  active Boolean?
+
+  schedule Schedule @relation(fields: [schedule_id], references: [id])
+  fee      Fee      @relation(fields: [fee_id], references: [id])
+  user     User     @relation(fields: [user_id], references: [id])
+
+  @@unique([schedule_id, date, active])
+  @@map("bookings")
 }
