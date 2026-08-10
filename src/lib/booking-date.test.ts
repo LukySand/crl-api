@@ -1,10 +1,17 @@
-// ponytail: el único bicho real de este modelo es que la fecha caiga en un día de
-// semana distinto al del turno, y que el huso del server corra el día. Se testea eso.
+// ponytail: los bichos reales de este modelo son de huso horario — que la fecha
+// caiga en otro día de semana, o que "hoy" se corra si el server no está en
+// Argentina. Se testea eso, no los getters.
 import { expect, test } from "bun:test";
-import { parseDate, todayUTC, matchesDayOfWeek } from "./booking-date";
+import {
+  parseDate,
+  matchesDayOfWeek,
+  timeToHHMM,
+  todayInClub,
+  nowTimeInClub,
+} from "./booking-date";
 
 test("parsea en UTC, sin correrse por el huso del server", () => {
-  // En Argentina (UTC-3) un parseo local daría el 9 a las 21:00 → getDay() = domingo
+  // Un parseo local en Argentina (UTC-3) daría el 9 a las 21:00 → domingo
   const d = parseDate("2026-08-10");
   expect(d.toISOString()).toBe("2026-08-10T00:00:00.000Z");
   expect(d.getUTCDay()).toBe(1); // lunes
@@ -22,14 +29,25 @@ test("domingo es 0 y sábado 6", () => {
   expect(parseDate("2026-08-15").getUTCDay()).toBe(6);
 });
 
-test("todayUTC queda a medianoche, así una reserva de hoy no cuenta como pasada", () => {
-  const t = todayUTC();
-  expect(t.getUTCHours()).toBe(0);
-  expect(t.getUTCMinutes()).toBe(0);
-  expect(t.getUTCSeconds()).toBe(0);
-  expect(t.getUTCMilliseconds()).toBe(0);
-});
-
 test("una fecha inválida da NaN (el endpoint la rechaza)", () => {
   expect(Number.isNaN(parseDate("2026-13-45").getTime())).toBe(true);
+});
+
+test("timeToHHMM saca la hora del TIME de Prisma", () => {
+  expect(timeToHHMM(new Date("1970-01-01T18:00:00Z"))).toBe("18:00");
+  expect(timeToHHMM(new Date("1970-01-01T08:30:00Z"))).toBe("08:30");
+});
+
+test("todayInClub devuelve YYYY-MM-DD comparable como string", () => {
+  const hoy = todayInClub();
+  expect(hoy).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  // El orden lexicográfico tiene que coincidir con el cronológico
+  expect("2026-08-09" < "2026-08-10").toBe(true);
+});
+
+test("nowTimeInClub devuelve HH:MM de 24h con cero adelante", () => {
+  const ahora = nowTimeInClub();
+  expect(ahora).toMatch(/^([01]\d|2[0-3]):[0-5]\d$/);
+  // Comparar horarios como string sólo funciona con el cero adelante
+  expect("08:00" < "16:00").toBe(true);
 });
