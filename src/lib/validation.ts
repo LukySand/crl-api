@@ -60,3 +60,23 @@ export const registerSchema = z.object({
 });
 
 export type RegisterData = z.infer<typeof registerSchema>;
+
+// ── Admin: alta/edición de usuarios con rol ─────────────────────────────
+export const roleSchema = z.enum([
+  "SuperAdmin",
+  "Administrador",
+  "Profesor",
+  "Socio",
+]);
+
+// Alta por admin: como el registro pero con rol elegido y celular opcional
+// (permite crear staff sin teléfono).
+export const adminCreateUserSchema = registerSchema.extend({
+  role: roleSchema,
+  celular: celularSchema.optional(),
+});
+
+// Edición: igual, pero la contraseña es opcional (vacío = no cambiarla).
+export const adminUpdateUserSchema = adminCreateUserSchema.extend({
+  password: passwordSchema.optional(),
+});

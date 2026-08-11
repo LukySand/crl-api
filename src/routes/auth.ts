@@ -1,40 +1,14 @@
 import { Router, type Request, type Response } from "express";
-import jwt from "jsonwebtoken";
 import { OAuth2Client } from "google-auth-library";
 import prisma from "../lib/prisma";
 import { registerSchema } from "../lib/validation";
-
-const JWT_SECRET =
-  process.env.JWT_SECRET || "your-secret-key-change-in-production";
+import { readToken, signToken, type JWTPayload } from "../lib/auth";
 
 const GOOGLE_CLIENT_ID = process.env.OAUTH_ID || "";
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 // Solo dni + birth_date (name/last_name vienen de Google, no hay password del cliente)
 const googleProfileSchema = registerSchema.pick({ dni: true, birth_date: true });
-
-interface JWTPayload {
-  id: number;
-  dni: string;
-  email: string;
-  role: string;
-  name: string;
-  last_name: string;
-}
-
-/** Obtener valor de una cookie desde el header */
-function getCookieFromHeader(
-  cookieHeader: string | undefined,
-  name: string,
-): string | null {
-  if (!cookieHeader) return null;
-  for (let cookie of cookieHeader.split(";")) {
-    cookie = cookie.trim();
-    const [key, value] = cookie.split("=");
-    if (key === name && value) return decodeURIComponent(value);
-  }
-  return null;
-}
 
 export const authRouter = Router();
 
@@ -70,6 +44,13 @@ authRouter.post("/login", async (req: Request, res: Response) => {
         .json({ success: false, error: "Contraseña incorrecta" });
     }
 
+    if (!user.active) {
+      return res.status(403).json({
+        success: false,
+        error: "Tu cuenta fue dada de baja. Contactá al club.",
+      });
+    }
+
     const jwtPayload: JWTPayload = {
       id: user.id,
       dni: user.dni,
@@ -78,7 +59,7 @@ authRouter.post("/login", async (req: Request, res: Response) => {
       name: user.name,
       last_name: user.last_name,
     };
-    const token = jwt.sign(jwtPayload, JWT_SECRET, { expiresIn: "24h" });
+    const token = signToken(jwtPayload);
 
     return res.status(200).json({ success: true, token, user: jwtPayload });
   } catch (error) {
@@ -95,40 +76,24 @@ authRouter.post("/login", async (req: Request, res: Response) => {
  */
 authRouter.get("/verify", (req: Request, res: Response) => {
   try {
-    let token: string | null = null;
-
-    const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith("Bearer ")) {
-      token = authHeader.slice(7);
-    }
-    if (!token) {
-      token = getCookieFromHeader(req.headers.cookie, "auth_token");
-    }
-
-    if (!token) {
-      return res
-        .status(401)
-        .json({ success: false, error: "No token provided" });
-    }
-
-    try {
-      const payload = jwt.verify(token, JWT_SECRET) as JWTPayload;
-      return res.status(200).json({
-        success: true,
-        user: {
-          id: payload.id,
-          dni: payload.dni,
-          email: payload.email,
-          role: payload.role,
-          name: payload.name,
-          last_name: payload.last_name,
-        },
-      });
-    } catch {
+    const payload = readToken(req);
+    if (!payload) {
       return res
         .status(401)
         .json({ success: false, error: "Invalid or expired token" });
     }
+
+    return res.status(200).json({
+      success: true,
+      user: {
+        id: payload.id,
+        dni: payload.dni,
+        email: payload.email,
+        role: payload.role,
+        name: payload.name,
+        last_name: payload.last_name,
+      },
+    });
   } catch (error) {
     console.error("Verify token error:", error);
     return res
@@ -199,7 +164,7 @@ authRouter.post("/register", async (req: Request, res: Response) => {
       name: newUser.name,
       last_name: newUser.last_name,
     };
-    const token = jwt.sign(jwtPayload, JWT_SECRET, { expiresIn: "24h" });
+    const token = signToken(jwtPayload);
 
     return res.status(201).json({ success: true, token, user: jwtPayload });
   } catch (error) {
@@ -275,6 +240,13 @@ authRouter.post("/google", async (req: Request, res: Response) => {
     });
     let created = false;
 
+    if (user && !user.active) {
+      return res.status(403).json({
+        success: false,
+        error: "Tu cuenta fue dada de baja. Contactá al club.",
+      });
+    }
+
     if (!user) {
       // Alta: faltan dni/birth_date → el front los pide y reintenta con el mismo credential
       if (!dni || !birth_date) {
@@ -335,7 +307,7 @@ authRouter.post("/google", async (req: Request, res: Response) => {
       name: user.name,
       last_name: user.last_name,
     };
-    const token = jwt.sign(jwtPayload, JWT_SECRET, { expiresIn: "24h" });
+    const token = signToken(jwtPayload);
 
     return res
       .status(created ? 201 : 200)
