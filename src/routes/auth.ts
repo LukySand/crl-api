@@ -144,12 +144,15 @@ authRouter.post("/register", async (req: Request, res: Response) => {
     const { name, last_name, dni, email, celular, password, birth_date } =
       validationResult.data;
 
-    // ponytail: solo se valida DNI duplicado (espeja a main). email no tiene @unique
-    // en el schema; si se quiere unicidad, agregar constraint + check acá.
     if (await prisma.user.findFirst({ where: { dni } })) {
       return res
         .status(409)
         .json({ success: false, error: "El DNI ya está registrado" });
+    }
+    if (await prisma.user.findFirst({ where: { email } })) {
+      return res
+        .status(409)
+        .json({ success: false, error: "El email ya está registrado" });
     }
 
     const socioRole = await prisma.role.findFirst({ where: { name: "Socio" } });
@@ -187,7 +190,13 @@ authRouter.post("/register", async (req: Request, res: Response) => {
     const token = signToken(jwtPayload);
 
     return res.status(201).json({ success: true, token, user: jwtPayload });
-  } catch (error) {
+  } catch (error: any) {
+    // Red de seguridad ante una carrera: el @unique de email corta acá.
+    if (error?.code === "P2002") {
+      return res
+        .status(409)
+        .json({ success: false, error: "El email ya está registrado" });
+    }
     console.error("Register error:", error);
     return res
       .status(500)

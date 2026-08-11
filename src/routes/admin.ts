@@ -9,6 +9,7 @@ import {
   adminCreateUserSchema,
   adminUpdateUserSchema,
 } from "../lib/validation";
+import { parseDate, todayInClub } from "../lib/booking-date";
 import type { ZodError } from "zod";
 
 export const adminRouter = Router();
@@ -84,6 +85,11 @@ adminRouter.post("/users", async (req: AuthedRequest, res: Response) => {
         .status(409)
         .json({ success: false, error: "El DNI ya está registrado" });
     }
+    if (await prisma.user.findFirst({ where: { email: rest.email } })) {
+      return res
+        .status(409)
+        .json({ success: false, error: "El email ya está registrado" });
+    }
     const roleRow = await prisma.role.findFirst({ where: { name: role } });
     if (!roleRow) {
       return res.status(400).json({ success: false, error: "Rol inválido" });
@@ -100,7 +106,11 @@ adminRouter.post("/users", async (req: AuthedRequest, res: Response) => {
       select: userSelect,
     });
     res.status(201).json({ success: true, user: flatten(user) });
-  } catch (error) {
+  } catch (error: any) {
+    // Red de seguridad ante una carrera: el @unique de email también corta acá.
+    if (error?.code === "P2002") {
+      return res.status(409).json({ success: false, error: "El email ya está registrado" });
+    }
     console.error("Create user error:", error);
     res.status(500).json({ success: false, error: "Error al crear usuario" });
   }
@@ -148,6 +158,14 @@ adminRouter.put("/users/:id", async (req: AuthedRequest, res: Response) => {
         .status(409)
         .json({ success: false, error: "El DNI ya está registrado" });
     }
+    const dupEmail = await prisma.user.findFirst({
+      where: { email: rest.email, NOT: { id } },
+    });
+    if (dupEmail) {
+      return res
+        .status(409)
+        .json({ success: false, error: "El email ya está registrado" });
+    }
     const roleRow = await prisma.role.findFirst({ where: { name: role } });
     if (!roleRow) {
       return res.status(400).json({ success: false, error: "Rol inválido" });
@@ -165,7 +183,10 @@ adminRouter.put("/users/:id", async (req: AuthedRequest, res: Response) => {
       select: userSelect,
     });
     res.json({ success: true, user: flatten(user) });
-  } catch (error) {
+  } catch (error: any) {
+    if (error?.code === "P2002") {
+      return res.status(409).json({ success: false, error: "El email ya está registrado" });
+    }
     console.error("Update user error:", error);
     res.status(500).json({ success: false, error: "Error al editar usuario" });
   }
@@ -175,6 +196,11 @@ adminRouter.put("/users/:id", async (req: AuthedRequest, res: Response) => {
  * DELETE /api/admin/users/:id — baja lógica (active = false), conserva el registro
  * y su historial. No podés darte de baja a vos mismo; solo un SuperAdmin da de baja
  * cuentas SuperAdmin. Se reactiva con PATCH /users/:id/reactivate.
+ *
+ * Además, al dar de baja se le cancelan las reservas de hoy en adelante (mismo
+ * criterio que cancelar una reserva: status = Cancelada y active = null, así se
+ * libera el turno pero queda el historial). Las pasadas no se tocan. Va todo en
+ * una transacción para que no quede a medias.
  */
 adminRouter.delete("/users/:id", async (req: AuthedRequest, res: Response) => {
   try {
@@ -201,12 +227,20 @@ adminRouter.delete("/users/:id", async (req: AuthedRequest, res: Response) => {
       });
     }
 
-    const user = await prisma.user.update({
-      where: { id },
-      data: { active: false },
-      select: userSelect,
-    });
-    res.json({ success: true, user: flatten(user) });
+    const hoy = parseDate(todayInClub());
+    const [user, canceladas] = await prisma.$transaction([
+      prisma.user.update({
+        where: { id },
+        data: { active: false },
+        select: userSelect,
+      }),
+      // Cancela las reservas de hoy en adelante que sigan vivas.
+      prisma.booking.updateMany({
+        where: { user_id: id, date: { gte: hoy }, status: { not: "Cancelada" } },
+        data: { status: "Cancelada", active: null },
+      }),
+    ]);
+    res.json({ success: true, user: flatten(user), reservasCanceladas: canceladas.count });
   } catch (error) {
     console.error("Deactivate user error:", error);
     res.status(500).json({ success: false, error: "Error al dar de baja al usuario" });
