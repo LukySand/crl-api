@@ -74,7 +74,7 @@ authRouter.post("/login", async (req: Request, res: Response) => {
  * GET /api/auth/verify — valida el token (header Authorization o cookie auth_token).
  * 200 { success, user } | 401 token inválido
  */
-authRouter.get("/verify", (req: Request, res: Response) => {
+authRouter.get("/verify", async (req: Request, res: Response) => {
   try {
     const payload = readToken(req);
     if (!payload) {
@@ -83,17 +83,37 @@ authRouter.get("/verify", (req: Request, res: Response) => {
         .json({ success: false, error: "Invalid or expired token" });
     }
 
-    return res.status(200).json({
-      success: true,
-      user: {
-        id: payload.id,
-        dni: payload.dni,
-        email: payload.email,
-        role: payload.role,
-        name: payload.name,
-        last_name: payload.last_name,
-      },
+    // Rol fresco desde la DB, no del token: así un cambio de rol (o una baja)
+    // hecho en la DB — p. ej. desde Prisma Studio — se refleja sin re-login. Se
+    // re-emite el token con el rol actual para que requireRole (que lee del
+    // token) autorice con ese rol, y front y back queden consistentes.
+    const user = await prisma.user.findUnique({
+      where: { id: payload.id },
+      include: { role: true },
     });
+    if (!user) {
+      return res
+        .status(401)
+        .json({ success: false, error: "Usuario no encontrado" });
+    }
+    if (!user.active) {
+      return res.status(403).json({
+        success: false,
+        error: "Tu cuenta fue dada de baja. Contactá al club.",
+      });
+    }
+
+    const fresh: JWTPayload = {
+      id: user.id,
+      dni: user.dni,
+      email: user.email,
+      role: user.role.name,
+      name: user.name,
+      last_name: user.last_name,
+    };
+    const token = signToken(fresh);
+
+    return res.status(200).json({ success: true, token, user: fresh });
   } catch (error) {
     console.error("Verify token error:", error);
     return res
