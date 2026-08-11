@@ -71,7 +71,7 @@ const DESDE_NOCHE = "20:00";
 
 const CANCHAS = [
   {
-    place: "Cancha de fútbol 5",
+    place: "Cancha de fútbol 5 «A»",
     fee: "Cancha de fútbol 5 — 1 hora",
     base: 12000,
     dias: [1, 3, 5, 6], // lunes, miércoles, viernes, sábado
