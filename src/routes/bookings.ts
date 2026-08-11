@@ -138,7 +138,14 @@ bookingsRouter.get("/:id", async (req: Request<{ id: string }>, res: Response) =
   }
 });
 
-/** POST /api/bookings — reserva un turno para una fecha. El socio sale del token. */
+/**
+ * POST /api/bookings — reserva un turno para una fecha.
+ *
+ * El socio reserva para sí mismo, a la tarifa del turno y siempre en Pendiente.
+ * La gestión puede además: reservar a nombre de otro (`user_id`), fijar una tarifa
+ * distinta (`fee_id`) y dejarla ya paga (`status`). Los tres campos se rechazan
+ * con 403 si los manda alguien sin rol de gestión.
+ */
 bookingsRouter.post("/", async (req: Request, res: Response) => {
   try {
     const parsed = createSchema.safeParse(req.body ?? {});
@@ -151,10 +158,49 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
     }
 
     const { schedule_id, date, notes } = parsed.data;
+    const admin = isAdmin(req);
     const when = parseDate(date);
 
     if (Number.isNaN(when.getTime())) {
       return res.status(400).json({ success: false, error: "Fecha inválida" });
+    }
+
+    // ── Campos de gestión ────────────────────────────────────────────────
+    // Un socio que manda cualquiera de los tres recibe 403. No se ignoran en
+    // silencio: es un intento de reservar por otro o de elegirse el precio.
+    if (!admin) {
+      if (parsed.data.user_id && parsed.data.user_id !== req.user!.id) {
+        return res
+          .status(403)
+          .json({ success: false, error: "No podés reservar a nombre de otro socio" });
+      }
+      if (parsed.data.fee_id !== undefined) {
+        return res
+          .status(403)
+          .json({ success: false, error: "No podés elegir la tarifa de la reserva" });
+      }
+      if (parsed.data.status !== undefined) {
+        return res
+          .status(403)
+          .json({ success: false, error: "No podés fijar el estado de la reserva" });
+      }
+    }
+
+    let userId = req.user!.id;
+    if (admin && parsed.data.user_id) {
+      const socio = await prisma.user.findUnique({
+        where: { id: parsed.data.user_id },
+        select: { id: true, active: true },
+      });
+      if (!socio) {
+        return res.status(404).json({ success: false, error: "El socio indicado no existe" });
+      }
+      if (!socio.active) {
+        return res
+          .status(409)
+          .json({ success: false, error: "El socio está dado de baja" });
+      }
+      userId = socio.id;
     }
 
     const hoy = todayInClub();
@@ -164,12 +210,12 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
 
     // Tope hacia adelante: 3 semanas para el socio, 6 meses para la gestión.
     const tope = ultimaFechaReservable(
-      isAdmin(req) ? DIAS_ADELANTE_ADMIN : DIAS_ADELANTE_SOCIO,
+      admin ? DIAS_ADELANTE_ADMIN : DIAS_ADELANTE_SOCIO,
     );
     if (date > tope) {
       return res.status(400).json({
         success: false,
-        error: isAdmin(req)
+        error: admin
           ? "No se puede reservar con más de 6 meses de anticipación"
           : "No se puede reservar con más de 3 semanas de anticipación",
       });
@@ -206,15 +252,30 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
       });
     }
 
+    // Snapshot de la tarifa. Por defecto sale del turno, no del cliente: si no,
+    // cualquiera reservaría el salón a precio de cancha. La gestión sí puede
+    // pisarla (tarifa especial, evento, socio con descuento).
+    let feeId = schedule.fee_id;
+    if (admin && parsed.data.fee_id !== undefined) {
+      const fee = await prisma.fee.findUnique({
+        where: { id: parsed.data.fee_id },
+        select: { id: true },
+      });
+      if (!fee) {
+        return res.status(400).json({ success: false, error: "La tarifa indicada no existe" });
+      }
+      feeId = fee.id;
+    }
+
     const booking = await prisma.booking.create({
       data: {
         schedule_id,
-        // Snapshot de la tarifa vigente. Sale del schedule, no del cliente:
-        // si no, cualquiera reservaría el salón a precio de cancha.
-        fee_id: schedule.fee_id,
-        user_id: req.user!.id,
+        fee_id: feeId,
+        user_id: userId,
         date: when,
         notes,
+        // La gestión puede darla por paga en el acto (cobró en el club).
+        ...(admin && parsed.data.status ? { status: parsed.data.status } : {}),
         active: true,
       },
       include: bookingInclude,

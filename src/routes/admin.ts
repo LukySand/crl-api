@@ -22,6 +22,7 @@ const userSelect = {
   celular: true,
   birth_date: true,
   active: true,
+  file_id: true, // para mostrar la foto en los listados y buscadores
   role: { select: { name: true } },
 } as const;
 

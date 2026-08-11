@@ -7,10 +7,18 @@ export const schedulesRouter = Router();
 
 const TIME = /^([01]\d|2[0-3]):[0-5]\d$/; // HH:MM 24h
 
+// El precio del turno se manda como monto, no como fee_id: quien carga horarios
+// piensa en "la hora sale $12.000", no en elegir una fila de tarifas. La tarifa la
+// resuelve findOrCreateFee.
+const amountSchema = z.coerce
+  .number()
+  .positive("El precio debe ser mayor a cero")
+  .max(99_999_999.99, "El precio es demasiado grande");
+
 const scheduleSchema = z
   .object({
     place_id: z.number().int().positive(),
-    fee_id: z.number().int().positive(),
+    amount: amountSchema,
     day_of_week: z.number().int().min(0, "0=domingo").max(6, "6=sábado"),
     start_time: z.string().regex(TIME, "Formato de hora inválido (HH:MM)"),
     end_time: z.string().regex(TIME, "Formato de hora inválido (HH:MM)"),
@@ -21,7 +29,7 @@ const scheduleSchema = z
   });
 
 const scheduleUpdateSchema = z.object({
-  fee_id: z.number().int().positive().optional(),
+  amount: amountSchema.optional(),
   day_of_week: z.number().int().min(0).max(6).optional(),
   start_time: z.string().regex(TIME, "Formato de hora inválido (HH:MM)").optional(),
   end_time: z.string().regex(TIME, "Formato de hora inválido (HH:MM)").optional(),
@@ -30,6 +38,44 @@ const scheduleUpdateSchema = z.object({
 /** Prisma guarda TIME como DateTime; usamos una fecha fija y solo importa la hora. */
 function toTime(hhmm: string): Date {
   return new Date(`1970-01-01T${hhmm}:00Z`);
+}
+
+/**
+ * Devuelve el id de una tarifa con ese monto **para ese espacio**: reusa la que ya
+ * esté en otro turno del mismo lugar, o crea una nueva con el nombre del lugar.
+ *
+ * Va en el backend y no en el front porque si no serían dos viajes (buscar y después
+ * crear) con una carrera en el medio: dos admins cargando el mismo precio a la vez
+ * terminarían con dos tarifas iguales.
+ *
+ * Acotado al espacio a propósito: buscando por monto solo, un turno de vóley a 9000
+ * podía terminar apuntando a "Cancha de fútbol 5 — 1 hora (2025)" (misma plata, otro
+ * lugar) y el nombre quedaba sin sentido.
+ */
+async function findOrCreateFee(amount: number, placeId: number): Promise<number> {
+  const place = await prisma.place.findUnique({
+    where: { id: placeId },
+    select: { name: true },
+  });
+  if (!place) throw Object.assign(new Error("place-not-found"), { code: "P2003" });
+
+  const enEstePlace = await prisma.schedule.findFirst({
+    where: { place_id: placeId, fee: { amount } },
+    orderBy: { fee: { created_at: "desc" } },
+    select: { fee_id: true },
+  });
+  if (enEstePlace) return enEstePlace.fee_id;
+
+  const creada = await prisma.fee.create({
+    data: {
+      // Nombre derivado del lugar y el monto: nadie lo elige, tiene que ser predecible.
+      name: `${place.name} — $${amount.toLocaleString("es-AR")}`,
+      amount,
+      description: "Creada automáticamente al cargar un horario.",
+    },
+    select: { id: true },
+  });
+  return creada.id;
 }
 
 function validationError(res: Response, error: z.ZodError) {
@@ -92,12 +138,12 @@ schedulesRouter.post(
       const parsed = scheduleSchema.safeParse(req.body ?? {});
       if (!parsed.success) return validationError(res, parsed.error);
 
-      const { place_id, fee_id, day_of_week, start_time, end_time } = parsed.data;
+      const { place_id, amount, day_of_week, start_time, end_time } = parsed.data;
 
       const schedule = await prisma.schedule.create({
         data: {
           place_id,
-          fee_id,
+          fee_id: await findOrCreateFee(amount, place_id),
           day_of_week,
           start_time: toTime(start_time),
           end_time: toTime(end_time),
@@ -123,7 +169,12 @@ schedulesRouter.post(
   },
 );
 
-/** PATCH /api/schedules/:id — Solo Administrador. Repuntar fee_id acá es cómo se cambia el precio. */
+/**
+ * PATCH /api/schedules/:id — Solo Administrador.
+ *
+ * Cambiar `amount` repunta el turno a otra tarifa (reusada o nueva). Las reservas
+ * ya hechas guardan su propio fee_id, así que conservan el precio que se les cobró.
+ */
 schedulesRouter.patch(
   "/:id",
   requireAuth,
@@ -138,12 +189,26 @@ schedulesRouter.patch(
       const parsed = scheduleUpdateSchema.safeParse(req.body ?? {});
       if (!parsed.success) return validationError(res, parsed.error);
 
-      const { fee_id, day_of_week, start_time, end_time } = parsed.data;
+      const { amount, day_of_week, start_time, end_time } = parsed.data;
+
+      // La tarifa se resuelve dentro del espacio del turno, así que hace falta
+      // saber a qué espacio pertenece antes de tocar el precio.
+      let feeId: number | undefined;
+      if (amount !== undefined) {
+        const actual = await prisma.schedule.findUnique({
+          where: { id },
+          select: { place_id: true },
+        });
+        if (!actual) {
+          return res.status(404).json({ success: false, error: "Horario no encontrado" });
+        }
+        feeId = await findOrCreateFee(amount, actual.place_id);
+      }
 
       const schedule = await prisma.schedule.update({
         where: { id },
         data: {
-          ...(fee_id !== undefined && { fee_id }),
+          ...(feeId !== undefined && { fee_id: feeId }),
           ...(day_of_week !== undefined && { day_of_week }),
           ...(start_time !== undefined && { start_time: toTime(start_time) }),
           ...(end_time !== undefined && { end_time: toTime(end_time) }),
