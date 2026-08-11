@@ -160,6 +160,11 @@ disciplinesRouter.patch(
 /**
  * DELETE /api/disciplines/:id — baja lógica (active=false). No se borra: conserva
  * el registro y no orfana horarios/reservas. Se reactiva con PATCH /:id/reactivate.
+ *
+ * Al darla de baja se **desinscribe a todos los socios** (baja lógica de la
+ * inscripción: active=null + left_at), porque la disciplina deja de estar
+ * disponible. El aviso a los socios se maneja por fuera de la app. Va en una
+ * transacción junto con la baja. Reactivar la disciplina NO los re-inscribe.
  */
 disciplinesRouter.delete(
   "/:id",
@@ -171,12 +176,18 @@ disciplinesRouter.delete(
       if (!Number.isInteger(id)) {
         return res.status(400).json({ success: false, error: "ID inválido" });
       }
-      const discipline = await prisma.discipline.update({
-        where: { id },
-        data: { active: false },
-        include: disciplineInclude,
-      });
-      return res.json({ success: true, discipline });
+      const [discipline, desinscriptos] = await prisma.$transaction([
+        prisma.discipline.update({
+          where: { id },
+          data: { active: false },
+          include: disciplineInclude,
+        }),
+        prisma.enrollment.updateMany({
+          where: { discipline_id: id, active: true },
+          data: { active: null, left_at: new Date() },
+        }),
+      ]);
+      return res.json({ success: true, discipline, desinscriptos: desinscriptos.count });
     } catch (error: any) {
       if (error?.code === "P2025") {
         return res.status(404).json({ success: false, error: "Disciplina no encontrada" });
