@@ -4,7 +4,7 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
-import { requireAuth, requireRole } from "../lib/auth";
+import { requireAuth, requireAdmin } from "../lib/auth";
 
 export const feesRouter = Router();
 
@@ -51,7 +51,7 @@ feesRouter.get("/:id", async (req: Request, res: Response) => {
 feesRouter.post(
   "/",
   requireAuth,
-  requireRole("Administrador"),
+  requireAdmin,
   async (req: Request, res: Response) => {
     try {
       const parsed = feeSchema.safeParse(req.body ?? {});

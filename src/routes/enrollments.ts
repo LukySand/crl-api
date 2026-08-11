@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
-import { requireAuth } from "../lib/auth";
+import { requireAuth, isAdmin } from "../lib/auth";
 
 export const enrollmentsRouter = Router();
 
@@ -28,8 +28,6 @@ const enrollmentInclude = {
   },
   user: { select: { id: true, name: true, last_name: true, dni: true } },
 } as const;
-
-const isAdmin = (req: Request) => req.user?.role === "Administrador";
 
 function validationError(res: Response, error: z.ZodError) {
   const errors: Record<string, string> = {};

@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
-import { requireAuth, requireRole } from "../lib/auth";
+import { requireAuth, requireAdmin } from "../lib/auth";
 
 export const disciplinesRouter = Router();
 
@@ -84,7 +84,7 @@ disciplinesRouter.get("/:id", async (req: Request, res: Response) => {
 disciplinesRouter.post(
   "/",
   requireAuth,
-  requireRole("Administrador"),
+  requireAdmin,
   async (req: Request, res: Response) => {
     try {
       const parsed = disciplineSchema.safeParse(req.body ?? {});
@@ -121,7 +121,7 @@ disciplinesRouter.post(
 disciplinesRouter.patch(
   "/:id",
   requireAuth,
-  requireRole("Administrador"),
+  requireAdmin,
   async (req: Request, res: Response) => {
     try {
       const id = Number(req.params.id);
@@ -164,7 +164,7 @@ disciplinesRouter.patch(
 disciplinesRouter.delete(
   "/:id",
   requireAuth,
-  requireRole("Administrador"),
+  requireAdmin,
   async (req: Request, res: Response) => {
     try {
       const id = Number(req.params.id);
@@ -191,7 +191,7 @@ disciplinesRouter.delete(
 disciplinesRouter.patch(
   "/:id/reactivate",
   requireAuth,
-  requireRole("Administrador"),
+  requireAdmin,
   async (req: Request, res: Response) => {
     try {
       const id = Number(req.params.id);

@@ -96,3 +96,18 @@ export function requireRole(...roles: string[]) {
     next();
   };
 }
+
+/**
+ * Roles con permisos de gestión. Definido acá y en un solo lugar porque estaba
+ * escrito a mano en 11 rutas como `requireRole("Administrador")` — que dejaba
+ * afuera a SuperAdmin — mientras /api/admin sí lo aceptaba. Un rol nuevo con
+ * permisos de gestión se agrega una vez, no once.
+ */
+export const ADMIN_ROLES = ["SuperAdmin", "Administrador"] as const;
+
+/** Exige rol de gestión. Usar siempre después de requireAuth. */
+export const requireAdmin = requireRole(...ADMIN_ROLES);
+
+/** ¿El usuario del token tiene permisos de gestión? Para ramas dentro de un handler. */
+export const isAdmin = (req: Request) =>
+  !!req.user && (ADMIN_ROLES as readonly string[]).includes(req.user.role);

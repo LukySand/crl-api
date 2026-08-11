@@ -34,7 +34,7 @@ import * as web from "node:stream/web";
  * Example:
  * ```typescript
  * const fileId = await Storage.create({
- *    userId: 51548531,
+ *    userId: 'a0000000-0000-4000-8000-000000000004',
  *    name: 'profilePicture',
  *    file: formData.get("file") as File,
  *    kind: 'profilePictures'    
@@ -78,9 +78,9 @@ import * as web from "node:stream/web";
 export namespace Storage {
     export type CreateFileArgs = {
         /**
-         * The id of the user who creates the file.
+         * The id of the user who creates the file. UUID, like User.id.
          */
-        userId: number;
+        userId: string;
 
         /**
          * The name of the file.
@@ -141,7 +141,7 @@ export namespace Storage {
      * - "file-write-panic" if something happens while writing the file to the disk.
      * - "file-too-big" if file exceeds the maximum size allowed 
      */
-    export async function create(arg: CreateFileArgs): Promise<number> {
+    export async function create(arg: CreateFileArgs): Promise<string> {
         if(arg.file.size > maxFileSize) {
             throw new Error("file-too-big");
         }
@@ -216,7 +216,7 @@ export namespace Storage {
                 throw new Error("file-write-panic", {cause: err});
             }
 
-            let fileId: number;
+            let fileId: string;
             const now = new Date()
 
             if(existingFile) {
@@ -274,7 +274,7 @@ export namespace Storage {
      * - "file-not-found" if the file is not found.
      * - "file-not-deleted" if the file could not be deleted.
      */
-    export async function remove(fileId: number): Promise<void> {
+    export async function remove(fileId: string): Promise<void> {
         await prisma.$transaction(async (txn) => {
             const file = await txn.file.delete({
                 where: { id: fileId },
@@ -299,7 +299,7 @@ export namespace Storage {
      * Returns null if the file does not exist.
      * If ifNoneMatch is passed and the file has not changed since that value, 'not-modified' is returned.
      */
-    export async function getFile(fileId: number, ifNoneMatch?: string): Promise<FileRead|null|'not-modified'> {
+    export async function getFile(fileId: string, ifNoneMatch?: string): Promise<FileRead|null|'not-modified'> {
         const file = await prisma.file.findFirst({
             where: {
                 id: fileId,

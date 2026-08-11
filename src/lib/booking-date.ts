@@ -43,3 +43,22 @@ export function nowTimeInClub(): string {
 export function timeToHHMM(time: Date): string {
   return time.toISOString().slice(11, 16);
 }
+
+/**
+ * Hasta cuándo se puede reservar hacia adelante.
+ *
+ * El socio tiene 3 semanas; la gestión llega a 6 meses para poder tomar reservas
+ * de eventos con anticipación. El tope vive acá y no sólo en el front: hasta
+ * ahora `SEMANAS_ADELANTE = 3` existía únicamente en ReservasScreen.tsx, así que
+ * pegándole a la API se podía reservar cualquier fecha futura.
+ */
+export const DIAS_ADELANTE_SOCIO = 21;
+export const DIAS_ADELANTE_ADMIN = 183; // ~6 meses
+
+/** "YYYY-MM-DD" del último día reservable, contando desde hoy en el club. */
+export function ultimaFechaReservable(diasAdelante: number): string {
+  const hoy = parseDate(todayInClub());
+  return new Date(hoy.getTime() + diasAdelante * 86_400_000)
+    .toISOString()
+    .slice(0, 10);
+}

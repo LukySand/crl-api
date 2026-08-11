@@ -1,13 +1,16 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
-import { requireAuth } from "../lib/auth";
+import { requireAuth, isAdmin } from "../lib/auth";
 import {
   parseDate,
   matchesDayOfWeek,
   todayInClub,
   nowTimeInClub,
   timeToHHMM,
+  ultimaFechaReservable,
+  DIAS_ADELANTE_SOCIO,
+  DIAS_ADELANTE_ADMIN,
 } from "../lib/booking-date";
 
 export const bookingsRouter = Router();
@@ -15,10 +18,32 @@ export const bookingsRouter = Router();
 // Todo lo de acá exige sesión: no se reserva sin estar logueado.
 bookingsRouter.use(requireAuth);
 
+/**
+ * Lo que se devuelve de cada reserva.
+ *
+ * `user` va con select y no con `true`: el modelo User tiene `password`, y un
+ * include plano la mandaría en cada respuesta. Sólo lo necesario para que la
+ * gestión sepa de quién es la reserva.
+ */
+const bookingInclude = {
+  schedule: { include: { place: true } },
+  fee: true,
+  user: {
+    select: { id: true, name: true, last_name: true, dni: true, email: true, celular: true },
+  },
+} as const;
+
 const createSchema = z.object({
   schedule_id: z.number().int().positive(),
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "La fecha debe ser YYYY-MM-DD"),
   notes: z.string().max(1000).optional(),
+
+  // Campos de gestión. Si los manda un socio se responde 403, no se ignoran en
+  // silencio: mandarlos es un intento de reservar a nombre de otro o de fijarse
+  // el precio, y eso tiene que fallar fuerte.
+  user_id: z.uuid("user_id inválido").optional(),
+  fee_id: z.number().int().positive().optional(),
+  status: z.enum(["Pendiente", "Confirmada"]).optional(),
 });
 
 const updateSchema = z.object({
@@ -26,7 +51,6 @@ const updateSchema = z.object({
   status: z.enum(["Pendiente", "Confirmada"]).optional(),
 });
 
-const isAdmin = (req: Request) => req.user?.role === "Administrador";
 
 /**
  * GET /api/bookings — reservas. El Administrador ve todas; el resto, las propias.
@@ -48,7 +72,7 @@ bookingsRouter.get("/", async (req: Request, res: Response) => {
         ...(typeof status === "string" && { status: status as any }),
         ...(placeId !== undefined && { schedule: { place_id: placeId } }),
       },
-      include: { schedule: { include: { place: true } }, fee: true },
+      include: bookingInclude,
       orderBy: [{ date: "desc" }],
     });
 
@@ -97,7 +121,7 @@ bookingsRouter.get("/:id", async (req: Request<{ id: string }>, res: Response) =
   try {
     const booking = await prisma.booking.findUnique({
       where: { id: req.params.id },
-      include: { schedule: { include: { place: true } }, fee: true },
+      include: bookingInclude,
     });
 
     if (!booking) {
@@ -138,9 +162,31 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: "No se puede reservar una fecha pasada" });
     }
 
-    const schedule = await prisma.schedule.findUnique({ where: { id: schedule_id } });
+    // Tope hacia adelante: 3 semanas para el socio, 6 meses para la gestión.
+    const tope = ultimaFechaReservable(
+      isAdmin(req) ? DIAS_ADELANTE_ADMIN : DIAS_ADELANTE_SOCIO,
+    );
+    if (date > tope) {
+      return res.status(400).json({
+        success: false,
+        error: isAdmin(req)
+          ? "No se puede reservar con más de 6 meses de anticipación"
+          : "No se puede reservar con más de 3 semanas de anticipación",
+      });
+    }
+
+    const schedule = await prisma.schedule.findUnique({
+      where: { id: schedule_id },
+      include: { place: { select: { active: true } } },
+    });
     if (!schedule) {
       return res.status(404).json({ success: false, error: "El horario no existe" });
+    }
+    // Un espacio dado de baja no se puede reservar (las reservas viejas siguen ahí)
+    if (!schedule.place.active) {
+      return res
+        .status(409)
+        .json({ success: false, error: "El espacio no está disponible" });
     }
 
     // Hoy a las 16:00 no se puede reservar el turno de las 08:00. Va acá y no sólo
@@ -171,7 +217,7 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
         notes,
         active: true,
       },
-      include: { schedule: { include: { place: true } }, fee: true },
+      include: bookingInclude,
     });
 
     return res.status(201).json({ success: true, booking });
@@ -248,7 +294,7 @@ bookingsRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response)
 
     const booking = await prisma.booking.findUnique({
       where: { id: req.params.id },
-      include: { schedule: { include: { place: true } }, fee: true },
+      include: bookingInclude,
     });
 
     return res.json({ success: true, booking });

@@ -133,6 +133,7 @@ model Place {
   capacity    Int?    @db.SmallInt
   description String? @db.Text
   file_id     String? @db.Char(128)
+  active      Boolean @default(true) // baja lógica: false = no disponible para reservar
 
   file        File?        @relation(fields: [file_id], references: [id])
   schedules   Schedule[]

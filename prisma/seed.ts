@@ -71,7 +71,7 @@ const DESDE_NOCHE = "20:00";
 
 const CANCHAS = [
   {
-    place: "Cancha de fútbol 5 «A»",
+    place: "Cancha de fútbol 5",
     fee: "Cancha de fútbol 5 — 1 hora",
     base: 12000,
     dias: [1, 3, 5, 6], // lunes, miércoles, viernes, sábado
@@ -132,16 +132,21 @@ function dateForDayOfWeek(dayOfWeek: number, weeksAhead = 0): Date {
 }
 
 async function seedRoles() {
-    const roles = [RoleType.SuperAdmin, RoleType.Administrador, RoleType.Profesor, RoleType.Socio];
+  const roles = [
+    RoleType.SuperAdmin,
+    RoleType.Administrador,
+    RoleType.Profesor,
+    RoleType.Socio,
+  ];
 
-    for (const name of roles) {
-        await prisma.role.upsert({
-            where: { name },
-            update: {},
-            create: { name },
-        });
-    }
-    console.log(`Roles listos (${roles.length}).`);
+  for (const name of roles) {
+    await prisma.role.upsert({
+      where: { name },
+      update: {},
+      create: { name },
+    });
+  }
+  console.log(`Roles listos (${roles.length}).`);
 
   const rows = await prisma.role.findMany();
   return new Map<string, number>(rows.map((r) => [r.name, r.id]));
@@ -417,7 +422,7 @@ async function seedFees() {
 async function seedPlaces() {
   const places = [
     {
-      name: "Cancha de fútbol 5 «A»",
+      name: "Cancha de fútbol 5",
       address: DIRECCION,
       capacity: 10,
       description: "Césped sintético, iluminación LED y vestuarios.",
@@ -567,7 +572,12 @@ async function seedDisciplines(
 ) {
   // [nombre, profesor_id|null, nombre de tarifa|null, nombre de espacio|null]
   const disciplines: [string, string | null, string | null, string | null][] = [
-    ["Fútbol", USER.profeFutbol, "Cancha de fútbol 5 — 1 hora", "Cancha de fútbol 5 «A»"],
+    [
+      "Fútbol",
+      USER.profeFutbol,
+      "Cancha de fútbol 5 — 1 hora",
+      "Cancha de fútbol",
+    ],
     ["Vóley", USER.profeVoley, "Cancha de vóley — 1 hora", "Cancha de vóley"],
     ["Hockey", null, "Cancha de hockey — 1 hora", "Cancha de hockey"],
     ["Patín", null, "Pista de patín — 1 hora", "Pista de patín"],
@@ -577,8 +587,8 @@ async function seedDisciplines(
     const data = {
       name,
       professor_id,
-      fee_id: feeName ? feeIds.get(feeName) ?? null : null,
-      place_id: placeName ? placeIds.get(placeName) ?? null : null,
+      fee_id: feeName ? (feeIds.get(feeName) ?? null) : null,
+      place_id: placeName ? (placeIds.get(placeName) ?? null) : null,
     };
     const existing = await prisma.discipline.findFirst({ where: { name } });
     if (existing) {
@@ -604,7 +614,7 @@ async function seedBookings(
   ][] = [
     [
       BOOKING.confirmadaF5,
-      "Cancha de fútbol 5 «A»|1|19:00",
+      "Cancha de fútbol 5|1|19:00",
       USER.socioMartin,
       1,
       "Confirmada",
@@ -612,7 +622,7 @@ async function seedBookings(
     ],
     [
       BOOKING.pendienteF5,
-      "Cancha de fútbol 5 «A»|6|10:00",
+      "Cancha de fútbol 5|6|10:00",
       USER.socioRodrigo,
       1,
       "Pendiente",
