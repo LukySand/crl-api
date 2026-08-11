@@ -604,7 +604,7 @@ async function seedBookings(
   ][] = [
     [
       BOOKING.confirmadaF5,
-      "Cancha de fútbol 5|1|19:00",
+      "Cancha de fútbol 5 «A»|1|19:00",
       USER.socioMartin,
       1,
       "Confirmada",
@@ -612,7 +612,7 @@ async function seedBookings(
     ],
     [
       BOOKING.pendienteF5,
-      "Cancha de fútbol 5|6|10:00",
+      "Cancha de fútbol 5 «A»|6|10:00",
       USER.socioRodrigo,
       1,
       "Pendiente",
