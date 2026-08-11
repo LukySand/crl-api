@@ -64,8 +64,9 @@ model User {
   role Role  @relation(fields: [role_id], references: [id])
   file File? @relation(fields: [file_id], references: [id])
 
-  families Family[]
-  bookings Booking[]
+  families    Family[]
+  bookings    Booking[]
+  disciplines Discipline[] // disciplinas que dicta (rol Profesor)
 
   @@map("users")
 }
@@ -96,8 +97,9 @@ model Fee {
   description String?  @db.Text
   created_at  DateTime @default(now())
 
-  schedules Schedule[]
-  bookings  Booking[]
+  schedules   Schedule[]
+  bookings    Booking[]
+  disciplines Discipline[]
 
   @@map("fees")
 }
@@ -110,10 +112,30 @@ model Place {
   description String? @db.Text
   file_id     String? @db.Char(128)
 
-  file      File?      @relation(fields: [file_id], references: [id])
-  schedules Schedule[]
+  file        File?        @relation(fields: [file_id], references: [id])
+  schedules   Schedule[]
+  disciplines Discipline[]
 
   @@map("places")
+}
+
+// Disciplina del club (fútbol, vóley, patín…): nombre + profesor + cuota + espacio.
+// El horario detallado vive en Schedule (issue #24). Baja lógica como User: se
+// desactiva (active=false), no se borra, para no orfanar reservas/horarios.
+model Discipline {
+  id           Int      @id @default(autoincrement())
+  name         String   @db.VarChar(100)
+  professor_id String?  @db.Char(128) // User rol Profesor; null = sin asignar
+  fee_id       Int? // cuota (Fee); null = sin definir
+  place_id     Int? // espacio habitual; null = sin definir
+  active       Boolean  @default(true) // baja lógica: false = dada de baja (#41)
+  created_at   DateTime @default(now())
+
+  professor User?  @relation(fields: [professor_id], references: [id])
+  fee       Fee?   @relation(fields: [fee_id], references: [id])
+  place     Place? @relation(fields: [place_id], references: [id])
+
+  @@map("disciplines")
 }
 
 model Schedule {

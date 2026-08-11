@@ -556,6 +556,40 @@ async function seedSchedules(
   return byKey;
 }
 
+/**
+ * Disciplinas del club. Se buscan por nombre (no hay unique natural) y se
+ * relinkean en cada corrida. Profesor/cuota/espacio son opcionales: hockey y
+ * patín quedan sin profesor asignado a propósito, para ejercitar el caso.
+ */
+async function seedDisciplines(
+  placeIds: Map<string, number>,
+  feeIds: Map<string, number>,
+) {
+  // [nombre, profesor_id|null, nombre de tarifa|null, nombre de espacio|null]
+  const disciplines: [string, string | null, string | null, string | null][] = [
+    ["Fútbol", USER.profeFutbol, "Cancha de fútbol 5 — 1 hora", "Cancha de fútbol 5 «A»"],
+    ["Vóley", USER.profeVoley, "Cancha de vóley — 1 hora", "Cancha de vóley"],
+    ["Hockey", null, "Cancha de hockey — 1 hora", "Cancha de hockey"],
+    ["Patín", null, "Pista de patín — 1 hora", "Pista de patín"],
+  ];
+
+  for (const [name, professor_id, feeName, placeName] of disciplines) {
+    const data = {
+      name,
+      professor_id,
+      fee_id: feeName ? feeIds.get(feeName) ?? null : null,
+      place_id: placeName ? placeIds.get(placeName) ?? null : null,
+    };
+    const existing = await prisma.discipline.findFirst({ where: { name } });
+    if (existing) {
+      await prisma.discipline.update({ where: { id: existing.id }, data });
+    } else {
+      await prisma.discipline.create({ data });
+    }
+  }
+  console.log(`Disciplinas listas (${disciplines.length}).`);
+}
+
 async function seedBookings(
   schedules: Map<string, { id: number; fee_id: number; day_of_week: number }>,
 ) {
@@ -680,6 +714,7 @@ async function main() {
   const placeIds = await seedPlaces();
   const schedules = await seedSchedules(placeIds, feeIds);
   await seedBookings(schedules);
+  await seedDisciplines(placeIds, feeIds);
 
   console.log(
     `\nSeed completado. Usuarios de ejemplo con contraseña "${DEMO_PASSWORD}":`,
