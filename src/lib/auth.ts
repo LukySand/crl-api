@@ -41,7 +41,16 @@ export function signToken(payload: JWTPayload): string {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: "24h" });
 }
 
-/** Lee el token del header Authorization o de la cookie. null si falta o es inválido. */
+/**
+ * Lee el token del header Authorization o de la cookie. null si falta, es
+ * inválido o quedó viejo.
+ *
+ * El `id` se valida en runtime a propósito: `jwt.verify` devuelve lo que haya
+ * adentro del token y un `as JWTPayload` le miente al compilador. Los tokens
+ * emitidos antes de migrar los ids a UUID traen `id` numérico, viven 24h y
+ * sobreviven al cambio de schema — sin este chequeo ese número viaja hasta
+ * Prisma y revienta en la query en vez de dar un 401 acá.
+ */
 export function readToken(req: Request): JWTPayload | null {
   let token: string | null = null;
 
@@ -51,7 +60,9 @@ export function readToken(req: Request): JWTPayload | null {
   if (!token) return null;
 
   try {
-    return jwt.verify(token, JWT_SECRET) as JWTPayload;
+    const payload = jwt.verify(token, JWT_SECRET) as JWTPayload;
+    if (typeof payload?.id !== "string" || !payload.id) return null;
+    return payload;
   } catch {
     return null;
   }

@@ -44,6 +44,13 @@ authRouter.post("/login", async (req: Request, res: Response) => {
         .json({ success: false, error: "Contraseña incorrecta" });
     }
 
+    if (!user.active) {
+      return res.status(403).json({
+        success: false,
+        error: "Tu cuenta fue dada de baja. Contactá al club.",
+      });
+    }
+
     const jwtPayload: JWTPayload = {
       id: user.id,
       dni: user.dni,
@@ -232,6 +239,13 @@ authRouter.post("/google", async (req: Request, res: Response) => {
       include: { role: true },
     });
     let created = false;
+
+    if (user && !user.active) {
+      return res.status(403).json({
+        success: false,
+        error: "Tu cuenta fue dada de baja. Contactá al club.",
+      });
+    }
 
     if (!user) {
       // Alta: faltan dni/birth_date → el front los pide y reintenta con el mismo credential
