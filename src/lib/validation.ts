@@ -48,6 +48,10 @@ export const birthDateSchema = z
     return (m < 0 || (m === 0 && d < 0) ? age - 1 : age) >= 13;
   }, "Debes tener al menos 13 años para registrarte");
 
+// file_id opcional en el registro: el UUID de una imagen ya subida (o nada).
+// File.id es un UUID (String), no un número — nada de regex de dígitos ni Number().
+const fileIdSchema = z.string().min(1).optional().nullable();
+
 // ── Schemas compuestos ──────────────────────────────────────────────────
 export const registerSchema = z.object({
   name: nameSchema,
@@ -57,6 +61,7 @@ export const registerSchema = z.object({
   celular: celularSchema,
   password: passwordSchema,
   birth_date: birthDateSchema,
+  file_id: fileIdSchema,
 });
 
 export type RegisterData = z.infer<typeof registerSchema>;

@@ -36,6 +36,24 @@ API en `http://localhost:3001`. Verificá: `curl http://localhost:3001/api/healt
 | POST | `/api/auth/register` | Alta de Socio + auto-login |
 | GET | `/api/auth/verify` | Valida token (header `Authorization: Bearer` o cookie `auth_token`) |
 | POST | `/api/auth/logout` | Limpia cookie de sesión |
+| PUT | `/api/files` | Sube una imagen (`multipart/form-data`) |
+| GET | `/api/files?id=:id` | Obtiene una imagen por id |
+| DELETE | `/api/files?fileId=:id` | Elimina una imagen por id |
+
+### Rutas de uso (`files`)
+
+- Subir imagen: `PUT /api/files`
+	- Form-data requerido: `file`, `kind`, `name`, `user_id`
+	- Tipos:
+		- `file`: archivo (`File`)
+		- `kind`: `string` (valores: `accountImages` | `postImages` | `localImages`)
+		- `name`: `string`
+		- `user_id`: `number` entero
+	- Tipos permitidos de imagen: `image/jpeg`, `image/png`, `image/heif`, `image/heic`, `image/webp`, `image/tiff`, `image/bmp`, `image/avif`
+- Ver imagen por id: `GET /api/files?id=<fileId>`
+	- Tipo de `fileId`: `number` entero
+- Eliminar imagen: `DELETE /api/files?fileId=<fileId>`
+	- Tipo de `fileId`: `number` entero
 
 ## Comandos
 

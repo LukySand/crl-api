@@ -58,6 +58,7 @@ authRouter.post("/login", async (req: Request, res: Response) => {
       role: user.role.name,
       name: user.name,
       last_name: user.last_name,
+      file_id: user.file_id ?? null,
     };
     const token = signToken(jwtPayload);
 
@@ -74,7 +75,7 @@ authRouter.post("/login", async (req: Request, res: Response) => {
  * GET /api/auth/verify — valida el token (header Authorization o cookie auth_token).
  * 200 { success, user } | 401 token inválido
  */
-authRouter.get("/verify", (req: Request, res: Response) => {
+authRouter.get("/verify", async (req: Request, res: Response) => {
   try {
     const payload = readToken(req);
     if (!payload) {
@@ -83,17 +84,38 @@ authRouter.get("/verify", (req: Request, res: Response) => {
         .json({ success: false, error: "Invalid or expired token" });
     }
 
-    return res.status(200).json({
-      success: true,
-      user: {
-        id: payload.id,
-        dni: payload.dni,
-        email: payload.email,
-        role: payload.role,
-        name: payload.name,
-        last_name: payload.last_name,
-      },
+    // Rol fresco desde la DB, no del token: así un cambio de rol (o una baja)
+    // hecho en la DB — p. ej. desde Prisma Studio — se refleja sin re-login. Se
+    // re-emite el token con el rol actual para que requireRole (que lee del
+    // token) autorice con ese rol, y front y back queden consistentes.
+    const user = await prisma.user.findUnique({
+      where: { id: payload.id },
+      include: { role: true },
     });
+    if (!user) {
+      return res
+        .status(401)
+        .json({ success: false, error: "Usuario no encontrado" });
+    }
+    if (!user.active) {
+      return res.status(403).json({
+        success: false,
+        error: "Tu cuenta fue dada de baja. Contactá al club.",
+      });
+    }
+
+    const fresh: JWTPayload = {
+      id: user.id,
+      dni: user.dni,
+      email: user.email,
+      role: user.role.name,
+      name: user.name,
+      last_name: user.last_name,
+      file_id: user.file_id ?? null,
+    };
+    const token = signToken(fresh);
+
+    return res.status(200).json({ success: true, token, user: fresh });
   } catch (error) {
     console.error("Verify token error:", error);
     return res
@@ -121,15 +143,18 @@ authRouter.post("/register", async (req: Request, res: Response) => {
         .json({ success: false, error: "Validación fallida", errors });
     }
 
-    const { name, last_name, dni, email, celular, password, birth_date } =
+    const { name, last_name, dni, email, celular, password, birth_date, file_id } =
       validationResult.data;
 
-    // ponytail: solo se valida DNI duplicado (espeja a main). email no tiene @unique
-    // en el schema; si se quiere unicidad, agregar constraint + check acá.
     if (await prisma.user.findFirst({ where: { dni } })) {
       return res
         .status(409)
         .json({ success: false, error: "El DNI ya está registrado" });
+    }
+    if (await prisma.user.findFirst({ where: { email } })) {
+      return res
+        .status(409)
+        .json({ success: false, error: "El email ya está registrado" });
     }
 
     const socioRole = await prisma.role.findFirst({ where: { name: "Socio" } });
@@ -152,6 +177,7 @@ authRouter.post("/register", async (req: Request, res: Response) => {
         password: hashedPassword,
         birth_date: new Date(birth_date),
         role_id: socioRole.id,
+        file_id: file_id ?? null,
       },
       include: { role: true },
     });
@@ -163,11 +189,18 @@ authRouter.post("/register", async (req: Request, res: Response) => {
       role: newUser.role.name,
       name: newUser.name,
       last_name: newUser.last_name,
+      file_id: newUser.file_id ?? null,
     };
     const token = signToken(jwtPayload);
 
     return res.status(201).json({ success: true, token, user: jwtPayload });
-  } catch (error) {
+  } catch (error: any) {
+    // Red de seguridad ante una carrera: el @unique de email corta acá.
+    if (error?.code === "P2002") {
+      return res
+        .status(409)
+        .json({ success: false, error: "El email ya está registrado" });
+    }
     console.error("Register error:", error);
     return res
       .status(500)
@@ -306,6 +339,7 @@ authRouter.post("/google", async (req: Request, res: Response) => {
       role: user.role.name,
       name: user.name,
       last_name: user.last_name,
+      file_id: user.file_id ?? null,
     };
     const token = signToken(jwtPayload);
 

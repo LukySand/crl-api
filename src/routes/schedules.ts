@@ -2,10 +2,9 @@ import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
 import { requireAuth, requireRole } from "../lib/auth";
+import { TIME, toTime } from "../lib/time";
 
 export const schedulesRouter = Router();
-
-const TIME = /^([01]\d|2[0-3]):[0-5]\d$/; // HH:MM 24h
 
 const scheduleSchema = z
   .object({
@@ -26,11 +25,6 @@ const scheduleUpdateSchema = z.object({
   start_time: z.string().regex(TIME, "Formato de hora inválido (HH:MM)").optional(),
   end_time: z.string().regex(TIME, "Formato de hora inválido (HH:MM)").optional(),
 });
-
-/** Prisma guarda TIME como DateTime; usamos una fecha fija y solo importa la hora. */
-function toTime(hhmm: string): Date {
-  return new Date(`1970-01-01T${hhmm}:00Z`);
-}
 
 function validationError(res: Response, error: z.ZodError) {
   const errors: Record<string, string> = {};

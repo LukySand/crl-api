@@ -14,6 +14,9 @@ const enrollSchema = z.object({
   user_id: z.string().min(1).optional(),
 });
 
+// Sin `as const` en el array: Prisma pide un orderBy mutable.
+const ordenHorarios = [{ day_of_week: "asc" as const }, { start_time: "asc" as const }];
+
 // Qué devolvemos de cada inscripción: nombre de la disciplina y datos del socio.
 const enrollmentInclude = {
   discipline: {
@@ -24,6 +27,12 @@ const enrollmentInclude = {
       fee: { select: { id: true, name: true, amount: true } },
       place: { select: { id: true, name: true } },
       professor: { select: { id: true, name: true, last_name: true } },
+      // Los horarios viajan acá para que el socio saque su próxima clase de este
+      // mismo GET, sin pedir un endpoint aparte por cada disciplina.
+      schedules: {
+        select: { id: true, day_of_week: true, start_time: true, end_time: true },
+        orderBy: ordenHorarios,
+      },
     },
   },
   user: { select: { id: true, name: true, last_name: true, dni: true } },
@@ -66,6 +75,7 @@ enrollmentsRouter.get("/", async (req: Request, res: Response) => {
 
     const enrollments = await prisma.enrollment.findMany({
       where: {
+        active: true, // solo las inscripciones vigentes; el historial (bajas) no se lista acá
         ...scope,
         ...(disciplineId !== undefined && { discipline_id: disciplineId }),
       },
@@ -143,8 +153,9 @@ enrollmentsRouter.post("/", async (req: Request, res: Response) => {
 });
 
 /**
- * DELETE /api/enrollments/:id — desinscribe (borra la fila). El dueño la suya;
- * el Administrador cualquiera. Sin baja lógica: no hay historial que conservar.
+ * DELETE /api/enrollments/:id — da de baja la inscripción (no borra). El dueño
+ * la suya; el Administrador cualquiera. Baja lógica: active=null + left_at=now,
+ * así el null libera el par en el unique y queda el período en el historial.
  */
 enrollmentsRouter.delete("/:id", async (req: Request<{ id: string }>, res: Response) => {
   try {
@@ -161,10 +172,17 @@ enrollmentsRouter.delete("/:id", async (req: Request<{ id: string }>, res: Respo
       return res.status(403).json({ success: false, error: "No tenés permisos para esta acción" });
     }
 
-    await prisma.enrollment.delete({ where: { id } });
-    return res.json({ success: true, message: "Inscripción cancelada" });
+    // Solo si sigue activa: dos bajas en paralelo (doble tap) dejan una sola.
+    const { count } = await prisma.enrollment.updateMany({
+      where: { id, active: true },
+      data: { active: null, left_at: new Date() },
+    });
+    if (count === 0) {
+      return res.status(409).json({ success: false, error: "La inscripción ya estaba dada de baja" });
+    }
+    return res.json({ success: true, message: "Inscripción dada de baja" });
   } catch (error) {
     console.error("Delete enrollment error:", error);
-    return res.status(500).json({ success: false, error: "Error al cancelar la inscripción" });
+    return res.status(500).json({ success: false, error: "Error al dar de baja la inscripción" });
   }
 });

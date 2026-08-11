@@ -13,6 +13,7 @@ export interface JWTPayload {
   role: string;
   name: string;
   last_name: string;
+  file_id: string | null;
 }
 
 declare global {
