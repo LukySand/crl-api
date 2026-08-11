@@ -31,11 +31,70 @@ async function readFormData(req: AuthedRequest) {
     return request.formData();
 }
 
+function isUsableFileId(id: unknown): id is string {
+    return (
+        typeof id === "string" &&
+        id.trim() !== "" &&
+        id !== "null" &&
+        id !== "undefined"
+    );
+}
+
 export const socioRouter = Router();
 
 // Todo /api/socio requiere sesión.
 socioRouter.use(authenticate);
 
+/**
+ * GET /api/socio/files?id=... — sirve un archivo almacenado (ej: foto de perfil).
+ */
+socioRouter.get("/files", async (req: AuthedRequest, res: Response) => {
+    try {
+        const userId = req.user?.id;
+        if (!userId) {
+            return res.status(401).json({ error: "No autenticado" });
+        }
+
+        const id = req.query.id;
+        if (!isUsableFileId(id)) {
+            return res.status(400).json({ error: "Falta el parámetro id" });
+        }
+
+        // Soporta cache condicional: el browser manda If-None-Match con
+        // comillas (ej: "1699999"), Storage.getFile espera el valor pelado.
+        const rawIfNoneMatch = req.headers["if-none-match"];
+        const ifNoneMatch = Array.isArray(rawIfNoneMatch)
+            ? rawIfNoneMatch[0]
+            : rawIfNoneMatch?.replace(/"/g, "");
+
+        let result;
+        try {
+            result = await Storage.getFile(id, ifNoneMatch);
+        } catch (err) {
+            console.error("Error leyendo archivo del storage.", { error: err, id });
+            return res.status(404).json({ error: "Archivo no encontrado" });
+        }
+
+        if (result === "not-modified") {
+            return res.status(304).end();
+        }
+
+        if (!result) {
+            return res.status(404).json({ error: "Archivo no encontrado" });
+        }
+
+        res.setHeader("Content-Type", result.mime || "application/octet-stream");
+        res.setHeader("Content-Length", String(result.size));
+        res.setHeader("ETag", `"${result.etag}"`);
+        res.setHeader("Last-Modified", result.lastModified.toUTCString());
+        res.setHeader("Cache-Control", "private, max-age=300");
+
+        Readable.fromWeb(result.stream as never).pipe(res);
+    } catch (error) {
+        console.error("Get file error:", error);
+        return res.status(500).json({ error: "Error al obtener el archivo" });
+    }
+});
 
 /**
  * PATCH /api/socio/profile-image — reemplaza la foto de perfil del socio logueado.
