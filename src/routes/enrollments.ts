@@ -14,6 +14,9 @@ const enrollSchema = z.object({
   user_id: z.string().min(1).optional(),
 });
 
+// Sin `as const` en el array: Prisma pide un orderBy mutable.
+const ordenHorarios = [{ day_of_week: "asc" as const }, { start_time: "asc" as const }];
+
 // Qué devolvemos de cada inscripción: nombre de la disciplina y datos del socio.
 const enrollmentInclude = {
   discipline: {
@@ -24,6 +27,12 @@ const enrollmentInclude = {
       fee: { select: { id: true, name: true, amount: true } },
       place: { select: { id: true, name: true } },
       professor: { select: { id: true, name: true, last_name: true } },
+      // Los horarios viajan acá para que el socio saque su próxima clase de este
+      // mismo GET, sin pedir un endpoint aparte por cada disciplina.
+      schedules: {
+        select: { id: true, day_of_week: true, start_time: true, end_time: true },
+        orderBy: ordenHorarios,
+      },
     },
   },
   user: { select: { id: true, name: true, last_name: true, dni: true } },

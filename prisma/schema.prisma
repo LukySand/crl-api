@@ -142,8 +142,8 @@ model Place {
 }
 
 // Disciplina del club (fútbol, vóley, patín…): nombre + profesor + cuota + espacio.
-// El horario detallado vive en Schedule (issue #24). Baja lógica como User: se
-// desactiva (active=false), no se borra, para no orfanar reservas/horarios.
+// Los días y horas de la clase viven en DisciplineSchedule. Baja lógica como User:
+// se desactiva (active=false), no se borra, para no orfanar reservas/horarios.
 model Discipline {
   id           Int      @id @default(autoincrement())
   name         String   @db.VarChar(100)
@@ -157,14 +157,31 @@ model Discipline {
   fee       Fee?   @relation(fields: [fee_id], references: [id])
   place     Place? @relation(fields: [place_id], references: [id])
 
-  enrollments Enrollment[] // socios inscriptos
+  enrollments Enrollment[]         // socios inscriptos
+  schedules   DisciplineSchedule[] // días y horas de la clase
 
   @@map("disciplines")
 }
 
-// Inscripción de un socio a una disciplina (M:N socio ↔ disciplina).
-// Baja = borrado físico: no hay historial que preservar (a diferencia de Booking).
-// Inscripción de un socio a una disciplina, con historial de períodos.
+// Horario semanal fijo de una disciplina: "vóley los martes de 19:00 a 20:30".
+// Es otro modelo que Schedule a propósito: Schedule es el turno reservable de un
+// espacio (lleva fee_id y cuelga Booking), la clase no se reserva, se dicta.
+model DisciplineSchedule {
+  id            Int      @id @default(autoincrement())
+  discipline_id Int
+  day_of_week   Int      @db.UnsignedTinyInt // 0=domingo … 6=sábado
+  start_time    DateTime @db.Time()
+  end_time      DateTime @db.Time()
+  created_at    DateTime @default(now())
+
+  discipline Discipline @relation(fields: [discipline_id], references: [id])
+
+  @@unique([discipline_id, day_of_week, start_time]) // no dos clases iguales
+  @@map("discipline_schedules")
+}
+
+// Inscripción de un socio a una disciplina (M:N socio ↔ disciplina), con
+// historial de períodos.
 // ponytail: mismo truco que Booking — `active` es true mientras el socio cursa
 // y null cuando se va. MySQL ignora los null en el unique, así que puede haber
 // muchas filas históricas (cada período `created_at`→`left_at`) + una sola
