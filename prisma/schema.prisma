@@ -67,6 +67,7 @@ model User {
   families    Family[]
   bookings    Booking[]
   disciplines Discipline[] // disciplinas que dicta (rol Profesor)
+  enrollments Enrollment[] // disciplinas en las que está inscripto (rol Socio)
 
   @@map("users")
 }
@@ -135,7 +136,24 @@ model Discipline {
   fee       Fee?   @relation(fields: [fee_id], references: [id])
   place     Place? @relation(fields: [place_id], references: [id])
 
+  enrollments Enrollment[] // socios inscriptos
+
   @@map("disciplines")
+}
+
+// Inscripción de un socio a una disciplina (M:N socio ↔ disciplina).
+// Baja = borrado físico: no hay historial que preservar (a diferencia de Booking).
+model Enrollment {
+  id            Int      @id @default(autoincrement())
+  user_id       String   @db.Char(128) // socio inscripto (UUID, como Booking.user_id)
+  discipline_id Int
+  created_at    DateTime @default(now())
+
+  user       User       @relation(fields: [user_id], references: [id])
+  discipline Discipline @relation(fields: [discipline_id], references: [id])
+
+  @@unique([user_id, discipline_id]) // no inscribirse dos veces a la misma disciplina
+  @@map("enrollments")
 }
 
 model Schedule {
