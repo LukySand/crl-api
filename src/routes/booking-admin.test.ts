@@ -11,7 +11,7 @@ import { z } from "zod";
 // proteger nada — está acá porque el schema real no se exporta.
 const amountSchema = z.coerce
   .number()
-  .positive("El precio debe ser mayor a cero")
+  .nonnegative("El precio no puede ser negativo")
   .max(99_999_999.99, "El precio es demasiado grande");
 
 const createSchema = z.object({
@@ -50,8 +50,8 @@ test("user_id tiene que ser UUID: un id numérico no pasa", () => {
   expect(createSchema.safeParse({ ...base, user_id: "4" }).success).toBe(false);
 });
 
-test("amount no puede ser cero ni negativo", () => {
-  expect(createSchema.safeParse({ ...base, amount: 0 }).success).toBe(false);
+test("amount permite cero (reserva gratuita) pero no negativo", () => {
+  expect(createSchema.safeParse({ ...base, amount: 0 }).success).toBe(true);
   expect(createSchema.safeParse({ ...base, amount: -5 }).success).toBe(false);
 });
 

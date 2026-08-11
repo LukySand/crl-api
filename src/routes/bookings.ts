@@ -37,9 +37,11 @@ const bookingInclude = {
 // Igual que en schedules.ts: se manda el monto, no un fee_id — quien reserva no
 // tiene por qué pensar en tarifas, piensa en plata. findOrCreateFeeForPlace
 // resuelve la fila.
+// nonnegative, no positive: una reserva puede ser gratuita (evento, cortesía),
+// a diferencia de un turno (schedules.ts), que siempre cobra algo.
 const amountSchema = z.coerce
   .number()
-  .positive("El precio debe ser mayor a cero")
+  .nonnegative("El precio no puede ser negativo")
   .max(99_999_999.99, "El precio es demasiado grande");
 
 const createSchema = z.object({
