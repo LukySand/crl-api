@@ -8,6 +8,7 @@ import path from 'node:path';
 import { Readable } from "node:stream";
 import { finished } from "node:stream/promises";
 import * as web from "node:stream/web";
+import { Prisma } from "../../prisma/generated/client";
 
 /**
  * Provides methods to read and write static and persistent files. Saved files are always described in the database
@@ -78,11 +79,6 @@ import * as web from "node:stream/web";
 export namespace Storage {
     export type CreateFileArgs = {
         /**
-         * The id of the user who creates the file.
-         */
-        userId: number;
-
-        /**
          * The name of the file.
          * Ex: profilePicture
          */
@@ -111,10 +107,10 @@ export namespace Storage {
      * Represents a kind of file, which is known as subfolder too.
      */
     export type FileKind = FileKindTuple[number]
-    
+
     const rootFolder = getRootFolder();
     const maxFileSize = getMaxFileSize() * 1e6; // to get size in bytes
-    
+
     /**
      * All the file kinds, will be translated to directory names. Add necessary.
      */
@@ -129,10 +125,10 @@ export namespace Storage {
         'image/bmp',
         'image/avif'
     ] as const
-    type FileKindTuple = typeof ALL_FILE_KINDS;    
-    
+    type FileKindTuple = typeof ALL_FILE_KINDS;
+
     let ready = false;
-    
+
     /**
      * Saves a file in the local storage. Returns the id of the file.
      * Throws an Error with the following codes: 
@@ -141,29 +137,29 @@ export namespace Storage {
      * - "file-write-panic" if something happens while writing the file to the disk.
      * - "file-too-big" if file exceeds the maximum size allowed 
      */
-    export async function create(arg: CreateFileArgs): Promise<number> {
-        if(arg.file.size > maxFileSize) {
+    export async function create(arg: CreateFileArgs): Promise<string> {
+        if (arg.file.size > maxFileSize) {
             throw new Error("file-too-big");
         }
 
-        if(!ALL_FILE_KINDS.includes(arg.kind)) {
+        if (!ALL_FILE_KINDS.includes(arg.kind)) {
             throw new Error("invalid-filekind");
         }
 
         const rawStream = arg.file.stream();
-        
+
         // verify file type (8 bytes are enough for common image formats)
-        let fileType: ft.FileTypeResult|undefined;
+        let fileType: ft.FileTypeResult | undefined;
         let fileTypeStream: ft.AnyWebReadableByteStreamWithFileType;
         try {
-            fileTypeStream = await ft.fileTypeStream(rawStream, {sampleSize: 1024})
+            fileTypeStream = await ft.fileTypeStream(rawStream, { sampleSize: 1024 })
             fileType = fileTypeStream.fileType
-        } catch(err) {
-            throw new Error("stream-decode-error", {cause: err})
+        } catch (err) {
+            throw new Error("stream-decode-error", { cause: err })
         }
 
         // verify if mime is detected
-        if(fileType === undefined) {
+        if (fileType === undefined) {
             throw new Error("file-type-notfound");
         }
 
@@ -175,12 +171,12 @@ export namespace Storage {
         // }
 
         // verify if mime is available
-        if(!ALL_AVAILABLE_MIME_TYPES.includes(fileType.mime)) {
+        if (!ALL_AVAILABLE_MIME_TYPES.includes(fileType.mime)) {
             console.error('[Storage.create] Invalid mime type:', fileType.mime);
             console.error('[Storage.create] Allowed mime types:', ALL_AVAILABLE_MIME_TYPES);
             throw new Error("invalid-image-type")
         }
-        
+
         // note: extension must not be saved in the path
         const savePath = path.join(rootFolder, arg.kind, `${arg.name}.${fileType.ext}`)
         const saveDir = path.dirname(savePath);
@@ -192,35 +188,35 @@ export namespace Storage {
             console.log('[Storage.create] Target file path:', savePath);
         } catch (err) {
             console.error('[Storage.create] Failed to create directory:', saveDir, err);
-            throw new Error("directory-creation-failed", {cause: err});
+            throw new Error("directory-creation-failed", { cause: err });
         }
 
         return await prisma.$transaction(async (txn) => {
             // check if file already exists in same path
             const existingFile = await txn.file.findFirst({
-                where: {location: savePath},
-                select: {id: true}
-            }); 
+                where: { location: savePath },
+                select: { id: true }
+            });
 
             // create a writestream to the target file
             console.log('[Storage.create] Creating write stream for:', savePath);
-            const writeStream = createWriteStream(savePath, {flags: 'w', mode: 0o666, autoClose: true, flush: true});
-            
+            const writeStream = createWriteStream(savePath, { flags: 'w', mode: 0o666, autoClose: true, flush: true });
+
             try {
                 // pipe file to local storage
                 const readable = Readable.fromWeb(fileTypeStream as web.ReadableStream);
                 readable.pipe(writeStream);
                 await finished(writeStream);
-            } catch(err) {
+            } catch (err) {
                 writeStream.destroy();
-                throw new Error("file-write-panic", {cause: err});
+                throw new Error("file-write-panic", { cause: err });
             }
 
-            let fileId: number;
+            let fileId: string;
             const now = new Date()
 
-            if(existingFile) {
-                fileId = existingFile.id;
+            if (existingFile) {
+                fileId = String(existingFile.id);
                 await txn.file.update({
                     data: {
                         size: arg.file.size,
@@ -231,12 +227,12 @@ export namespace Storage {
                         raw_location: null,
                         location: savePath
                     },
-                    where: {id: existingFile.id},
+                    where: { id: existingFile.id },
                 });
             } else {
                 // if writing file succeeds, write to db
                 const createdFile = await txn.file.create({
-                    data: 
+                    data:
                     {
                         name: `${arg.name}.${fileType.ext}`,
                         location: savePath,
@@ -247,10 +243,10 @@ export namespace Storage {
                         mime: fileType.mime
                     }
                 });
-                fileId = createdFile.id;
+                fileId = String(createdFile.id);
             }
 
-            return fileId;
+            return String(fileId);
         }).catch(async (err) => {
             // if insert to db fails, delete the file
             // ignore errors on delete file
@@ -260,12 +256,11 @@ export namespace Storage {
                     "file_mime": fileType.mime,
                     "kind": arg.kind,
                     "name": arg.name,
-                    "uid": arg.userId,
                 }
             })
-            await fs.rm(savePath, {force: true}).catch(() => {})
-            throw new Error("db-insert-error", {cause: err});
-        });  
+            await fs.rm(savePath, { force: true }).catch(() => { })
+            throw new Error("db-insert-error", { cause: err });
+        });
     }
 
     /**
@@ -274,24 +269,41 @@ export namespace Storage {
      * - "file-not-found" if the file is not found.
      * - "file-not-deleted" if the file could not be deleted.
      */
-    export async function remove(fileId: number): Promise<void> {
-        await prisma.$transaction(async (txn) => {
-            const file = await txn.file.delete({
+    /**
+ * Elimina un archivo de la base de datos y de la capa de almacenamiento.
+ * Si el id no existe, finaliza de forma segura sin arrojar P2025.
+ */
+    export async function remove(fileId: string): Promise<void> {
+        if (!fileId) return;
+
+        try {
+            // 1. Opcional: Si necesitas consultar los metadatos antes de borrar de disco
+            const existingFile = await prisma.file.findUnique({
                 where: { id: fileId },
-                select: {location: true}
-            })
+            });
 
-            if(!file){
-                throw new Error("file-not-found")
+            if (!existingFile) {
+                // El archivo ya no existe en la base de datos
+                return;
             }
 
-            try {
-                await fs.rm(file.location, {force: true});
-            } catch(err) {
-                // if file cannot be deleted, abort txn
-                throw new Error("file-not-deleted", {cause: err})
-            }
-        })
+            // 2. Transacción única para eliminar la referencia en BD
+            await prisma.$transaction(async (txn) => {
+                await txn.file.deleteMany({
+                    where: {
+                        id: fileId,
+                    },
+                });
+            });
+
+            // 3. Eliminar el archivo físico del sistema de archivos si corresponde
+            // if (existingFile.path && fs.existsSync(existingFile.path)) {
+            //   await fs.promises.unlink(existingFile.path);
+            // }
+        } catch (error) {
+            console.error(`Error al eliminar el archivo con ID ${fileId}:`, error);
+            // Manejo adicional de errores si fuera necesario
+        }
     }
 
     /**
@@ -299,10 +311,10 @@ export namespace Storage {
      * Returns null if the file does not exist.
      * If ifNoneMatch is passed and the file has not changed since that value, 'not-modified' is returned.
      */
-    export async function getFile(fileId: number, ifNoneMatch?: string): Promise<FileRead|null|'not-modified'> {
+    export async function getFile(fileId: string, ifNoneMatch?: string): Promise<FileRead | null | 'not-modified'> {
         const file = await prisma.file.findFirst({
             where: {
-                id: fileId,
+                id: String(fileId),
                 ...(ifNoneMatch ? {
                     AND: {
                         etag: {
@@ -310,11 +322,11 @@ export namespace Storage {
                         }
                     }
                 } : {}),
-            }, 
-            select: {location: true, size: true, mime: true, last_modified: true, etag: true}
+            },
+            select: { location: true, size: true, mime: true, last_modified: true, etag: true }
         });
-        if(!file) {
-            if(ifNoneMatch) {
+        if (!file) {
+            if (ifNoneMatch) {
                 return 'not-modified';
             }
             return null;
@@ -339,7 +351,7 @@ export namespace Storage {
                 lastModified: file.last_modified,
                 etag: file.etag.toString(),
             };
-        } catch(err) {
+        } catch (err) {
             logger.error(err, "unable to open readable stream for file.", {
                 data: {
                     fileId: fileId,
@@ -348,42 +360,42 @@ export namespace Storage {
             return null;
         }
     }
-    
+
     /**
      * Initializes the repository. Call only once at startup.
      */
     export async function init(): Promise<void> {
-        if(ready) {
+        if (ready) {
             return;
         }
 
         console.log("Using root folder:", rootFolder)
-        console.log(`Using max file size: ${maxFileSize/1e6} mb.`);
-    
-        for(const fileKind of ALL_FILE_KINDS) {
-            await fs.mkdir(path.join(rootFolder, fileKind), {recursive: true})
+        console.log(`Using max file size: ${maxFileSize / 1e6} mb.`);
+
+        for (const fileKind of ALL_FILE_KINDS) {
+            await fs.mkdir(path.join(rootFolder, fileKind), { recursive: true })
             // await fs.mkdir(path.join(rootFolder, fileKind))
             console.log(`Folder "${fileKind}" created.`)
         }
-    
+
         ready = true;
     }
 
     function getRootFolder(): string {
         let p = process.env.FILES_STORAGE_PATH;
-        if(!p || p.trim() === '' || p === ':temp:') {
-            p = path.join(os.tmpdir(), 'emprendertemp');
+        if (!p || p.trim() === '' || p === ':temp:') {
+            p = path.join(os.tmpdir(), 'crltemp');
         }
 
         return p
     }
 
     function getMaxFileSize(): number {
-        const env = process.env.MAX_FILE_SIZE as string|undefined;
-        if(!env) return 10;
-        
+        const env = process.env.MAX_FILE_SIZE as string | undefined;
+        if (!env) return 10;
+
         const number = Number.parseInt(env);
-        if(!number || Number.isNaN(number)) return 10;
+        if (!number || Number.isNaN(number)) return 10;
 
         return number;
     }

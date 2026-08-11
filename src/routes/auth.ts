@@ -58,6 +58,7 @@ authRouter.post("/login", async (req: Request, res: Response) => {
       role: user.role.name,
       name: user.name,
       last_name: user.last_name,
+      file_id: user.file_id ?? null,
     };
     const token = signToken(jwtPayload);
 
@@ -110,6 +111,7 @@ authRouter.get("/verify", async (req: Request, res: Response) => {
       role: user.role.name,
       name: user.name,
       last_name: user.last_name,
+      file_id: user.file_id ?? null,
     };
     const token = signToken(fresh);
 
@@ -141,7 +143,7 @@ authRouter.post("/register", async (req: Request, res: Response) => {
         .json({ success: false, error: "Validación fallida", errors });
     }
 
-    const { name, last_name, dni, email, celular, password, birth_date } =
+    const { name, last_name, dni, email, celular, password, birth_date, file_id } =
       validationResult.data;
 
     if (await prisma.user.findFirst({ where: { dni } })) {
@@ -175,6 +177,7 @@ authRouter.post("/register", async (req: Request, res: Response) => {
         password: hashedPassword,
         birth_date: new Date(birth_date),
         role_id: socioRole.id,
+        file_id: file_id ?? null,
       },
       include: { role: true },
     });
@@ -186,6 +189,7 @@ authRouter.post("/register", async (req: Request, res: Response) => {
       role: newUser.role.name,
       name: newUser.name,
       last_name: newUser.last_name,
+      file_id: newUser.file_id ?? null,
     };
     const token = signToken(jwtPayload);
 
@@ -335,6 +339,7 @@ authRouter.post("/google", async (req: Request, res: Response) => {
       role: user.role.name,
       name: user.name,
       last_name: user.last_name,
+      file_id: user.file_id ?? null,
     };
     const token = signToken(jwtPayload);
 

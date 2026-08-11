@@ -9,6 +9,7 @@ import { feesRouter } from "./routes/fees";
 import { bookingsRouter } from "./routes/bookings";
 import { disciplinesRouter } from "./routes/disciplines";
 import { enrollmentsRouter } from "./routes/enrollments";
+import { socioRouter } from "./routes/socio";
 
 const app = express();
 app.use(express.json());
@@ -26,6 +27,7 @@ app.use("/api/fees", feesRouter);
 app.use("/api/bookings", bookingsRouter);
 app.use("/api/disciplines", disciplinesRouter);
 app.use("/api/enrollments", enrollmentsRouter);
+app.use("/api/socio", socioRouter);
 
 const port = Number(process.env.PORT ?? 3001);
 app.listen(port, () => {
