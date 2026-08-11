@@ -9,12 +9,17 @@ import { z } from "zod";
 
 // Espejo del createSchema de bookings.ts. Si se desincroniza, este test deja de
 // proteger nada — está acá porque el schema real no se exporta.
+const amountSchema = z.coerce
+  .number()
+  .positive("El precio debe ser mayor a cero")
+  .max(99_999_999.99, "El precio es demasiado grande");
+
 const createSchema = z.object({
   schedule_id: z.number().int().positive(),
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "La fecha debe ser YYYY-MM-DD"),
   notes: z.string().max(1000).optional(),
   user_id: z.uuid("user_id inválido").optional(),
-  fee_id: z.number().int().positive().optional(),
+  amount: amountSchema.optional(),
   status: z.enum(["Pendiente", "Confirmada"]).optional(),
 });
 
@@ -25,7 +30,7 @@ test("el alta mínima del socio no necesita campos de gestión", () => {
   expect(r.success).toBe(true);
   if (r.success) {
     expect(r.data.user_id).toBeUndefined();
-    expect(r.data.fee_id).toBeUndefined();
+    expect(r.data.amount).toBeUndefined();
     expect(r.data.status).toBeUndefined();
   }
 });
@@ -34,7 +39,7 @@ test("acepta los tres campos de gestión juntos", () => {
   const r = createSchema.safeParse({
     ...base,
     user_id: "a0000000-0000-4000-8000-000000000004",
-    fee_id: 3,
+    amount: 15000,
     status: "Confirmada",
   });
   expect(r.success).toBe(true);
@@ -45,9 +50,9 @@ test("user_id tiene que ser UUID: un id numérico no pasa", () => {
   expect(createSchema.safeParse({ ...base, user_id: "4" }).success).toBe(false);
 });
 
-test("fee_id no puede ser cero ni negativo", () => {
-  expect(createSchema.safeParse({ ...base, fee_id: 0 }).success).toBe(false);
-  expect(createSchema.safeParse({ ...base, fee_id: -5 }).success).toBe(false);
+test("amount no puede ser cero ni negativo", () => {
+  expect(createSchema.safeParse({ ...base, amount: 0 }).success).toBe(false);
+  expect(createSchema.safeParse({ ...base, amount: -5 }).success).toBe(false);
 });
 
 test("status sólo admite Pendiente o Confirmada, nunca Cancelada", () => {

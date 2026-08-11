@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
 import { requireAuth, requireAdmin } from "../lib/auth";
+import { findOrCreateFeeForPlace } from "../lib/fee";
 
 export const schedulesRouter = Router();
 
@@ -40,43 +41,6 @@ function toTime(hhmm: string): Date {
   return new Date(`1970-01-01T${hhmm}:00Z`);
 }
 
-/**
- * Devuelve el id de una tarifa con ese monto **para ese espacio**: reusa la que ya
- * esté en otro turno del mismo lugar, o crea una nueva con el nombre del lugar.
- *
- * Va en el backend y no en el front porque si no serían dos viajes (buscar y después
- * crear) con una carrera en el medio: dos admins cargando el mismo precio a la vez
- * terminarían con dos tarifas iguales.
- *
- * Acotado al espacio a propósito: buscando por monto solo, un turno de vóley a 9000
- * podía terminar apuntando a "Cancha de fútbol 5 — 1 hora (2025)" (misma plata, otro
- * lugar) y el nombre quedaba sin sentido.
- */
-async function findOrCreateFee(amount: number, placeId: number): Promise<number> {
-  const place = await prisma.place.findUnique({
-    where: { id: placeId },
-    select: { name: true },
-  });
-  if (!place) throw Object.assign(new Error("place-not-found"), { code: "P2003" });
-
-  const enEstePlace = await prisma.schedule.findFirst({
-    where: { place_id: placeId, fee: { amount } },
-    orderBy: { fee: { created_at: "desc" } },
-    select: { fee_id: true },
-  });
-  if (enEstePlace) return enEstePlace.fee_id;
-
-  const creada = await prisma.fee.create({
-    data: {
-      // Nombre derivado del lugar y el monto: nadie lo elige, tiene que ser predecible.
-      name: `${place.name} — $${amount.toLocaleString("es-AR")}`,
-      amount,
-      description: "Creada automáticamente al cargar un horario.",
-    },
-    select: { id: true },
-  });
-  return creada.id;
-}
 
 function validationError(res: Response, error: z.ZodError) {
   const errors: Record<string, string> = {};
@@ -143,7 +107,7 @@ schedulesRouter.post(
       const schedule = await prisma.schedule.create({
         data: {
           place_id,
-          fee_id: await findOrCreateFee(amount, place_id),
+          fee_id: await findOrCreateFeeForPlace(amount, place_id),
           day_of_week,
           start_time: toTime(start_time),
           end_time: toTime(end_time),
@@ -202,7 +166,7 @@ schedulesRouter.patch(
         if (!actual) {
           return res.status(404).json({ success: false, error: "Horario no encontrado" });
         }
-        feeId = await findOrCreateFee(amount, actual.place_id);
+        feeId = await findOrCreateFeeForPlace(amount, actual.place_id);
       }
 
       const schedule = await prisma.schedule.update({
