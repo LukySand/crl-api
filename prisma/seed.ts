@@ -617,50 +617,43 @@ async function seedDisciplines(
 }
 
 /**
- * Inscripciones de socios a disciplinas (Enrollment M:N).
- * Idempotente mediante el índice único @@unique([user_id, discipline_id]).
+ * Inscripciones de ejemplo (socios ↔ disciplinas), con el modelo de historial
+ * (active/left_at). Idempotente: no re-inscribe si ya hay una activa para el par.
  */
 async function seedEnrollments(disciplineIds: Map<string, number>) {
-  const enrollments = [
+  // [socio, nombre de disciplina]
+  const inscripciones: [string, string][] = [
     // Fútbol
-    { user_id: USER.socioMartin, discipline: "Fútbol" },
-    { user_id: USER.socioRodrigo, discipline: "Fútbol" },
-    { user_id: USER.menorTomas, discipline: "Fútbol" },
+    [USER.socioMartin, "Fútbol"],
+    [USER.socioRodrigo, "Fútbol"],
+    [USER.menorTomas, "Fútbol"],
     // Vóley
-    { user_id: USER.socioLucia, discipline: "Vóley" },
-    { user_id: USER.socioValentina, discipline: "Vóley" },
+    [USER.socioLucia, "Vóley"],
+    [USER.socioValentina, "Vóley"],
+    // Hockey
+    [USER.socioValentina, "Hockey"],
     // Patín / Gimnasia Artística
-    { user_id: USER.menorSofia, discipline: "Patín" },
-    { user_id: USER.menorSofia, discipline: "Gimnasia Artística" },
-    { user_id: USER.socioValentina, discipline: "Gimnasia Artística" },
+    [USER.menorSofia, "Patín"],
+    [USER.menorSofia, "Gimnasia Artística"],
+    [USER.socioValentina, "Gimnasia Artística"],
     // Básquet
-    { user_id: USER.socioMartin, discipline: "Básquet" },
-    { user_id: USER.socioRodrigo, discipline: "Básquet" },
+    [USER.socioMartin, "Básquet"],
+    [USER.socioRodrigo, "Básquet"],
   ];
 
   let creadas = 0;
-
-  for (const { user_id, discipline } of enrollments) {
-    const discipline_id = disciplineIds.get(discipline);
+  for (const [user_id, discName] of inscripciones) {
+    const discipline_id = disciplineIds.get(discName);
     if (!discipline_id) continue;
-
-    await prisma.enrollment.upsert({
-      where: {
-        user_id_discipline_id: {
-          user_id,
-          discipline_id,
-        },
-      },
-      update: {},
-      create: {
-        user_id,
-        discipline_id,
-      },
+    const yaActiva = await prisma.enrollment.findFirst({
+      where: { user_id, discipline_id, active: true },
     });
-    creadas++;
+    if (!yaActiva) {
+      await prisma.enrollment.create({ data: { user_id, discipline_id } });
+      creadas++;
+    }
   }
-
-  console.log(`Inscripciones listas (${creadas}).`);
+  console.log(`Inscripciones listas (${creadas} nuevas).`);
 }
 
 async function seedBookings(

@@ -54,7 +54,7 @@ model User {
   name       String   @db.VarChar(50)
   last_name  String   @db.VarChar(50)
   dni        String   @db.VarChar(20)
-  email      String   @db.VarChar(75)
+  email      String   @unique @db.VarChar(75)
   celular    String?  @db.VarChar(20)
   password   String   @db.Text
   file_id    String?  @db.Char(128)
@@ -180,18 +180,24 @@ model DisciplineSchedule {
   @@map("discipline_schedules")
 }
 
-// Inscripción de un socio a una disciplina (M:N socio ↔ disciplina).
-// Baja = borrado físico: no hay historial que preservar (a diferencia de Booking).
+// Inscripción de un socio a una disciplina (M:N socio ↔ disciplina), con
+// historial de períodos.
+// ponytail: mismo truco que Booking — `active` es true mientras el socio cursa
+// y null cuando se va. MySQL ignora los null en el unique, así que puede haber
+// muchas filas históricas (cada período `created_at`→`left_at`) + una sola
+// activa por par socio-disciplina. Salir no borra: setea active=null + left_at.
 model Enrollment {
-  id            Int      @id @default(autoincrement())
-  user_id       String   @db.Char(128) // socio inscripto (UUID, como Booking.user_id)
+  id            Int       @id @default(autoincrement())
+  user_id       String    @db.Char(128) // socio inscripto (UUID, como Booking.user_id)
   discipline_id Int
-  created_at    DateTime @default(now())
+  created_at    DateTime  @default(now()) // alta del período (desde)
+  active        Boolean?  @default(true) // true = cursando; null = se dio de baja
+  left_at       DateTime? // baja del período (hasta); null mientras sigue activo
 
   user       User       @relation(fields: [user_id], references: [id])
   discipline Discipline @relation(fields: [discipline_id], references: [id])
 
-  @@unique([user_id, discipline_id]) // no inscribirse dos veces a la misma disciplina
+  @@unique([user_id, discipline_id, active]) // una sola inscripción activa por par
   @@map("enrollments")
 }
 
