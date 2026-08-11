@@ -10,11 +10,11 @@ const prisma = new PrismaClient({ adapter });
 /**
  * El seed tiene dos partes:
  *
- *  1. Roles — imprescindibles para que ande el registro. Se siembran siempre,
+ *  1. Roles — imprescindible para que ande el registro. Se siembran siempre,
  *     también en producción (los corre `entrypoint.sh`).
- *  2. Datos de ejemplo — usuarios, espacios, tarifas, horarios y reservas para
- *     tener con qué laburar en dev. NO se siembran en producción salvo que
- *     pongas SEED_DEMO=true a mano.
+ *  2. Datos de ejemplo — usuarios, espacios, tarifas, horarios, reservas y
+ *     disciplinas para tener con qué laburar en dev. NO se siembran en producción
+ *     salvo que pongas SEED_DEMO=true a mano.
  *
  * Todo es idempotente: podés correrlo las veces que quieras y no duplica nada.
  */
@@ -58,14 +58,6 @@ const BOOKING = {
 
 const DIRECCION = "Av. Libertador 1234, Posadas, Misiones";
 
-/**
- * Las tres canchas de ejemplo, con su grilla semanal.
- *
- * A partir de las 20:00 la hora sale `RECARGO_NOCHE` más cara: son dos tarifas
- * distintas, no un cálculo. Fee es inmutable y `Schedule.fee_id` es lo que define
- * el precio de cada turno, así que el turno de las 21 apunta a la tarifa noche y
- * el de las 18 a la de día. Un turno que arranca 20:00 ya cuenta como noche.
- */
 const RECARGO_NOCHE = 1000;
 const DESDE_NOCHE = "20:00";
 
@@ -94,15 +86,10 @@ const CANCHAS = [
 ] as const;
 
 const esNoche = (hhmm: string) => hhmm >= DESDE_NOCHE;
-
-/** Nombre de la tarifa nocturna a partir de la diurna. */
 const feeNoche = (fee: string) => `${fee} (noche)`;
-
-/** Turnos de 1 hora: "20:00" → "21:00". */
 const horaSiguiente = (hhmm: string) =>
   `${String(Number(hhmm.slice(0, 2)) + 1).padStart(2, "0")}:${hhmm.slice(3)}`;
 
-/** Prisma guarda TIME como DateTime: la fecha es fija, solo importa la hora. */
 function toTime(hhmm: string): Date {
   return new Date(`1970-01-01T${hhmm}:00Z`);
 }
@@ -111,7 +98,6 @@ function utcDate(yyyymmdd: string): Date {
   return new Date(`${yyyymmdd}T00:00:00Z`);
 }
 
-/** Hoy a medianoche UTC (mismo criterio que `src/lib/booking-date.ts`). */
 function todayUTC(): Date {
   const now = new Date();
   return new Date(
@@ -119,12 +105,6 @@ function todayUTC(): Date {
   );
 }
 
-/**
- * Próxima fecha que cae en `dayOfWeek`, corrida `weeksAhead` semanas.
- * Las reservas se generan relativas a hoy: si fueran fechas fijas, en un mes
- * el seed sembraría puras reservas vencidas. Con weeksAhead negativo sale una
- * fecha pasada, útil para tener historial.
- */
 function dateForDayOfWeek(dayOfWeek: number, weeksAhead = 0): Date {
   const base = todayUTC();
   const delta = (dayOfWeek - base.getUTCDay() + 7) % 7;
@@ -132,16 +112,21 @@ function dateForDayOfWeek(dayOfWeek: number, weeksAhead = 0): Date {
 }
 
 async function seedRoles() {
-    const roles = [RoleType.SuperAdmin, RoleType.Administrador, RoleType.Profesor, RoleType.Socio];
+  const roles = [
+    RoleType.SuperAdmin,
+    RoleType.Administrador,
+    RoleType.Profesor,
+    RoleType.Socio,
+  ];
 
-    for (const name of roles) {
-        await prisma.role.upsert({
-            where: { name },
-            update: {},
-            create: { name },
-        });
-    }
-    console.log(`Roles listos (${roles.length}).`);
+  for (const name of roles) {
+    await prisma.role.upsert({
+      where: { name },
+      update: {},
+      create: { name },
+    });
+  }
+  console.log(`Roles listos (${roles.length}).`);
 
   const rows = await prisma.role.findMany();
   return new Map<string, number>(rows.map((r) => [r.name, r.id]));
@@ -204,8 +189,6 @@ async function seedFiles() {
 }
 
 async function seedUsers(roleIds: Map<string, number>) {
-  // Un solo hash para todos: Bun.password usa argon2 y es lento a propósito,
-  // no tiene sentido pagarlo nueve veces por la misma contraseña de ejemplo.
   const password = await Bun.password.hash(DEMO_PASSWORD);
 
   const admin = roleIds.get(RoleType.Administrador)!;
@@ -275,7 +258,6 @@ async function seedUsers(roleIds: Map<string, number>) {
       last_name: "Cáceres",
       dni: "40233167",
       email: "rodrigo.caceres@crl.test",
-      // Sin celular: el campo es opcional y conviene que el seed lo ejercite.
       celular: null,
       file_id: null,
       birth_date: utcDate("1997-09-18"),
@@ -319,8 +301,6 @@ async function seedUsers(roleIds: Map<string, number>) {
     const { id, ...rest } = user;
     await prisma.user.upsert({
       where: { id },
-      // El password no va en el update: si alguien lo cambió probando,
-      // no tiene por qué volver atrás en cada corrida del seed.
       update: rest,
       create: { id, password, ...rest },
     });
@@ -329,9 +309,6 @@ async function seedUsers(roleIds: Map<string, number>) {
 }
 
 async function seedFamilies() {
-  // ponytail: el modelo Family hoy solo guarda el tutor (parent_id). Todavía
-  // no hay columna para el menor a cargo, así que esto siembra los grupos
-  // familiares de Martín y Lucía, sin el vínculo con Tomás y Sofía.
   const families = [
     { id: FAMILY.martin, parent_id: USER.socioMartin, responsible: true },
     { id: FAMILY.lucia, parent_id: USER.socioLucia, responsible: true },
@@ -348,14 +325,7 @@ async function seedFamilies() {
   console.log(`Familias listas (${families.length}).`);
 }
 
-/**
- * Tarifas. Fee es inmutable por diseño (ver schema.prisma): no se buscan por id
- * fijo ni se actualizan, se buscan por nombre y solo se crean si faltan. Así el
- * seed nunca le pisa el precio a una reserva vieja que apunta a esa fila.
- */
 async function seedFees() {
-  // Una tarifa noche por cancha, derivada de la base: si cambia el recargo,
-  // se toca RECARGO_NOCHE y nada más.
   const nocturnas = CANCHAS.map((c) => ({
     name: feeNoche(c.fee),
     amount: (c.base + RECARGO_NOCHE).toFixed(2),
@@ -413,7 +383,6 @@ async function seedFees() {
   return byName;
 }
 
-/** Espacios. Mismo criterio que Fee: se buscan por nombre, no por id fijo. */
 async function seedPlaces() {
   const places = [
     {
@@ -473,13 +442,10 @@ async function seedPlaces() {
   return byName;
 }
 
-/** Horarios. Acá sí hay unique natural (place_id, day_of_week, start_time) → upsert. */
 async function seedSchedules(
   placeIds: Map<string, number>,
   feeIds: Map<string, number>,
 ) {
-  // Las tres canchas de ejemplo salen generadas de CANCHAS: cada día × cada hora,
-  // con la tarifa noche si el turno arranca 20:00 o más tarde.
   const grillaCanchas = CANCHAS.flatMap((c) =>
     c.dias.flatMap((dia) =>
       c.horas.map((desde): [string, string, number, string, string] => [
@@ -505,6 +471,13 @@ async function seedSchedules(
     [
       "Cancha de fútbol 11",
       "Cancha de fútbol 11 — 1 hora",
+      5,
+      "18:00",
+      "19:00",
+    ], // NUEVO
+    [
+      "Cancha de fútbol 11",
+      "Cancha de fútbol 11 — 1 hora",
       6,
       "16:00",
       "17:00",
@@ -517,12 +490,13 @@ async function seedSchedules(
       "11:00",
     ],
     ["Pista de patín", "Pista de patín — 1 hora", 1, "16:00", "17:00"],
+    ["Pista de patín", "Pista de patín — 1 hora", 3, "18:00", "19:00"], // NUEVO
     ["Pista de patín", "Pista de patín — 1 hora", 4, "16:00", "17:00"],
+    ["Salón de eventos", "Salón de eventos — turno", 5, "20:00", "23:00"], // NUEVO
     ["Salón de eventos", "Salón de eventos — turno", 6, "20:00", "23:00"],
     ["Salón de eventos", "Salón de eventos — turno", 0, "12:00", "18:00"],
   ];
 
-  // Clave "espacio|día|hora" para que las reservas de abajo puedan encontrar su turno.
   const byKey = new Map<
     string,
     { id: number; fee_id: number; day_of_week: number }
@@ -556,44 +530,142 @@ async function seedSchedules(
   return byKey;
 }
 
-/**
- * Disciplinas del club. Se buscan por nombre (no hay unique natural) y se
- * relinkean en cada corrida. Profesor/cuota/espacio son opcionales: hockey y
- * patín quedan sin profesor asignado a propósito, para ejercitar el caso.
- */
 async function seedDisciplines(
   placeIds: Map<string, number>,
   feeIds: Map<string, number>,
 ) {
   // [nombre, profesor_id|null, nombre de tarifa|null, nombre de espacio|null]
   const disciplines: [string, string | null, string | null, string | null][] = [
-    ["Fútbol", USER.profeFutbol, "Cancha de fútbol 5 — 1 hora", "Cancha de fútbol 5 «A»"],
+    [
+      "Fútbol",
+      USER.profeFutbol,
+      "Cancha de fútbol 5 — 1 hora",
+      "Cancha de fútbol 5 «A»",
+    ],
     ["Vóley", USER.profeVoley, "Cancha de vóley — 1 hora", "Cancha de vóley"],
     ["Hockey", null, "Cancha de hockey — 1 hora", "Cancha de hockey"],
     ["Patín", null, "Pista de patín — 1 hora", "Pista de patín"],
+    [
+      "Gimnasia Artística",
+      USER.profeVoley,
+      "Pista de patín — 1 hora",
+      "Pista de patín",
+    ], // NUEVO
+    ["Básquet", null, "Cancha de vóley — 1 hora", "Cancha de vóley"], // NUEVO
   ];
+
+  // Horarios de clase por disciplina: [día (0=domingo), desde, hasta].
+  const classSchedules: Record<string, [number, string, string][]> = {
+    Fútbol: [
+      [1, "18:00", "19:30"],
+      [3, "18:00", "19:30"],
+    ],
+    Vóley: [
+      [2, "19:00", "20:30"],
+      [4, "19:00", "20:30"],
+    ],
+    Hockey: [[5, "17:30", "19:00"]],
+    Patín: [[6, "10:00", "11:30"]],
+    "Gimnasia Artística": [
+      [1, "16:00", "17:30"],
+      [3, "16:00", "17:30"],
+    ], // NUEVO
+    Básquet: [
+      [2, "17:30", "19:00"],
+      [4, "17:30", "19:00"],
+    ], // NUEVO
+  };
+
+  const byName = new Map<string, number>();
 
   for (const [name, professor_id, feeName, placeName] of disciplines) {
     const data = {
       name,
       professor_id,
-      fee_id: feeName ? feeIds.get(feeName) ?? null : null,
-      place_id: placeName ? placeIds.get(placeName) ?? null : null,
+      fee_id: feeName ? (feeIds.get(feeName) ?? null) : null,
+      place_id: placeName ? (placeIds.get(placeName) ?? null) : null,
     };
     const existing = await prisma.discipline.findFirst({ where: { name } });
-    if (existing) {
-      await prisma.discipline.update({ where: { id: existing.id }, data });
-    } else {
-      await prisma.discipline.create({ data });
+    const discipline = existing
+      ? await prisma.discipline.update({ where: { id: existing.id }, data })
+      : await prisma.discipline.create({ data });
+
+    byName.set(name, discipline.id);
+
+    for (const [day, from, to] of classSchedules[name] ?? []) {
+      const start_time = toTime(from);
+      await prisma.disciplineSchedule.upsert({
+        where: {
+          discipline_id_day_of_week_start_time: {
+            discipline_id: discipline.id,
+            day_of_week: day,
+            start_time,
+          },
+        },
+        update: { end_time: toTime(to) },
+        create: {
+          discipline_id: discipline.id,
+          day_of_week: day,
+          start_time,
+          end_time: toTime(to),
+        },
+      });
     }
   }
   console.log(`Disciplinas listas (${disciplines.length}).`);
+  return byName;
+}
+
+/**
+ * Inscripciones de socios a disciplinas (Enrollment M:N).
+ * Idempotente mediante el índice único @@unique([user_id, discipline_id]).
+ */
+async function seedEnrollments(disciplineIds: Map<string, number>) {
+  const enrollments = [
+    // Fútbol
+    { user_id: USER.socioMartin, discipline: "Fútbol" },
+    { user_id: USER.socioRodrigo, discipline: "Fútbol" },
+    { user_id: USER.menorTomas, discipline: "Fútbol" },
+    // Vóley
+    { user_id: USER.socioLucia, discipline: "Vóley" },
+    { user_id: USER.socioValentina, discipline: "Vóley" },
+    // Patín / Gimnasia Artística
+    { user_id: USER.menorSofia, discipline: "Patín" },
+    { user_id: USER.menorSofia, discipline: "Gimnasia Artística" },
+    { user_id: USER.socioValentina, discipline: "Gimnasia Artística" },
+    // Básquet
+    { user_id: USER.socioMartin, discipline: "Básquet" },
+    { user_id: USER.socioRodrigo, discipline: "Básquet" },
+  ];
+
+  let creadas = 0;
+
+  for (const { user_id, discipline } of enrollments) {
+    const discipline_id = disciplineIds.get(discipline);
+    if (!discipline_id) continue;
+
+    await prisma.enrollment.upsert({
+      where: {
+        user_id_discipline_id: {
+          user_id,
+          discipline_id,
+        },
+      },
+      update: {},
+      create: {
+        user_id,
+        discipline_id,
+      },
+    });
+    creadas++;
+  }
+
+  console.log(`Inscripciones listas (${creadas}).`);
 }
 
 async function seedBookings(
   schedules: Map<string, { id: number; fee_id: number; day_of_week: number }>,
 ) {
-  // [id, clave del turno, usuario, semanas de acá, estado, notas]
   const bookings: [
     string,
     string,
@@ -663,14 +735,11 @@ async function seedBookings(
 
     const data = {
       schedule_id: schedule.id,
-      // Snapshot de la tarifa: sale del turno, igual que en POST /api/bookings.
       fee_id: schedule.fee_id,
       user_id,
       date: dateForDayOfWeek(schedule.day_of_week, weeks),
       status,
       notes,
-      // active queda en NULL si está cancelada: así libera el turno en el
-      // unique (schedule_id, date, active) sin borrar la fila.
       active: status === "Cancelada" ? null : true,
     };
 
@@ -682,7 +751,6 @@ async function seedBookings(
       });
       creadas++;
     } catch (error: any) {
-      // El turno ya lo tomó una reserva real hecha a mano probando: no se pisa.
       if (error?.code === "P2002") {
         console.warn(
           `El turno ${key} ya está reservado, se saltea la reserva de ejemplo.`,
@@ -714,7 +782,9 @@ async function main() {
   const placeIds = await seedPlaces();
   const schedules = await seedSchedules(placeIds, feeIds);
   await seedBookings(schedules);
-  await seedDisciplines(placeIds, feeIds);
+
+  const disciplineIds = await seedDisciplines(placeIds, feeIds);
+  await seedEnrollments(disciplineIds);
 
   console.log(
     `\nSeed completado. Usuarios de ejemplo con contraseña "${DEMO_PASSWORD}":`,
