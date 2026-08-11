@@ -48,6 +48,14 @@ export const birthDateSchema = z
     return (m < 0 || (m === 0 && d < 0) ? age - 1 : age) >= 13;
   }, "Debes tener al menos 13 años para registrarte");
 
+  const fileIdSchema = z.object({
+    fileId: z
+        .string({ error: "Missing or invalid file id" })
+        .regex(/^[0-9]+$/, "Missing or invalid file id")
+        .transform(Number)
+        .optional(),
+});
+
 // ── Schemas compuestos ──────────────────────────────────────────────────
 export const registerSchema = z.object({
   name: nameSchema,
@@ -57,6 +65,7 @@ export const registerSchema = z.object({
   celular: celularSchema,
   password: passwordSchema,
   birth_date: birthDateSchema,
+  file_id: fileIdSchema,
 });
 
 export type RegisterData = z.infer<typeof registerSchema>;

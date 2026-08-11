@@ -14,10 +14,6 @@ const uploadSchema = z.object({
     file: z.instanceof(File, { message: "Missing file" }),
     kind: z.string({ error: "Missing kind" }).min(1, "Missing kind"),
     name: z.string({ error: "Missing name" }).min(1, "Missing name"),
-    user_id: z
-        .string({ error: "Missing or invalid user id" })
-        .regex(/^[0-9]+$/, "Missing or invalid user id")
-        .transform(Number),
 });
 
 function formatValidationErrors(issues: z.ZodIssue[]) {
@@ -63,7 +59,7 @@ filesRouter.get("/", async (req: Request, res: Response) => {
     const fileId = validationResult.data.fileId;
 
     const ifNoneMatch = req.headers["if-none-match"] ?? undefined;
-    const file = await Storage.getFile(fileId, ifNoneMatch);
+    const file = await Storage.getFile(String(fileId), ifNoneMatch);
     if (!file) {
         return res.status(404).json({ error: "File not found" });
     }
@@ -89,7 +85,6 @@ filesRouter.put("/", async (req: Request, res: Response) => {
         file: form.get("file"),
         kind: form.get("kind"),
         name: form.get("name"),
-        user_id: form.get("user_id"),
     });
 
     if (!validationResult.success) {
@@ -99,14 +94,13 @@ filesRouter.put("/", async (req: Request, res: Response) => {
         });
     }
 
-    const { file, kind, name, user_id } = validationResult.data;
+    const { file, kind, name } = validationResult.data;
 
     try {
         const result = await Storage.create({
             file,
             kind: kind as Storage.FileKind,
             name,
-            userId: user_id,
         });
         return res.status(200).json({ fileId: result });
     } catch (err) {
@@ -133,7 +127,7 @@ filesRouter.delete("/", async (req: Request, res: Response) => {
     const fileId = validationResult.data.fileId;
 
     try {
-        await Storage.remove(fileId);
+        await Storage.remove(String(fileId));
         return res.status(200).json({ deleted: true });
     } catch (err) {
         console.error(err);
