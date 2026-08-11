@@ -573,6 +573,7 @@ async function seedDisciplines(
     ["Patín", null, "Pista de patín — 1 hora", "Pista de patín"],
   ];
 
+  const byName = new Map<string, number>();
   for (const [name, professor_id, feeName, placeName] of disciplines) {
     const data = {
       name,
@@ -581,13 +582,41 @@ async function seedDisciplines(
       place_id: placeName ? placeIds.get(placeName) ?? null : null,
     };
     const existing = await prisma.discipline.findFirst({ where: { name } });
-    if (existing) {
-      await prisma.discipline.update({ where: { id: existing.id }, data });
-    } else {
-      await prisma.discipline.create({ data });
-    }
+    const row = existing
+      ? await prisma.discipline.update({ where: { id: existing.id }, data })
+      : await prisma.discipline.create({ data });
+    byName.set(name, row.id);
   }
   console.log(`Disciplinas listas (${disciplines.length}).`);
+  return byName;
+}
+
+/**
+ * Inscripciones de ejemplo (socios ↔ disciplinas), con el modelo de historial
+ * (active/left_at). Idempotente: no re-inscribe si ya hay una activa para el par.
+ */
+async function seedEnrollments(disciplineIds: Map<string, number>) {
+  // [socio, nombre de disciplina]
+  const inscripciones: [string, string][] = [
+    [USER.socioMartin, "Fútbol"],
+    [USER.socioRodrigo, "Fútbol"],
+    [USER.socioLucia, "Vóley"],
+    [USER.socioValentina, "Hockey"],
+  ];
+
+  let creadas = 0;
+  for (const [user_id, discName] of inscripciones) {
+    const discipline_id = disciplineIds.get(discName);
+    if (!discipline_id) continue;
+    const yaActiva = await prisma.enrollment.findFirst({
+      where: { user_id, discipline_id, active: true },
+    });
+    if (!yaActiva) {
+      await prisma.enrollment.create({ data: { user_id, discipline_id } });
+      creadas++;
+    }
+  }
+  console.log(`Inscripciones listas (${creadas} nuevas).`);
 }
 
 async function seedBookings(
@@ -714,7 +743,8 @@ async function main() {
   const placeIds = await seedPlaces();
   const schedules = await seedSchedules(placeIds, feeIds);
   await seedBookings(schedules);
-  await seedDisciplines(placeIds, feeIds);
+  const disciplineIds = await seedDisciplines(placeIds, feeIds);
+  await seedEnrollments(disciplineIds);
 
   console.log(
     `\nSeed completado. Usuarios de ejemplo con contraseña "${DEMO_PASSWORD}":`,
