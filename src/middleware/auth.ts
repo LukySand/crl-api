@@ -11,6 +11,7 @@ export interface AuthUser {
   role: string;
   name: string;
   last_name: string;
+  file_id: string | null;
 }
 
 export interface AuthedRequest extends Request {
