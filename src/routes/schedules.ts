@@ -41,6 +41,31 @@ function toTime(hhmm: string): Date {
   return new Date(`1970-01-01T${hhmm}:00Z`);
 }
 
+/**
+ * True si el turno [start, end) se superpone con otro del mismo espacio y día.
+ * Dos intervalos se pisan si uno empieza antes de que el otro termine y viceversa
+ * (start < otroEnd && end > otroStart). `exceptId` excluye el turno que se edita.
+ */
+async function haySolapamiento(
+  place_id: number,
+  day_of_week: number,
+  start: Date,
+  end: Date,
+  exceptId?: number,
+): Promise<boolean> {
+  const choque = await prisma.schedule.findFirst({
+    where: {
+      place_id,
+      day_of_week,
+      ...(exceptId !== undefined && { id: { not: exceptId } }),
+      start_time: { lt: end },
+      end_time: { gt: start },
+    },
+    select: { id: true },
+  });
+  return choque !== null;
+}
+
 
 function validationError(res: Response, error: z.ZodError) {
   const errors: Record<string, string> = {};
@@ -104,13 +129,22 @@ schedulesRouter.post(
 
       const { place_id, amount, day_of_week, start_time, end_time } = parsed.data;
 
+      const start = toTime(start_time);
+      const end = toTime(end_time);
+      if (await haySolapamiento(place_id, day_of_week, start, end)) {
+        return res.status(409).json({
+          success: false,
+          error: "El turno se superpone con otro del mismo espacio y día",
+        });
+      }
+
       const schedule = await prisma.schedule.create({
         data: {
           place_id,
           fee_id: await findOrCreateFeeForPlace(amount, place_id),
           day_of_week,
-          start_time: toTime(start_time),
-          end_time: toTime(end_time),
+          start_time: start,
+          end_time: end,
         },
         include: { fee: true },
       });
@@ -155,37 +189,51 @@ schedulesRouter.patch(
 
       const { amount, day_of_week, start_time, end_time } = parsed.data;
 
-      // La tarifa se resuelve dentro del espacio del turno, así que hace falta
-      // saber a qué espacio pertenece antes de tocar el precio.
-      let feeId: number | undefined;
-      if (amount !== undefined) {
-        const actual = await prisma.schedule.findUnique({
-          where: { id },
-          select: { place_id: true },
-        });
-        if (!actual) {
-          return res.status(404).json({ success: false, error: "Horario no encontrado" });
-        }
-        feeId = await findOrCreateFeeForPlace(amount, actual.place_id);
+      // El turno actual: hace falta para el espacio (tarifa) y para chequear
+      // solapamiento con los valores efectivos (los nuevos si vienen, los
+      // actuales si no).
+      const actual = await prisma.schedule.findUnique({
+        where: { id },
+        select: { place_id: true, day_of_week: true, start_time: true, end_time: true },
+      });
+      if (!actual) {
+        return res.status(404).json({ success: false, error: "Horario no encontrado" });
       }
+
+      const effDay = day_of_week ?? actual.day_of_week;
+      const effStart = start_time !== undefined ? toTime(start_time) : actual.start_time;
+      const effEnd = end_time !== undefined ? toTime(end_time) : actual.end_time;
+
+      if (effStart >= effEnd) {
+        return res.status(400).json({
+          success: false,
+          error: "La hora de fin debe ser posterior a la de inicio",
+        });
+      }
+      // Solo revalidar solapamiento si cambió el día o alguna hora.
+      if (day_of_week !== undefined || start_time !== undefined || end_time !== undefined) {
+        if (await haySolapamiento(actual.place_id, effDay, effStart, effEnd, id)) {
+          return res.status(409).json({
+            success: false,
+            error: "El turno se superpone con otro del mismo espacio y día",
+          });
+        }
+      }
+
+      const feeId =
+        amount !== undefined ? await findOrCreateFeeForPlace(amount, actual.place_id) : undefined;
 
       const schedule = await prisma.schedule.update({
         where: { id },
         data: {
           ...(feeId !== undefined && { fee_id: feeId }),
           ...(day_of_week !== undefined && { day_of_week }),
-          ...(start_time !== undefined && { start_time: toTime(start_time) }),
-          ...(end_time !== undefined && { end_time: toTime(end_time) }),
+          ...(start_time !== undefined && { start_time: effStart }),
+          ...(end_time !== undefined && { end_time: effEnd }),
         },
         include: { fee: true },
       });
 
-      if (schedule.start_time >= schedule.end_time) {
-        return res.status(400).json({
-          success: false,
-          error: "La hora de fin debe ser posterior a la de inicio",
-        });
-      }
       return res.json({ success: true, schedule });
     } catch (error: any) {
       if (error?.code === "P2025") {
