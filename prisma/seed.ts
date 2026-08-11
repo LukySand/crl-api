@@ -71,7 +71,7 @@ const DESDE_NOCHE = "20:00";
 
 const CANCHAS = [
   {
-    place: "Cancha de fútbol 5",
+    place: "Cancha de fútbol 5 «A»",
     fee: "Cancha de fútbol 5 — 1 hora",
     base: 12000,
     dias: [1, 3, 5, 6], // lunes, miércoles, viernes, sábado
@@ -570,7 +570,7 @@ async function seedBookings(
   ][] = [
     [
       BOOKING.confirmadaF5,
-      "Cancha de fútbol 5|1|19:00",
+      "Cancha de fútbol 5 «A»|1|19:00",
       USER.socioMartin,
       1,
       "Confirmada",
@@ -578,7 +578,7 @@ async function seedBookings(
     ],
     [
       BOOKING.pendienteF5,
-      "Cancha de fútbol 5|6|10:00",
+      "Cancha de fútbol 5 «A»|6|10:00",
       USER.socioRodrigo,
       1,
       "Pendiente",
