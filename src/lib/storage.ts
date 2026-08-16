@@ -93,6 +93,12 @@ export namespace Storage {
      * The kind of the file, a.k.a. subfolder.
      */
     kind: FileKind;
+
+    /**
+     * Id of the user uploading the file. Only used for logging: `File` has no
+     * owner column, so this is the only trace of who a failed upload belonged to.
+     */
+    userId: string;
   };
 
   export type FileRead = {
@@ -279,6 +285,7 @@ export namespace Storage {
             file_mime: fileType.mime,
             kind: arg.kind,
             name: arg.name,
+            uid: arg.userId,
           },
         });
         await fs.rm(savePath, { force: true }).catch(() => {});

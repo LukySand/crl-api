@@ -132,6 +132,7 @@ socioRouter.patch("/profile-image", async (req: AuthedRequest, res: Response) =>
                 file,
                 kind: "accountImages",
                 name: file.name,
+                userId,
             });
         } catch (err) {
             console.error("Error uploading profile image.", {

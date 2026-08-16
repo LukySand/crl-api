@@ -1,12 +1,8 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
-<<<<<<< HEAD
-import { requireAuth, requireRole } from "../lib/auth";
-import { TIME, toTime } from "../lib/time";
-=======
 import { requireAuth, requireAdmin } from "../lib/auth";
->>>>>>> admin-reserve-place-management
+import { TIME, toTime } from "../lib/time";
 
 export const disciplinesRouter = Router();
 

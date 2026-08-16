@@ -1,19 +1,11 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
-<<<<<<< HEAD
-import { requireAuth, requireRole } from "../lib/auth";
+import { requireAuth, requireAdmin } from "../lib/auth";
+import { findOrCreateFeeForPlace } from "../lib/fee";
 import { TIME, toTime } from "../lib/time";
 
 export const schedulesRouter = Router();
-
-=======
-import { requireAuth, requireAdmin } from "../lib/auth";
-import { findOrCreateFeeForPlace } from "../lib/fee";
-
-export const schedulesRouter = Router();
-
-const TIME = /^([01]\d|2[0-3]):[0-5]\d$/; // HH:MM 24h
 
 // El precio del turno se manda como monto, no como fee_id: quien carga horarios
 // piensa en "la hora sale $12.000", no en elegir una fila de tarifas. La tarifa la
@@ -23,7 +15,6 @@ const amountSchema = z.coerce
   .positive("El precio debe ser mayor a cero")
   .max(99_999_999.99, "El precio es demasiado grande");
 
->>>>>>> admin-reserve-place-management
 const scheduleSchema = z
   .object({
     place_id: z.number().int().positive(),
@@ -44,15 +35,6 @@ const scheduleUpdateSchema = z.object({
   end_time: z.string().regex(TIME, "Formato de hora inválido (HH:MM)").optional(),
 });
 
-<<<<<<< HEAD
-=======
-/** Prisma guarda TIME como DateTime; usamos una fecha fija y solo importa la hora. */
-function toTime(hhmm: string): Date {
-  return new Date(`1970-01-01T${hhmm}:00Z`);
-}
-
-
->>>>>>> admin-reserve-place-management
 function validationError(res: Response, error: z.ZodError) {
   const errors: Record<string, string> = {};
   error.issues.forEach((e) => {

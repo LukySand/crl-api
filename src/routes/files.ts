@@ -109,10 +109,7 @@ filesRouter.put("/", requireAuth, async (req: Request, res: Response) => {
             file,
             kind: kind as Storage.FileKind,
             name,
-<<<<<<< HEAD
-=======
             userId: req.user!.id,
->>>>>>> admin-reserve-place-management
         });
         return res.status(200).json({ fileId: result });
     } catch (err) {
