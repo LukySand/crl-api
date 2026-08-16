@@ -1,13 +1,17 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
-import { requireAuth } from "../lib/auth";
+import { requireAuth, isAdmin } from "../lib/auth";
+import { findOrCreateFeeForPlace } from "../lib/fee";
 import {
   parseDate,
   matchesDayOfWeek,
   todayInClub,
   nowTimeInClub,
   timeToHHMM,
+  ultimaFechaReservable,
+  DIAS_ADELANTE_SOCIO,
+  DIAS_ADELANTE_ADMIN,
 } from "../lib/booking-date";
 
 export const bookingsRouter = Router();
@@ -15,18 +19,52 @@ export const bookingsRouter = Router();
 // Todo lo de acá exige sesión: no se reserva sin estar logueado.
 bookingsRouter.use(requireAuth);
 
+/**
+ * Lo que se devuelve de cada reserva.
+ *
+ * `user` va con select y no con `true`: el modelo User tiene `password`, y un
+ * include plano la mandaría en cada respuesta. Sólo lo necesario para que la
+ * gestión sepa de quién es la reserva.
+ */
+const bookingInclude = {
+  schedule: { include: { place: true } },
+  fee: true,
+  user: {
+    select: { id: true, name: true, last_name: true, dni: true, email: true, celular: true },
+  },
+} as const;
+
+// Igual que en schedules.ts: se manda el monto, no un fee_id — quien reserva no
+// tiene por qué pensar en tarifas, piensa en plata. findOrCreateFeeForPlace
+// resuelve la fila.
+// nonnegative, no positive: una reserva puede ser gratuita (evento, cortesía),
+// a diferencia de un turno (schedules.ts), que siempre cobra algo.
+const amountSchema = z.coerce
+  .number()
+  .nonnegative("El precio no puede ser negativo")
+  .max(99_999_999.99, "El precio es demasiado grande");
+
 const createSchema = z.object({
   schedule_id: z.number().int().positive(),
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "La fecha debe ser YYYY-MM-DD"),
   notes: z.string().max(1000).optional(),
+
+  // Campos de gestión. Si los manda un socio se responde 403, no se ignoran en
+  // silencio: mandarlos es un intento de reservar a nombre de otro o de fijarse
+  // el precio, y eso tiene que fallar fuerte.
+  user_id: z.uuid("user_id inválido").optional(),
+  amount: amountSchema.optional(),
+  status: z.enum(["Pendiente", "Confirmada"]).optional(),
 });
 
 const updateSchema = z.object({
   notes: z.string().max(1000).optional(),
   status: z.enum(["Pendiente", "Confirmada"]).optional(),
+  // Precio puntual de esta reserva. No toca Schedule.fee_id: las próximas
+  // reservas de ese turno siguen saliendo al precio del turno.
+  amount: amountSchema.optional(),
 });
 
-const isAdmin = (req: Request) => req.user?.role === "Administrador";
 
 /**
  * GET /api/bookings — reservas. El Administrador ve todas; el resto, las propias.
@@ -48,7 +86,7 @@ bookingsRouter.get("/", async (req: Request, res: Response) => {
         ...(typeof status === "string" && { status: status as any }),
         ...(placeId !== undefined && { schedule: { place_id: placeId } }),
       },
-      include: { schedule: { include: { place: true } }, fee: true },
+      include: bookingInclude,
       orderBy: [{ date: "desc" }],
     });
 
@@ -97,7 +135,7 @@ bookingsRouter.get("/:id", async (req: Request<{ id: string }>, res: Response) =
   try {
     const booking = await prisma.booking.findUnique({
       where: { id: req.params.id },
-      include: { schedule: { include: { place: true } }, fee: true },
+      include: bookingInclude,
     });
 
     if (!booking) {
@@ -114,7 +152,14 @@ bookingsRouter.get("/:id", async (req: Request<{ id: string }>, res: Response) =
   }
 });
 
-/** POST /api/bookings — reserva un turno para una fecha. El socio sale del token. */
+/**
+ * POST /api/bookings — reserva un turno para una fecha.
+ *
+ * El socio reserva para sí mismo, a la tarifa del turno y siempre en Pendiente.
+ * La gestión puede además: reservar a nombre de otro (`user_id`), fijar una tarifa
+ * distinta (`fee_id`) y dejarla ya paga (`status`). Los tres campos se rechazan
+ * con 403 si los manda alguien sin rol de gestión.
+ */
 bookingsRouter.post("/", async (req: Request, res: Response) => {
   try {
     const parsed = createSchema.safeParse(req.body ?? {});
@@ -127,10 +172,49 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
     }
 
     const { schedule_id, date, notes } = parsed.data;
+    const admin = isAdmin(req);
     const when = parseDate(date);
 
     if (Number.isNaN(when.getTime())) {
       return res.status(400).json({ success: false, error: "Fecha inválida" });
+    }
+
+    // ── Campos de gestión ────────────────────────────────────────────────
+    // Un socio que manda cualquiera de los tres recibe 403. No se ignoran en
+    // silencio: es un intento de reservar por otro o de elegirse el precio.
+    if (!admin) {
+      if (parsed.data.user_id && parsed.data.user_id !== req.user!.id) {
+        return res
+          .status(403)
+          .json({ success: false, error: "No podés reservar a nombre de otro socio" });
+      }
+      if (parsed.data.amount !== undefined) {
+        return res
+          .status(403)
+          .json({ success: false, error: "No podés elegir el precio de la reserva" });
+      }
+      if (parsed.data.status !== undefined) {
+        return res
+          .status(403)
+          .json({ success: false, error: "No podés fijar el estado de la reserva" });
+      }
+    }
+
+    let userId = req.user!.id;
+    if (admin && parsed.data.user_id) {
+      const socio = await prisma.user.findUnique({
+        where: { id: parsed.data.user_id },
+        select: { id: true, active: true },
+      });
+      if (!socio) {
+        return res.status(404).json({ success: false, error: "El socio indicado no existe" });
+      }
+      if (!socio.active) {
+        return res
+          .status(409)
+          .json({ success: false, error: "El socio está dado de baja" });
+      }
+      userId = socio.id;
     }
 
     const hoy = todayInClub();
@@ -138,9 +222,31 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: "No se puede reservar una fecha pasada" });
     }
 
-    const schedule = await prisma.schedule.findUnique({ where: { id: schedule_id } });
+    // Tope hacia adelante: 3 semanas para el socio, 6 meses para la gestión.
+    const tope = ultimaFechaReservable(
+      admin ? DIAS_ADELANTE_ADMIN : DIAS_ADELANTE_SOCIO,
+    );
+    if (date > tope) {
+      return res.status(400).json({
+        success: false,
+        error: admin
+          ? "No se puede reservar con más de 6 meses de anticipación"
+          : "No se puede reservar con más de 3 semanas de anticipación",
+      });
+    }
+
+    const schedule = await prisma.schedule.findUnique({
+      where: { id: schedule_id },
+      include: { place: { select: { active: true } } },
+    });
     if (!schedule) {
       return res.status(404).json({ success: false, error: "El horario no existe" });
+    }
+    // Un espacio dado de baja no se puede reservar (las reservas viejas siguen ahí)
+    if (!schedule.place.active) {
+      return res
+        .status(409)
+        .json({ success: false, error: "El espacio no está disponible" });
     }
 
     // Hoy a las 16:00 no se puede reservar el turno de las 08:00. Va acá y no sólo
@@ -160,18 +266,28 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
       });
     }
 
+    // Snapshot del precio. Por defecto sale del turno, no del cliente: si no,
+    // cualquiera reservaría el salón a precio de cancha. La gestión sí puede
+    // pisarlo (precio especial, evento, socio con descuento) — reusa una tarifa
+    // existente de ese espacio con ese monto, o crea una nueva. No toca
+    // Schedule.fee_id: es el precio de ESTA reserva, no del turno en general.
+    const feeId =
+      admin && parsed.data.amount !== undefined
+        ? await findOrCreateFeeForPlace(parsed.data.amount, schedule.place_id)
+        : schedule.fee_id;
+
     const booking = await prisma.booking.create({
       data: {
         schedule_id,
-        // Snapshot de la tarifa vigente. Sale del schedule, no del cliente:
-        // si no, cualquiera reservaría el salón a precio de cancha.
-        fee_id: schedule.fee_id,
-        user_id: req.user!.id,
+        fee_id: feeId,
+        user_id: userId,
         date: when,
         notes,
+        // La gestión puede darla por paga en el acto (cobró en el club).
+        ...(admin && parsed.data.status ? { status: parsed.data.status } : {}),
         active: true,
       },
-      include: { schedule: { include: { place: true } }, fee: true },
+      include: bookingInclude,
     });
 
     return res.status(201).json({ success: true, booking });
@@ -202,8 +318,9 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
 });
 
 /**
- * PATCH /api/bookings/:id — el dueño edita sus notas; el Administrador confirma.
- * Cancelar no se hace acá, va por DELETE.
+ * PATCH /api/bookings/:id — el dueño edita sus notas; el Administrador confirma,
+ * cambia el precio puntual de esta reserva, o ambos. Cancelar no se hace acá, va
+ * por DELETE.
  */
 bookingsRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response) => {
   try {
@@ -216,7 +333,10 @@ bookingsRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response)
       return res.status(400).json({ success: false, error: "Validación fallida", errors });
     }
 
-    const existing = await prisma.booking.findUnique({ where: { id: req.params.id } });
+    const existing = await prisma.booking.findUnique({
+      where: { id: req.params.id },
+      select: { user_id: true, schedule: { select: { place_id: true } } },
+    });
     if (!existing) {
       return res.status(404).json({ success: false, error: "Reserva no encontrada" });
     }
@@ -225,12 +345,24 @@ bookingsRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response)
       return res.status(403).json({ success: false, error: "No tenés permisos para esta acción" });
     }
 
-    const { notes, status } = parsed.data;
+    const { notes, status, amount } = parsed.data;
     if (status && !isAdmin(req)) {
       return res
         .status(403)
         .json({ success: false, error: "Solo un administrador puede cambiar el estado" });
     }
+    if (amount !== undefined && !isAdmin(req)) {
+      return res
+        .status(403)
+        .json({ success: false, error: "Solo un administrador puede cambiar el precio" });
+    }
+
+    // No toca Schedule.fee_id: el resto de las reservas de ese turno sigue
+    // saliendo al precio del turno, esto sólo repuntea ESTA reserva.
+    const feeId =
+      amount !== undefined
+        ? await findOrCreateFeeForPlace(amount, existing.schedule.place_id)
+        : undefined;
 
     // El estado sí puede cambiar entre la lectura y la escritura (otra pestaña
     // cancelando). Va como condición del UPDATE, no como if previo: si alguien
@@ -240,6 +372,7 @@ bookingsRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response)
       data: {
         ...(notes !== undefined && { notes }),
         ...(status !== undefined && { status }),
+        ...(feeId !== undefined && { fee_id: feeId }),
       },
     });
     if (count === 0) {
@@ -248,7 +381,7 @@ bookingsRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response)
 
     const booking = await prisma.booking.findUnique({
       where: { id: req.params.id },
-      include: { schedule: { include: { place: true } }, fee: true },
+      include: bookingInclude,
     });
 
     return res.json({ success: true, booking });

@@ -1,10 +1,6 @@
-import { Router, type Response } from "express";
+import { Router, type Request, type Response } from "express";
 import prisma from "../lib/prisma";
-import {
-  authenticate,
-  requireRole,
-  type AuthedRequest,
-} from "../middleware/auth";
+import { requireAuth, requireAdmin } from "../lib/auth";
 import {
   adminCreateUserSchema,
   adminUpdateUserSchema,
@@ -15,7 +11,7 @@ import type { ZodError } from "zod";
 export const adminRouter = Router();
 
 // Todo /api/admin requiere sesión y rol de gestión.
-adminRouter.use(authenticate, requireRole("SuperAdmin", "Administrador"));
+adminRouter.use(requireAuth, requireAdmin);
 
 // Campos que devolvemos de un usuario (nunca la password).
 const userSelect = {
@@ -27,6 +23,7 @@ const userSelect = {
   celular: true,
   birth_date: true,
   active: true,
+  file_id: true, // para mostrar la foto en los listados y buscadores
   role: { select: { name: true } },
 } as const;
 
@@ -45,7 +42,7 @@ function zodErrors(err: ZodError): Record<string, string> {
  * ponytail: sin paginación ni filtros server-side. Dataset tamaño club;
  * la búsqueda y el filtro por rol se hacen en el front.
  */
-adminRouter.get("/users", async (_req: AuthedRequest, res: Response) => {
+adminRouter.get("/users", async (_req: Request, res: Response) => {
   try {
     const users = await prisma.user.findMany({
       orderBy: [{ last_name: "asc" }, { name: "asc" }],
@@ -62,7 +59,7 @@ adminRouter.get("/users", async (_req: AuthedRequest, res: Response) => {
  * POST /api/admin/users — alta de usuario con rol.
  * Solo un SuperAdmin puede crear otro SuperAdmin.
  */
-adminRouter.post("/users", async (req: AuthedRequest, res: Response) => {
+adminRouter.post("/users", async (req: Request, res: Response) => {
   try {
     const parsed = adminCreateUserSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
@@ -120,7 +117,7 @@ adminRouter.post("/users", async (req: AuthedRequest, res: Response) => {
  * PUT /api/admin/users/:id — edición. La contraseña es opcional (vacío = no cambia).
  * Solo un SuperAdmin puede tocar cuentas SuperAdmin (existentes o de destino).
  */
-adminRouter.put("/users/:id", async (req: AuthedRequest, res: Response) => {
+adminRouter.put("/users/:id", async (req: Request, res: Response) => {
   try {
     const id = req.params.id;
     if (typeof id !== "string") {
@@ -202,7 +199,7 @@ adminRouter.put("/users/:id", async (req: AuthedRequest, res: Response) => {
  * libera el turno pero queda el historial). Las pasadas no se tocan. Va todo en
  * una transacción para que no quede a medias.
  */
-adminRouter.delete("/users/:id", async (req: AuthedRequest, res: Response) => {
+adminRouter.delete("/users/:id", async (req: Request, res: Response) => {
   try {
     const id = req.params.id;
     if (typeof id !== "string") {
@@ -251,7 +248,7 @@ adminRouter.delete("/users/:id", async (req: AuthedRequest, res: Response) => {
  * PATCH /api/admin/users/:id/reactivate — reactiva una cuenta dada de baja.
  * Solo un SuperAdmin puede reactivar cuentas SuperAdmin.
  */
-adminRouter.patch("/users/:id/reactivate", async (req: AuthedRequest, res: Response) => {
+adminRouter.patch("/users/:id/reactivate", async (req: Request, res: Response) => {
   try {
     const id = req.params.id;
     if (typeof id !== "string") {

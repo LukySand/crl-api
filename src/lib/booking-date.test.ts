@@ -8,6 +8,9 @@ import {
   timeToHHMM,
   todayInClub,
   nowTimeInClub,
+  ultimaFechaReservable,
+  DIAS_ADELANTE_SOCIO,
+  DIAS_ADELANTE_ADMIN,
 } from "./booking-date";
 
 test("parsea en UTC, sin correrse por el huso del server", () => {
@@ -43,6 +46,27 @@ test("todayInClub devuelve YYYY-MM-DD comparable como string", () => {
   expect(hoy).toMatch(/^\d{4}-\d{2}-\d{2}$/);
   // El orden lexicográfico tiene que coincidir con el cronológico
   expect("2026-08-09" < "2026-08-10").toBe(true);
+});
+
+test("el tope del socio cae 21 días después de hoy", () => {
+  const hoy = todayInClub();
+  const tope = ultimaFechaReservable(DIAS_ADELANTE_SOCIO);
+  expect(tope).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  // Se compara como fecha real, no como string, para atrapar el cruce de mes
+  const dias =
+    (parseDate(tope).getTime() - parseDate(hoy).getTime()) / 86_400_000;
+  expect(dias).toBe(21);
+});
+
+test("el tope de gestión es mayor que el del socio", () => {
+  expect(DIAS_ADELANTE_ADMIN).toBeGreaterThan(DIAS_ADELANTE_SOCIO);
+  expect(ultimaFechaReservable(DIAS_ADELANTE_ADMIN) > ultimaFechaReservable(DIAS_ADELANTE_SOCIO)).toBe(true);
+});
+
+test("hoy nunca queda fuera del tope (comparable como string)", () => {
+  const hoy = todayInClub();
+  expect(hoy <= ultimaFechaReservable(DIAS_ADELANTE_SOCIO)).toBe(true);
+  expect(hoy <= ultimaFechaReservable(0)).toBe(true);
 });
 
 test("nowTimeInClub devuelve HH:MM de 24h con cero adelante", () => {

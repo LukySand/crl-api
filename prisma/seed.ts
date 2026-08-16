@@ -63,7 +63,7 @@ const DESDE_NOCHE = "20:00";
 
 const CANCHAS = [
   {
-    place: "Cancha de fútbol 5 «A»",
+    place: "Cancha de fútbol 5",
     fee: "Cancha de fútbol 5 — 1 hora",
     base: 12000,
     dias: [1, 3, 5, 6], // lunes, miércoles, viernes, sábado
@@ -386,7 +386,7 @@ async function seedFees() {
 async function seedPlaces() {
   const places = [
     {
-      name: "Cancha de fútbol 5 «A»",
+      name: "Cancha de fútbol 5",
       address: DIRECCION,
       capacity: 10,
       description: "Césped sintético, iluminación LED y vestuarios.",
@@ -540,7 +540,7 @@ async function seedDisciplines(
       "Fútbol",
       USER.profeFutbol,
       "Cancha de fútbol 5 — 1 hora",
-      "Cancha de fútbol 5 «A»",
+      "Cancha de fútbol 5",
     ],
     ["Vóley", USER.profeVoley, "Cancha de vóley — 1 hora", "Cancha de vóley"],
     ["Hockey", null, "Cancha de hockey — 1 hora", "Cancha de hockey"],
@@ -669,7 +669,7 @@ async function seedBookings(
   ][] = [
     [
       BOOKING.confirmadaF5,
-      "Cancha de fútbol 5 «A»|1|19:00",
+      "Cancha de fútbol 5|1|19:00",
       USER.socioMartin,
       1,
       "Confirmada",
@@ -677,7 +677,7 @@ async function seedBookings(
     ],
     [
       BOOKING.pendienteF5,
-      "Cancha de fútbol 5 «A»|6|10:00",
+      "Cancha de fútbol 5|6|10:00",
       USER.socioRodrigo,
       1,
       "Pendiente",
