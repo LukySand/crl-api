@@ -198,6 +198,52 @@ disciplinesRouter.delete(
   },
 );
 
+/**
+ * PATCH /api/disciplines/:id/full — marca/desmarca el cupo lleno (#5). Lo puede
+ * tocar el **profesor asignado** a la disciplina o un **Administrador**; con el
+ * cupo lleno el back rechaza nuevas inscripciones (ver enrollments.ts).
+ */
+disciplinesRouter.patch(
+  "/:id/full",
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id)) {
+        return res.status(400).json({ success: false, error: "ID inválido" });
+      }
+      const parsed = z.object({ full: z.boolean() }).safeParse(req.body ?? {});
+      if (!parsed.success) return validationError(res, parsed.error);
+
+      const disc = await prisma.discipline.findUnique({
+        where: { id },
+        select: { professor_id: true },
+      });
+      if (!disc) {
+        return res.status(404).json({ success: false, error: "Disciplina no encontrada" });
+      }
+      const esAdmin = req.user!.role === "Administrador";
+      const esProfeAsignado = req.user!.role === "Profesor" && disc.professor_id === req.user!.id;
+      if (!esAdmin && !esProfeAsignado) {
+        return res.status(403).json({ success: false, error: "No tenés permisos para esta acción" });
+      }
+
+      const discipline = await prisma.discipline.update({
+        where: { id },
+        data: { full: parsed.data.full },
+        include: disciplineInclude,
+      });
+      return res.json({ success: true, discipline });
+    } catch (error: any) {
+      if (error?.code === "P2025") {
+        return res.status(404).json({ success: false, error: "Disciplina no encontrada" });
+      }
+      console.error("Toggle full discipline error:", error);
+      return res.status(500).json({ success: false, error: "Error al cambiar el cupo" });
+    }
+  },
+);
+
 /** PATCH /api/disciplines/:id/reactivate — reactiva una disciplina dada de baja. Solo Administrador. */
 disciplinesRouter.patch(
   "/:id/reactivate",

@@ -21,6 +21,7 @@ const enrollmentInclude = {
       id: true,
       name: true,
       active: true,
+      full: true,
       fee: { select: { id: true, name: true, amount: true } },
       place: { select: { id: true, name: true } },
       professor: { select: { id: true, name: true, last_name: true } },
@@ -124,6 +125,10 @@ enrollmentsRouter.post("/", async (req: Request, res: Response) => {
     }
     if (!discipline.active) {
       return res.status(400).json({ success: false, error: "La disciplina está dada de baja" });
+    }
+    // Cupo lleno (lo marca el profe/admin): no se aceptan nuevas inscripciones (#5).
+    if (discipline.full) {
+      return res.status(409).json({ success: false, error: "La disciplina tiene el cupo lleno" });
     }
 
     const enrollment = await prisma.enrollment.create({
