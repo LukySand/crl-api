@@ -2,12 +2,13 @@ import { Router, type Request, type Response } from "express";
 import { Readable } from "node:stream";
 import { z } from "zod";
 import { Storage } from "../lib/storage";
+import { requireAuth, requireAdmin } from "../lib/auth";
 
+// File.id es UUID (String), igual que User.id. Antes esto validaba /^[0-9]+$/ y
+// transformaba a Number: quedó de cuando los ids eran int autoincremental y no
+// matcheaba ningún archivo real.
 const fileIdSchema = z.object({
-    fileId: z
-        .string({ error: "Missing or invalid file id" })
-        .regex(/^[0-9]+$/, "Missing or invalid file id")
-        .transform(Number),
+    fileId: z.uuid({ error: "Missing or invalid file id" }),
 });
 
 const uploadSchema = z.object({
@@ -44,6 +45,7 @@ async function readFormData(req: Request) {
 
 export const filesRouter = Router();
 
+/** GET /api/files?id=<uuid> — descarga. Público: las imágenes se muestran en la app. */
 filesRouter.get("/", async (req: Request, res: Response) => {
     const validationResult = fileIdSchema.safeParse({
         fileId: getFirstQueryValue(req.query.id),
@@ -77,8 +79,14 @@ filesRouter.get("/", async (req: Request, res: Response) => {
     return Readable.fromWeb(file.stream).pipe(res);
 });
 
-// Uncomment to test.
-filesRouter.put("/", async (req: Request, res: Response) => {
+/**
+ * PUT /api/files — sube (o reemplaza) un archivo. Exige sesión.
+ *
+ * El dueño sale del token, no del form: antes venía como `user_id` en el
+ * FormData, así que cualquiera podía subir archivos a nombre de otro (y sin
+ * estar logueado, porque la ruta no pedía sesión).
+ */
+filesRouter.put("/", requireAuth, async (req: Request, res: Response) => {
     const form = await readFormData(req);
 
     const validationResult = uploadSchema.safeParse({
@@ -101,6 +109,7 @@ filesRouter.put("/", async (req: Request, res: Response) => {
             file,
             kind: kind as Storage.FileKind,
             name,
+            userId: req.user!.id,
         });
         return res.status(200).json({ fileId: result });
     } catch (err) {
@@ -112,7 +121,8 @@ filesRouter.put("/", async (req: Request, res: Response) => {
     }
 });
 
-filesRouter.delete("/", async (req: Request, res: Response) => {
+/** DELETE /api/files?fileId=<uuid> — solo gestión: borra el archivo del disco y la DB. */
+filesRouter.delete("/", requireAuth, requireAdmin, async (req: Request, res: Response) => {
     const validationResult = fileIdSchema.safeParse({
         fileId: getFirstQueryValue(req.query.fileId),
     });

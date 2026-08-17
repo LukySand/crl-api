@@ -1,7 +1,8 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
-import { requireAuth, requireRole } from "../lib/auth";
+import { requireAuth, requireAdmin, readToken, ADMIN_ROLES } from "../lib/auth";
+import { parseDate, todayInClub } from "../lib/booking-date";
 
 export const placesRouter = Router();
 
@@ -26,10 +27,25 @@ function validationError(res: Response, error: z.ZodError) {
   return res.status(400).json({ success: false, error: "Validación fallida", errors });
 }
 
-/** GET /api/places — lista de espacios. Público: el visitante ve qué hay. */
-placesRouter.get("/", async (_req: Request, res: Response) => {
+/**
+ * GET /api/places — lista de espacios. Público: el visitante ve qué hay.
+ *
+ * Por defecto sólo los activos. Con `?all=true` vienen también los dados de baja,
+ * para que la gestión pueda verlos y reactivarlos — pero sólo si es admin: si no,
+ * el socio vería en la app espacios que no puede reservar.
+ */
+placesRouter.get("/", async (req: Request, res: Response) => {
   try {
-    const places = await prisma.place.findMany({ orderBy: { name: "asc" } });
+    // La ruta es pública, así que no pasa por requireAuth y req.user está vacío:
+    // el token se lee a mano para saber si hay una sesión de gestión detrás.
+    const sesion = readToken(req);
+    const esAdmin = !!sesion && (ADMIN_ROLES as readonly string[]).includes(sesion.role);
+    const verTodos = req.query.all === "true" && esAdmin;
+
+    const places = await prisma.place.findMany({
+      where: verTodos ? undefined : { active: true },
+      orderBy: { name: "asc" },
+    });
     return res.json({ success: true, places });
   } catch (error) {
     console.error("List places error:", error);
@@ -66,7 +82,7 @@ placesRouter.get("/:id", async (req: Request, res: Response) => {
 placesRouter.post(
   "/",
   requireAuth,
-  requireRole("Administrador"),
+  requireAdmin,
   async (req: Request, res: Response) => {
     try {
       const parsed = placeSchema.safeParse(req.body ?? {});
@@ -88,7 +104,7 @@ placesRouter.post(
 placesRouter.patch(
   "/:id",
   requireAuth,
-  requireRole("Administrador"),
+  requireAdmin,
   async (req: Request, res: Response) => {
     try {
       const id = Number(req.params.id);
@@ -111,11 +127,20 @@ placesRouter.patch(
   },
 );
 
-/** DELETE /api/places/:id — borra un espacio. Solo Administrador. */
+/**
+ * DELETE /api/places/:id — baja lógica (active=false). Solo gestión.
+ *
+ * No se borra la fila: un espacio borrado orfanaría los horarios y, con ellos, el
+ * historial de reservas que apunta a cada turno. Desactivado deja de aparecer para
+ * reservar pero las reservas viejas siguen siendo legibles.
+ *
+ * Devuelve `reservas_futuras` para que el front pueda avisar a quién afecta antes
+ * de confirmar — la baja no las cancela ni las bloquea.
+ */
 placesRouter.delete(
   "/:id",
   requireAuth,
-  requireRole("Administrador"),
+  requireAdmin,
   async (req: Request, res: Response) => {
     try {
       const id = Number(req.params.id);
@@ -123,21 +148,53 @@ placesRouter.delete(
         return res.status(400).json({ success: false, error: "ID inválido" });
       }
 
-      await prisma.place.delete({ where: { id } });
-      return res.json({ success: true, message: "Espacio eliminado" });
+      const place = await prisma.place.update({
+        where: { id },
+        data: { active: false },
+      });
+
+      const reservas_futuras = await prisma.booking.count({
+        where: {
+          active: true,
+          date: { gte: parseDate(todayInClub()) },
+          schedule: { place_id: id },
+        },
+      });
+
+      return res.json({ success: true, place, reservas_futuras });
     } catch (error: any) {
       if (error?.code === "P2025") {
         return res.status(404).json({ success: false, error: "Espacio no encontrado" });
       }
-      // FK: tiene horarios (y por ende posibles reservas) colgando
-      if (error?.code === "P2003") {
-        return res.status(409).json({
-          success: false,
-          error: "No se puede eliminar: el espacio tiene horarios cargados",
-        });
+      console.error("Deactivate place error:", error);
+      return res.status(500).json({ success: false, error: "Error al dar de baja el espacio" });
+    }
+  },
+);
+
+/** PATCH /api/places/:id/reactivate — vuelve a habilitar un espacio. Solo gestión. */
+placesRouter.patch(
+  "/:id/reactivate",
+  requireAuth,
+  requireAdmin,
+  async (req: Request, res: Response) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id)) {
+        return res.status(400).json({ success: false, error: "ID inválido" });
       }
-      console.error("Delete place error:", error);
-      return res.status(500).json({ success: false, error: "Error al eliminar el espacio" });
+
+      const place = await prisma.place.update({
+        where: { id },
+        data: { active: true },
+      });
+      return res.json({ success: true, place });
+    } catch (error: any) {
+      if (error?.code === "P2025") {
+        return res.status(404).json({ success: false, error: "Espacio no encontrado" });
+      }
+      console.error("Reactivate place error:", error);
+      return res.status(500).json({ success: false, error: "Error al reactivar el espacio" });
     }
   },
 );

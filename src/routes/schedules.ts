@@ -1,15 +1,24 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
-import { requireAuth, requireRole } from "../lib/auth";
+import { requireAuth, requireAdmin } from "../lib/auth";
+import { findOrCreateFeeForPlace } from "../lib/fee";
 import { TIME, toTime } from "../lib/time";
 
 export const schedulesRouter = Router();
 
+// El precio del turno se manda como monto, no como fee_id: quien carga horarios
+// piensa en "la hora sale $12.000", no en elegir una fila de tarifas. La tarifa la
+// resuelve findOrCreateFee.
+const amountSchema = z.coerce
+  .number()
+  .positive("El precio debe ser mayor a cero")
+  .max(99_999_999.99, "El precio es demasiado grande");
+
 const scheduleSchema = z
   .object({
     place_id: z.number().int().positive(),
-    fee_id: z.number().int().positive(),
+    amount: amountSchema,
     day_of_week: z.number().int().min(0, "0=domingo").max(6, "6=sábado"),
     start_time: z.string().regex(TIME, "Formato de hora inválido (HH:MM)"),
     end_time: z.string().regex(TIME, "Formato de hora inválido (HH:MM)"),
@@ -20,7 +29,7 @@ const scheduleSchema = z
   });
 
 const scheduleUpdateSchema = z.object({
-  fee_id: z.number().int().positive().optional(),
+  amount: amountSchema.optional(),
   day_of_week: z.number().int().min(0).max(6).optional(),
   start_time: z.string().regex(TIME, "Formato de hora inválido (HH:MM)").optional(),
   end_time: z.string().regex(TIME, "Formato de hora inválido (HH:MM)").optional(),
@@ -80,18 +89,18 @@ schedulesRouter.get("/:id", async (req: Request, res: Response) => {
 schedulesRouter.post(
   "/",
   requireAuth,
-  requireRole("Administrador"),
+  requireAdmin,
   async (req: Request, res: Response) => {
     try {
       const parsed = scheduleSchema.safeParse(req.body ?? {});
       if (!parsed.success) return validationError(res, parsed.error);
 
-      const { place_id, fee_id, day_of_week, start_time, end_time } = parsed.data;
+      const { place_id, amount, day_of_week, start_time, end_time } = parsed.data;
 
       const schedule = await prisma.schedule.create({
         data: {
           place_id,
-          fee_id,
+          fee_id: await findOrCreateFeeForPlace(amount, place_id),
           day_of_week,
           start_time: toTime(start_time),
           end_time: toTime(end_time),
@@ -117,11 +126,16 @@ schedulesRouter.post(
   },
 );
 
-/** PATCH /api/schedules/:id — Solo Administrador. Repuntar fee_id acá es cómo se cambia el precio. */
+/**
+ * PATCH /api/schedules/:id — Solo Administrador.
+ *
+ * Cambiar `amount` repunta el turno a otra tarifa (reusada o nueva). Las reservas
+ * ya hechas guardan su propio fee_id, así que conservan el precio que se les cobró.
+ */
 schedulesRouter.patch(
   "/:id",
   requireAuth,
-  requireRole("Administrador"),
+  requireAdmin,
   async (req: Request, res: Response) => {
     try {
       const id = Number(req.params.id);
@@ -132,12 +146,26 @@ schedulesRouter.patch(
       const parsed = scheduleUpdateSchema.safeParse(req.body ?? {});
       if (!parsed.success) return validationError(res, parsed.error);
 
-      const { fee_id, day_of_week, start_time, end_time } = parsed.data;
+      const { amount, day_of_week, start_time, end_time } = parsed.data;
+
+      // La tarifa se resuelve dentro del espacio del turno, así que hace falta
+      // saber a qué espacio pertenece antes de tocar el precio.
+      let feeId: number | undefined;
+      if (amount !== undefined) {
+        const actual = await prisma.schedule.findUnique({
+          where: { id },
+          select: { place_id: true },
+        });
+        if (!actual) {
+          return res.status(404).json({ success: false, error: "Horario no encontrado" });
+        }
+        feeId = await findOrCreateFeeForPlace(amount, actual.place_id);
+      }
 
       const schedule = await prisma.schedule.update({
         where: { id },
         data: {
-          ...(fee_id !== undefined && { fee_id }),
+          ...(feeId !== undefined && { fee_id: feeId }),
           ...(day_of_week !== undefined && { day_of_week }),
           ...(start_time !== undefined && { start_time: toTime(start_time) }),
           ...(end_time !== undefined && { end_time: toTime(end_time) }),
@@ -172,7 +200,7 @@ schedulesRouter.patch(
 schedulesRouter.delete(
   "/:id",
   requireAuth,
-  requireRole("Administrador"),
+  requireAdmin,
   async (req: Request, res: Response) => {
     try {
       const id = Number(req.params.id);
