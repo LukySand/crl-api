@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
 import { requireAuth, requireAdmin, readToken, ADMIN_ROLES } from "../lib/auth";
-import { parseDate, todayInClub } from "../lib/booking-date";
+import { parseDate, todayInClub, nowTimeInClub, timeToHHMM } from "../lib/booking-date";
 
 export const placesRouter = Router();
 
@@ -52,6 +52,97 @@ placesRouter.get("/", async (req: Request, res: Response) => {
     return res.status(500).json({ success: false, error: "Error al listar espacios" });
   }
 });
+
+/**
+ * GET /api/places/occupancy — ocupación de hoy de cada espacio, para la gestión.
+ *
+ * Por espacio devuelve los turnos de hoy, cuántos están reservados y si en este
+ * momento hay uno en curso ocupado. "Hoy" y "ahora" salen del huso del club, no
+ * del server (ver lib/booking-date.ts).
+ *
+ * Dos consultas para todos los espacios, no una por espacio: la pantalla de
+ * gestión la repite cada 15s y un N+1 acá se nota.
+ *
+ * Va antes de "/:id" a propósito: Express matchea por orden y si no tomaría
+ * "occupancy" como un id — mismo caso que /api/bookings/availability.
+ */
+placesRouter.get(
+  "/occupancy",
+  requireAuth,
+  requireAdmin,
+  async (_req: Request, res: Response) => {
+    try {
+      const date = todayInClub();
+      const now = nowTimeInClub();
+      const dayOfWeek = parseDate(date).getUTCDay();
+
+      const [schedules, bookings] = await Promise.all([
+        prisma.schedule.findMany({
+          where: { day_of_week: dayOfWeek },
+          select: { id: true, place_id: true, start_time: true, end_time: true },
+          orderBy: { start_time: "asc" },
+        }),
+        prisma.booking.findMany({
+          // active: true deja afuera las canceladas, que liberan el turno
+          where: { date: parseDate(date), active: true },
+          select: { schedule_id: true },
+        }),
+      ]);
+
+      const reservados = new Set(bookings.map((b) => b.schedule_id));
+
+      const porEspacio = new Map<
+        number,
+        {
+          place_id: number;
+          total: number;
+          reservados: number;
+          ocupado_ahora: boolean;
+          turno_actual: { start: string; end: string; reservado: boolean } | null;
+        }
+      >();
+
+      for (const s of schedules) {
+        const start = timeToHHMM(s.start_time);
+        const end = timeToHHMM(s.end_time);
+        const reservado = reservados.has(s.id);
+
+        const fila =
+          porEspacio.get(s.place_id) ??
+          {
+            place_id: s.place_id,
+            total: 0,
+            reservados: 0,
+            ocupado_ahora: false,
+            turno_actual: null,
+          };
+
+        fila.total += 1;
+        if (reservado) fila.reservados += 1;
+
+        // "HH:MM" con cero adelante compara bien como string, no hace falta parsear.
+        if (start <= now && now < end) {
+          fila.turno_actual = { start, end, reservado };
+          fila.ocupado_ahora = reservado;
+        }
+
+        porEspacio.set(s.place_id, fila);
+      }
+
+      return res.json({
+        success: true,
+        date,
+        now,
+        occupancy: [...porEspacio.values()],
+      });
+    } catch (error) {
+      console.error("Occupancy error:", error);
+      return res
+        .status(500)
+        .json({ success: false, error: "Error al calcular la ocupación" });
+    }
+  },
+);
 
 /** GET /api/places/:id — un espacio con sus horarios y tarifas. */
 placesRouter.get("/:id", async (req: Request, res: Response) => {

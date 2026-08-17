@@ -17,6 +17,12 @@ import prisma from "./prisma";
  * Acotado al espacio a propósito: buscando por monto solo, un turno de vóley a
  * 9000 podía terminar apuntando a "Cancha de fútbol 5 — 1 hora (2025)" (misma
  * plata, otro lugar) y el nombre quedaba sin sentido.
+ *
+ * Es el **único** lugar que crea tarifas con category `Reserva`: acá el contexto
+ * (un turno de un espacio) no deja lugar a duda, así que no se pregunta. El
+ * filtro por category en la búsqueda cierra el otro lado — una cuota de socio de
+ * $12.000 no puede terminar cobrándose como alquiler de cancha por coincidir el
+ * monto.
  */
 export async function findOrCreateFeeForPlace(amount: number, placeId: number): Promise<number> {
   const place = await prisma.place.findUnique({
@@ -28,6 +34,7 @@ export async function findOrCreateFeeForPlace(amount: number, placeId: number): 
   const existente = await prisma.fee.findFirst({
     where: {
       amount,
+      category: "Reserva",
       OR: [
         { schedules: { some: { place_id: placeId } } },
         { bookings: { some: { schedule: { place_id: placeId } } } },
@@ -43,6 +50,7 @@ export async function findOrCreateFeeForPlace(amount: number, placeId: number): 
       // Nombre derivado del lugar y el monto: nadie lo elige, tiene que ser predecible.
       name: `${place.name} — $${amount.toLocaleString("es-AR")}`,
       amount,
+      category: "Reserva",
       description: "Creada automáticamente al cargar un horario o una reserva.",
     },
     select: { id: true },

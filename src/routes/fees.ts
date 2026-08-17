@@ -8,19 +8,51 @@ import { requireAuth, requireAdmin } from "../lib/auth";
 
 export const feesRouter = Router();
 
+/** Las cinco categorías del enum; sirve para validar el filtro del GET. */
+const CATEGORIAS = ["Reserva", "CuotaSocio", "Disciplina", "Donacion", "Otro"] as const;
+
+/**
+ * Las que un admin puede elegir a mano. `Reserva` queda afuera a propósito: esas
+ * las crea sola `findOrCreateFeeForPlace()` a partir del precio del turno, con
+ * nombre derivado del espacio. Dejarla acá permitiría una tarifa `Reserva` que no
+ * cuelga de ningún espacio, y la categoría dejaría de ser confiable para filtrar.
+ */
+const CATEGORIAS_MANUALES = ["CuotaSocio", "Disciplina", "Donacion", "Otro"] as const;
+
 const feeSchema = z.object({
   name: z.string().min(1, "El nombre es requerido").max(255),
+  // nonnegative y no positive: una cuota puede arrancar en $0 (disciplina nueva
+  // sin precio cargado todavía), igual que una reserva de cortesía en bookings.ts.
   amount: z.coerce
     .number()
-    .positive("El monto debe ser mayor a cero")
+    .nonnegative("El monto no puede ser negativo")
     .max(99_999_999.99, "El monto es demasiado grande"),
+  category: z
+    .enum(CATEGORIAS_MANUALES, {
+      error: "Las tarifas de reserva se crean solas al cargar el precio de un turno",
+    })
+    .default("Otro"),
   description: z.string().optional(),
 });
 
-/** GET /api/fees — lista de tarifas (histórico incluido, las viejas siguen existiendo). */
-feesRouter.get("/", async (_req: Request, res: Response) => {
+/**
+ * GET /api/fees — lista de tarifas (histórico incluido, las viejas siguen existiendo).
+ * `?category=CuotaSocio` filtra por tipo; sin el parámetro vienen todas.
+ */
+feesRouter.get("/", async (req: Request, res: Response) => {
   try {
-    const fees = await prisma.fee.findMany({ orderBy: { created_at: "desc" } });
+    const { category } = req.query;
+    if (category !== undefined && !CATEGORIAS.includes(category as never)) {
+      return res.status(400).json({
+        success: false,
+        error: `Categoría inválida. Opciones: ${CATEGORIAS.join(", ")}`,
+      });
+    }
+
+    const fees = await prisma.fee.findMany({
+      where: category ? { category: category as (typeof CATEGORIAS)[number] } : undefined,
+      orderBy: { created_at: "desc" },
+    });
     return res.json({ success: true, fees });
   } catch (error) {
     console.error("List fees error:", error);
