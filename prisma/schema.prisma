@@ -152,6 +152,7 @@ model Discipline {
   fee_id       Int? // cuota (Fee); null = sin definir
   place_id     Int? // espacio habitual; null = sin definir
   active       Boolean  @default(true) // baja lógica: false = dada de baja (#41)
+  full         Boolean  @default(false) // cupo lleno: lo marca el profe/admin; bloquea nuevas inscripciones (#5)
   created_at   DateTime @default(now())
 
   professor User?  @relation(fields: [professor_id], references: [id])
