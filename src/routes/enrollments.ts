@@ -27,7 +27,10 @@ const enrollmentInclude = {
       full: true,
       fee: { select: { id: true, name: true, amount: true } },
       place: { select: { id: true, name: true } },
-      professor: { select: { id: true, name: true, last_name: true } },
+      professors: {
+        select: { professor: { select: { id: true, name: true, last_name: true } } },
+        orderBy: { created_at: "asc" as const },
+      },
       // Los horarios viajan acá para que el socio saque su próxima clase de este
       // mismo GET, sin pedir un endpoint aparte por cada disciplina.
       schedules: {
@@ -38,6 +41,19 @@ const enrollmentInclude = {
   },
   user: { select: { id: true, name: true, last_name: true, dni: true } },
 } as const;
+
+/**
+ * Aplana los profesores de la disciplina, igual que en `routes/disciplines.ts`.
+ * `professor` (el primero) va por compatibilidad con las pantallas que todavía
+ * esperan uno solo; se saca cuando todas lean `professors`.
+ */
+function serialize<T extends { discipline: { professors: { professor: unknown }[] } }>(e: T) {
+  const professors = e.discipline.professors.map((p) => p.professor);
+  return {
+    ...e,
+    discipline: { ...e.discipline, professors, professor: professors[0] ?? null },
+  };
+}
 
 function validationError(res: Response, error: z.ZodError) {
   const errors: Record<string, string> = {};
@@ -67,7 +83,8 @@ enrollmentsRouter.get("/", async (req: Request, res: Response) => {
     if (isAdmin(req)) {
       scope = {};
     } else if (req.user!.role === "Profesor") {
-      scope = { discipline: { professor_id: req.user!.id } };
+      // Las disciplinas que dicta: ahora puede ser uno de varios profes (#6).
+      scope = { discipline: { professors: { some: { professor_id: req.user!.id } } } };
     } else {
       scope = { user_id: req.user!.id };
     }
@@ -82,7 +99,7 @@ enrollmentsRouter.get("/", async (req: Request, res: Response) => {
       orderBy: { created_at: "desc" },
     });
 
-    return res.json({ success: true, enrollments });
+    return res.json({ success: true, enrollments: enrollments.map(serialize) });
   } catch (error) {
     console.error("List enrollments error:", error);
     return res.status(500).json({ success: false, error: "Error al listar inscripciones" });
@@ -142,7 +159,7 @@ enrollmentsRouter.post("/", async (req: Request, res: Response) => {
       data: { user_id: targetId, discipline_id },
       include: enrollmentInclude,
     });
-    return res.status(201).json({ success: true, enrollment });
+    return res.status(201).json({ success: true, enrollment: serialize(enrollment) });
   } catch (error: any) {
     if (error?.code === "P2002") {
       return res.status(409).json({ success: false, error: "Ya está inscripto en esta disciplina" });

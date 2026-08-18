@@ -66,7 +66,7 @@ model User {
 
   families    Family[]
   bookings    Booking[]
-  disciplines Discipline[] // disciplinas que dicta (rol Profesor)
+  disciplines DisciplineProfessor[] // disciplinas que dicta (rol Profesor)
   enrollments Enrollment[] // disciplinas en las que está inscripto (rol Socio)
 
   @@map("users")
@@ -146,23 +146,44 @@ model Place {
 // Los días y horas de la clase viven en DisciplineSchedule. Baja lógica como User:
 // se desactiva (active=false), no se borra, para no orfanar reservas/horarios.
 model Discipline {
-  id           Int      @id @default(autoincrement())
-  name         String   @db.VarChar(100)
-  professor_id String?  @db.Char(128) // User rol Profesor; null = sin asignar
-  fee_id       Int? // cuota (Fee); null = sin definir
-  place_id     Int? // espacio habitual; null = sin definir
-  active       Boolean  @default(true) // baja lógica: false = dada de baja (#41)
-  full         Boolean  @default(false) // cupo lleno: lo marca el profe/admin; bloquea nuevas inscripciones (#5)
-  created_at   DateTime @default(now())
+  id       Int     @id @default(autoincrement())
+  name     String  @db.VarChar(100)
+  fee_id   Int? // cuota (Fee); null = sin definir
+  place_id Int? // espacio habitual; null = sin definir
+  active   Boolean @default(true) // baja lógica: false = dada de baja (#41)
+  full     Boolean @default(false) // cupo lleno: lo marca el profe/admin; bloquea nuevas inscripciones (#5)
 
-  professor User?  @relation(fields: [professor_id], references: [id])
-  fee       Fee?   @relation(fields: [fee_id], references: [id])
-  place     Place? @relation(fields: [place_id], references: [id])
+  // ponytail: DEPRECADO por #6 (varios profes). La fuente de verdad ahora es
+  // `professors` (DisciplineProfessor). La columna sigue existiendo sólo para no
+  // perder las asignaciones viejas al hacer `db push`: el seed las copia a la
+  // tabla nueva. Nada la lee ni la escribe. Borrarla cuando todos hayan corrido
+  // el seed una vez (PR de limpieza aparte).
+  professor_id String? @db.Char(128)
 
-  enrollments Enrollment[]         // socios inscriptos
+  created_at DateTime @default(now())
+
+  fee   Fee?   @relation(fields: [fee_id], references: [id])
+  place Place? @relation(fields: [place_id], references: [id])
+
+  professors  DisciplineProfessor[] // profes que la dictan (#6)
+  enrollments Enrollment[] // socios inscriptos
   schedules   DisciplineSchedule[] // días y horas de la clase
 
   @@map("disciplines")
+}
+
+// Qué profesores dictan cada disciplina (M:N). Reemplaza al viejo
+// `Discipline.professor_id`, que sólo admitía uno.
+model DisciplineProfessor {
+  discipline_id Int
+  professor_id  String   @db.Char(128) // User con rol Profesor
+  created_at    DateTime @default(now())
+
+  discipline Discipline @relation(fields: [discipline_id], references: [id])
+  professor  User       @relation(fields: [professor_id], references: [id])
+
+  @@id([discipline_id, professor_id]) // un profe no se repite en la misma disciplina
+  @@map("discipline_professors")
 }
 
 // Horario semanal fijo de una disciplina: "vóley los martes de 19:00 a 20:30".
