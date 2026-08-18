@@ -11,12 +11,29 @@ export const disciplinesRouter = Router();
 // Los FK van opcionales: una disciplina puede existir sin profe/cuota/espacio asignado.
 const disciplineSchema = z.object({
   name: z.string().min(1, "El nombre es requerido").max(100),
+  // #6: una disciplina puede tener varios profes. `professor_id` (uno solo) se
+  // sigue aceptando para no romper a los clientes viejos mientras migran.
+  professor_ids: z.array(z.string().min(1)).optional(),
   professor_id: z.string().min(1).optional().nullable(),
   fee_id: z.coerce.number().int().positive().optional().nullable(),
   place_id: z.coerce.number().int().positive().optional().nullable(),
 });
 
 const disciplineUpdateSchema = disciplineSchema.partial();
+
+/**
+ * Normaliza las dos formas de mandar profesores a una sola lista sin repetidos.
+ * Devuelve `undefined` cuando el request no menciona profesores (en un PATCH eso
+ * significa "no los toques"), y `[]` cuando pide dejarla sin ninguno.
+ */
+function profesoresPedidos(data: {
+  professor_ids?: string[];
+  professor_id?: string | null;
+}): string[] | undefined {
+  if (data.professor_ids !== undefined) return [...new Set(data.professor_ids)];
+  if (data.professor_id !== undefined) return data.professor_id ? [data.professor_id] : [];
+  return undefined;
+}
 
 // Horario de clase: día de la semana + rango horario. Mismas reglas que el turno
 // reservable de un espacio (`routes/schedules.ts`), sin cuota ni lugar propios.
@@ -51,11 +68,27 @@ const schedulesInclude = { orderBy: ordenHorarios };
 
 // Nombres relacionados que devolvemos (no el objeto entero de cada relación).
 const disciplineInclude = {
-  professor: { select: { id: true, name: true, last_name: true } },
+  professors: {
+    select: { professor: { select: { id: true, name: true, last_name: true } } },
+    orderBy: { created_at: "asc" as const }, // el primero es el que estaba asignado antes de #6
+  },
   fee: { select: { id: true, name: true, amount: true } },
   place: { select: { id: true, name: true } },
   schedules: schedulesInclude,
 } as const;
+
+/**
+ * Aplana la tabla puente a una lista de profesores y, además, deja `professor`
+ * (el primero) en la respuesta.
+ *
+ * ponytail: `professor` es compatibilidad hacia atrás — las pantallas que todavía
+ * esperan un solo profe siguen andando mientras migran a `professors`. Se saca
+ * cuando no queden lectores (buscar `\.professor\b` en el front).
+ */
+function serialize<T extends { professors: { professor: unknown }[] }>(d: T) {
+  const professors = d.professors.map((p) => p.professor);
+  return { ...d, professors, professor: professors[0] ?? null };
+}
 
 function validationError(res: Response, error: z.ZodError) {
   const errors: Record<string, string> = {};
@@ -65,16 +98,21 @@ function validationError(res: Response, error: z.ZodError) {
   return res.status(400).json({ success: false, error: "Validación fallida", errors });
 }
 
-// El profesor asignado tiene que ser un User con rol Profesor (no un Socio/Admin).
-// Devuelve un mensaje de error si no es válido, o null si está ok / no se asignó.
-async function invalidProfessor(professor_id: string | null | undefined): Promise<string | null> {
-  if (!professor_id) return null;
-  const prof = await prisma.user.findUnique({
-    where: { id: professor_id },
+// Los profesores asignados tienen que ser Users con rol Profesor (no Socios/Admins).
+// Devuelve un mensaje de error si alguno no sirve, o null si están todos bien.
+async function invalidProfessors(ids: string[] | undefined): Promise<string | null> {
+  if (!ids?.length) return null;
+  const encontrados = await prisma.user.findMany({
+    where: { id: { in: ids } },
     include: { role: true },
   });
-  if (!prof) return "El profesor asignado no existe";
-  if (prof.role.name !== "Profesor") return "El usuario asignado no es un profesor";
+  if (encontrados.length !== ids.length) {
+    return ids.length === 1 ? "El profesor asignado no existe" : "Alguno de los profesores no existe";
+  }
+  const noProfe = encontrados.find((u) => u.role.name !== "Profesor");
+  if (noProfe) {
+    return `${noProfe.name} ${noProfe.last_name} no es un profesor`;
+  }
   return null;
 }
 
@@ -85,7 +123,7 @@ disciplinesRouter.get("/", async (_req: Request, res: Response) => {
       orderBy: { name: "asc" },
       include: disciplineInclude,
     });
-    return res.json({ success: true, disciplines });
+    return res.json({ success: true, disciplines: disciplines.map(serialize) });
   } catch (error) {
     console.error("List disciplines error:", error);
     return res.status(500).json({ success: false, error: "Error al listar disciplinas" });
@@ -106,7 +144,7 @@ disciplinesRouter.get("/:id", async (req: Request, res: Response) => {
     if (!discipline) {
       return res.status(404).json({ success: false, error: "Disciplina no encontrada" });
     }
-    return res.json({ success: true, discipline });
+    return res.json({ success: true, discipline: serialize(discipline) });
   } catch (error) {
     console.error("Get discipline error:", error);
     return res.status(500).json({ success: false, error: "Error al obtener la disciplina" });
@@ -123,22 +161,23 @@ disciplinesRouter.post(
       const parsed = disciplineSchema.safeParse(req.body ?? {});
       if (!parsed.success) return validationError(res, parsed.error);
 
-      const { name, professor_id, fee_id, place_id } = parsed.data;
-      const profError = await invalidProfessor(professor_id);
+      const { name, fee_id, place_id } = parsed.data;
+      const profesores = profesoresPedidos(parsed.data) ?? [];
+      const profError = await invalidProfessors(profesores);
       if (profError) {
-        return res.status(400).json({ success: false, error: profError, errors: { professor_id: profError } });
+        return res.status(400).json({ success: false, error: profError, errors: { professor_ids: profError } });
       }
 
       const discipline = await prisma.discipline.create({
         data: {
           name,
-          professor_id: professor_id ?? null,
           fee_id: fee_id ?? null,
           place_id: place_id ?? null,
+          professors: { create: profesores.map((professor_id) => ({ professor_id })) },
         },
         include: disciplineInclude,
       });
-      return res.status(201).json({ success: true, discipline });
+      return res.status(201).json({ success: true, discipline: serialize(discipline) });
     } catch (error: any) {
       // FK: la cuota o el espacio indicado no existe
       if (error?.code === "P2003") {
@@ -164,19 +203,31 @@ disciplinesRouter.patch(
       const parsed = disciplineUpdateSchema.safeParse(req.body ?? {});
       if (!parsed.success) return validationError(res, parsed.error);
 
-      if ("professor_id" in parsed.data) {
-        const profError = await invalidProfessor(parsed.data.professor_id);
-        if (profError) {
-          return res.status(400).json({ success: false, error: profError, errors: { professor_id: profError } });
-        }
+      // Los profesores no son una columna: van aparte, en la tabla puente.
+      const { professor_ids: _pi, professor_id: _p, ...campos } = parsed.data;
+      const profesores = profesoresPedidos(parsed.data);
+
+      const profError = await invalidProfessors(profesores);
+      if (profError) {
+        return res.status(400).json({ success: false, error: profError, errors: { professor_ids: profError } });
       }
 
       const discipline = await prisma.discipline.update({
         where: { id },
-        data: parsed.data,
+        data: {
+          ...campos,
+          // Reemplazo completo: la lista que llega es la que queda. Si el request
+          // no menciona profesores, no se tocan.
+          ...(profesores !== undefined && {
+            professors: {
+              deleteMany: {},
+              create: profesores.map((professor_id) => ({ professor_id })),
+            },
+          }),
+        },
         include: disciplineInclude,
       });
-      return res.json({ success: true, discipline });
+      return res.json({ success: true, discipline: serialize(discipline) });
     } catch (error: any) {
       if (error?.code === "P2025") {
         return res.status(404).json({ success: false, error: "Disciplina no encontrada" });
@@ -220,7 +271,11 @@ disciplinesRouter.delete(
           data: { active: null, left_at: new Date() },
         }),
       ]);
-      return res.json({ success: true, discipline, desinscriptos: desinscriptos.count });
+      return res.json({
+        success: true,
+        discipline: serialize(discipline),
+        desinscriptos: desinscriptos.count,
+      });
     } catch (error: any) {
       if (error?.code === "P2025") {
         return res.status(404).json({ success: false, error: "Disciplina no encontrada" });
@@ -250,13 +305,15 @@ disciplinesRouter.patch(
 
       const disc = await prisma.discipline.findUnique({
         where: { id },
-        select: { professor_id: true },
+        select: { professors: { select: { professor_id: true } } },
       });
       if (!disc) {
         return res.status(404).json({ success: false, error: "Disciplina no encontrada" });
       }
       const esAdmin = req.user!.role === "Administrador";
-      const esProfeAsignado = req.user!.role === "Profesor" && disc.professor_id === req.user!.id;
+      // Cualquiera de los profes que la dicta puede marcar el cupo (#6).
+      const esProfeAsignado =
+        req.user!.role === "Profesor" && disc.professors.some((p) => p.professor_id === req.user!.id);
       if (!esAdmin && !esProfeAsignado) {
         return res.status(403).json({ success: false, error: "No tenés permisos para esta acción" });
       }
@@ -266,7 +323,7 @@ disciplinesRouter.patch(
         data: { full: parsed.data.full },
         include: disciplineInclude,
       });
-      return res.json({ success: true, discipline });
+      return res.json({ success: true, discipline: serialize(discipline) });
     } catch (error: any) {
       if (error?.code === "P2025") {
         return res.status(404).json({ success: false, error: "Disciplina no encontrada" });
@@ -293,7 +350,7 @@ disciplinesRouter.patch(
         data: { active: true },
         include: disciplineInclude,
       });
-      return res.json({ success: true, discipline });
+      return res.json({ success: true, discipline: serialize(discipline) });
     } catch (error: any) {
       if (error?.code === "P2025") {
         return res.status(404).json({ success: false, error: "Disciplina no encontrada" });
@@ -321,11 +378,17 @@ async function denyScheduleEdit(
 ): Promise<{ status: number; error: string } | null> {
   const discipline = await prisma.discipline.findUnique({
     where: { id: disciplineId },
-    select: { professor_id: true },
+    select: { professors: { select: { professor_id: true } } },
   });
   if (!discipline) return { status: 404, error: "Disciplina no encontrada" };
   if (req.user?.role === "Administrador") return null;
-  if (req.user?.role === "Profesor" && discipline.professor_id === req.user.id) return null;
+  // Cualquiera de los profes que la dicta (#6), no solo el primero.
+  if (
+    req.user?.role === "Profesor" &&
+    discipline.professors.some((p) => p.professor_id === req.user!.id)
+  ) {
+    return null;
+  }
   return { status: 403, error: "No podés editar los horarios de esta disciplina" };
 }
 

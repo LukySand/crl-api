@@ -534,24 +534,26 @@ async function seedDisciplines(
   placeIds: Map<string, number>,
   feeIds: Map<string, number>,
 ) {
-  // [nombre, profesor_id|null, nombre de tarifa|null, nombre de espacio|null]
-  const disciplines: [string, string | null, string | null, string | null][] = [
+  // [nombre, profesores (0..n), nombre de tarifa|null, nombre de espacio|null]
+  // Fútbol va con dos a propósito: es el caso de #6 y así queda dato de ejemplo
+  // para probar que un profe ve las disciplinas que comparte con otro.
+  const disciplines: [string, string[], string | null, string | null][] = [
     [
       "Fútbol",
-      USER.profeFutbol,
+      [USER.profeFutbol, USER.profeVoley],
       "Cancha de fútbol 5 — 1 hora",
       "Cancha de fútbol 5",
     ],
-    ["Vóley", USER.profeVoley, "Cancha de vóley — 1 hora", "Cancha de vóley"],
-    ["Hockey", null, "Cancha de hockey — 1 hora", "Cancha de hockey"],
-    ["Patín", null, "Pista de patín — 1 hora", "Pista de patín"],
+    ["Vóley", [USER.profeVoley], "Cancha de vóley — 1 hora", "Cancha de vóley"],
+    ["Hockey", [], "Cancha de hockey — 1 hora", "Cancha de hockey"],
+    ["Patín", [], "Pista de patín — 1 hora", "Pista de patín"],
     [
       "Gimnasia Artística",
-      USER.profeVoley,
+      [USER.profeVoley],
       "Pista de patín — 1 hora",
       "Pista de patín",
     ], // NUEVO
-    ["Básquet", null, "Cancha de vóley — 1 hora", "Cancha de vóley"], // NUEVO
+    ["Básquet", [], "Cancha de vóley — 1 hora", "Cancha de vóley"], // NUEVO
   ];
 
   // Horarios de clase por disciplina: [día (0=domingo), desde, hasta].
@@ -578,10 +580,9 @@ async function seedDisciplines(
 
   const byName = new Map<string, number>();
 
-  for (const [name, professor_id, feeName, placeName] of disciplines) {
+  for (const [name, professorIds, feeName, placeName] of disciplines) {
     const data = {
       name,
-      professor_id,
       fee_id: feeName ? (feeIds.get(feeName) ?? null) : null,
       place_id: placeName ? (placeIds.get(placeName) ?? null) : null,
     };
@@ -591,6 +592,18 @@ async function seedDisciplines(
       : await prisma.discipline.create({ data });
 
     byName.set(name, discipline.id);
+
+    // #6: los profes viven en la tabla puente. Idempotente por la PK compuesta.
+    // No borra los que alguien haya agregado a mano desde el panel.
+    for (const professor_id of professorIds) {
+      await prisma.disciplineProfessor.upsert({
+        where: {
+          discipline_id_professor_id: { discipline_id: discipline.id, professor_id },
+        },
+        update: {},
+        create: { discipline_id: discipline.id, professor_id },
+      });
+    }
 
     for (const [day, from, to] of classSchedules[name] ?? []) {
       const start_time = toTime(from);
@@ -614,6 +627,30 @@ async function seedDisciplines(
   }
   console.log(`Disciplinas listas (${disciplines.length}).`);
   return byName;
+}
+
+/**
+ * Migración puntual de #6: pasa las asignaciones del viejo `professor_id` a la
+ * tabla puente, para las disciplinas que no cargó este seed (las que cada uno
+ * creó a mano desde el panel). Idempotente y sin efecto una vez migradas.
+ *
+ * ponytail: vive acá y no en un script aparte porque el seed ya es el "poné la
+ * base al día" del equipo. Se borra junto con la columna `professor_id`.
+ */
+async function backfillProfesores() {
+  const pendientes = await prisma.discipline.findMany({
+    where: { professor_id: { not: null }, professors: { none: {} } },
+    select: { id: true, professor_id: true },
+  });
+
+  for (const d of pendientes) {
+    await prisma.disciplineProfessor.create({
+      data: { discipline_id: d.id, professor_id: d.professor_id! },
+    });
+  }
+  if (pendientes.length) {
+    console.log(`Profesores migrados a la tabla nueva (${pendientes.length}).`);
+  }
 }
 
 /**
@@ -777,6 +814,7 @@ async function main() {
   await seedBookings(schedules);
 
   const disciplineIds = await seedDisciplines(placeIds, feeIds);
+  await backfillProfesores();
   await seedEnrollments(disciplineIds);
 
   console.log(
