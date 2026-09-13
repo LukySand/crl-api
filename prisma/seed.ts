@@ -1,5 +1,8 @@
 import { PrismaClient, RoleType } from "./generated/client";
 import { PrismaMariaDb } from "@prisma/adapter-mariadb";
+// El huso sale de la app y no de una constante local: si el club se muda, se
+// cambia en un solo lugar y el seed sigue generando datos coherentes.
+import { CLUB_TZ } from "../src/lib/booking-date";
 
 // ponytail: se conecta por DATABASE_URL (127.0.0.1) y no armando el host a mano.
 // Con DB_HOST=localhost, en Mac Bun resuelve a IPv6 y el adapter se cuelga 10s.
@@ -54,6 +57,8 @@ const BOOKING = {
   pendienteVoley: "c0000000-0000-4000-8000-000000000004",
   cancelada: "c0000000-0000-4000-8000-000000000005",
   pasada: "c0000000-0000-4000-8000-000000000006",
+  pasadaMartin: "c0000000-0000-4000-8000-000000000007",
+  ventanaCerrada: "c0000000-0000-4000-8000-000000000008",
 } as const;
 
 const DIRECCION = "Av. Libertador 1234, Posadas, Misiones";
@@ -752,6 +757,18 @@ async function seedBookings(
       "Confirmada",
       "Reserva vieja, queda como historial.",
     ],
+    // Martín es el socio con el que se prueba la app: tiene que ver los tres
+    // casos de cancelación sin cambiar de cuenta. La futura cancelable es
+    // `confirmadaF5` (una semana adelante), la de ventana cerrada la arma
+    // `seedBookingEnVentana`, y esta es la pasada.
+    [
+      BOOKING.pasadaMartin,
+      "Cancha de hockey|5|18:00",
+      USER.socioMartin,
+      -1,
+      "Confirmada",
+      "Ya jugada: queda en el historial y no se puede cancelar.",
+    ],
   ];
 
   let creadas = 0;
@@ -793,6 +810,98 @@ async function seedBookings(
   console.log(`Reservas listas (${creadas}).`);
 }
 
+/** Cuántas horas adelante se pone el turno de prueba de "ya no se puede cancelar". */
+const HORAS_VENTANA_DEMO = 2;
+
+/**
+ * Una reserva que arranca dentro de la ventana de cancelación, para poder probar
+ * que el botón desaparece y que el backend rechaza el DELETE igual.
+ *
+ * No sale de la grilla fija de `CANCHAS` a propósito: el seed corre a cualquier
+ * hora del día, así que ningún turno fijo garantiza caer dentro de las próximas
+ * horas. Se calcula contra el reloj y se hace upsert por la clave natural
+ * (espacio, día, hora): re-sembrar a la misma hora reutiliza la fila en vez de
+ * duplicarla, y las horas posibles son 7×24, no infinitas.
+ *
+ * Va sobre la pista de patín porque es el espacio con la grilla más floja y sin
+ * tarifa nocturna, así que la hora que toque nunca choca con un turno real.
+ */
+async function seedBookingEnVentana(
+  placeIds: Map<string, number>,
+  feeIds: Map<string, number>,
+) {
+  const ESPACIO = "Pista de patín";
+  const TARIFA = "Pista de patín — 1 hora";
+
+  const place_id = placeIds.get(ESPACIO);
+  const fee_id = feeIds.get(TARIFA);
+  if (!place_id || !fee_id) {
+    console.warn(`Falta ${ESPACIO}, se saltea la reserva de ventana cerrada.`);
+    return;
+  }
+
+  // En hora del club, no la del server: corriendo en UTC, a las 22:00 de
+  // Argentina ya sería mañana y el turno caería en el día equivocado.
+  const objetivo = new Date(Date.now() + HORAS_VENTANA_DEMO * 3_600_000);
+  const fecha = objetivo.toLocaleDateString("en-CA", { timeZone: CLUB_TZ });
+  const hhmm = objetivo.toLocaleTimeString("en-GB", {
+    timeZone: CLUB_TZ,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  // Redondear a la hora en punto saca como mucho 59 minutos de las dos horas:
+  // el turno sigue quedando adelante en el tiempo y dentro de la ventana.
+  const desde = `${hhmm.slice(0, 2)}:00`;
+  // horaSiguiente("23:00") daría "24:00", que no es un TIME válido.
+  const hasta = desde === "23:00" ? "23:59" : horaSiguiente(desde);
+
+  const date = utcDate(fecha);
+  const start_time = toTime(desde);
+  const day_of_week = date.getUTCDay();
+
+  const schedule = await prisma.schedule.upsert({
+    where: {
+      place_id_day_of_week_start_time: { place_id, day_of_week, start_time },
+    },
+    update: { fee_id, end_time: toTime(hasta) },
+    create: {
+      place_id,
+      fee_id,
+      day_of_week,
+      start_time,
+      end_time: toTime(hasta),
+    },
+  });
+
+  const data = {
+    schedule_id: schedule.id,
+    fee_id: schedule.fee_id,
+    user_id: USER.socioMartin,
+    date,
+    status: "Confirmada" as const,
+    notes: "Arranca en un rato: ya no entra en la ventana de cancelación.",
+    active: true,
+  };
+
+  try {
+    await prisma.booking.upsert({
+      where: { id: BOOKING.ventanaCerrada },
+      update: data,
+      create: { id: BOOKING.ventanaCerrada, ...data },
+    });
+    console.log(`Reserva de ventana cerrada lista (${ESPACIO}, ${fecha} ${desde}).`);
+  } catch (error: any) {
+    if (error?.code === "P2002") {
+      console.warn(
+        `El turno ${ESPACIO} ${fecha} ${desde} ya está reservado, se saltea la reserva de ventana cerrada.`,
+      );
+      return;
+    }
+    throw error;
+  }
+}
+
 async function main() {
   const roleIds = await seedRoles();
 
@@ -812,6 +921,7 @@ async function main() {
   const placeIds = await seedPlaces();
   const schedules = await seedSchedules(placeIds, feeIds);
   await seedBookings(schedules);
+  await seedBookingEnVentana(placeIds, feeIds);
 
   const disciplineIds = await seedDisciplines(placeIds, feeIds);
   await backfillProfesores();
