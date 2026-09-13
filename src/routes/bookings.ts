@@ -12,6 +12,8 @@ import {
   ultimaFechaReservable,
   DIAS_ADELANTE_SOCIO,
   DIAS_ADELANTE_ADMIN,
+  HORAS_ANTES_CANCELAR,
+  dentroDeVentanaCancelacion,
 } from "../lib/booking-date";
 
 export const bookingsRouter = Router();
@@ -395,15 +397,36 @@ bookingsRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response)
  * DELETE /api/bookings/:id — cancela (no borra). status = Cancelada y active = null
  * en el mismo update: el NULL saca la fila de la unique constraint y libera el turno,
  * pero la reserva queda para el historial.
+ *
+ * El socio tiene ventana: hasta HORAS_ANTES_CANCELAR antes de que arranque el turno.
+ * La gestión no.
  */
 bookingsRouter.delete("/:id", async (req: Request<{ id: string }>, res: Response) => {
   try {
-    const existing = await prisma.booking.findUnique({ where: { id: req.params.id } });
+    // Trae el turno porque la ventana de cancelación necesita la hora de inicio:
+    // la reserva sola sólo sabe el día.
+    const existing = await prisma.booking.findUnique({
+      where: { id: req.params.id },
+      include: { schedule: true },
+    });
     if (!existing) {
       return res.status(404).json({ success: false, error: "Reserva no encontrada" });
     }
     if (!isAdmin(req) && existing.user_id !== req.user!.id) {
       return res.status(403).json({ success: false, error: "No tenés permisos para esta acción" });
+    }
+
+    // La gestión cancela siempre; el socio, hasta HORAS_ANTES_CANCELAR antes del
+    // turno. Va en el backend y no sólo en el front: escondiendo el botón, un
+    // DELETE a mano seguiría liberando la cancha cinco minutos antes.
+    if (
+      !isAdmin(req) &&
+      !dentroDeVentanaCancelacion(existing.date, existing.schedule.start_time)
+    ) {
+      return res.status(409).json({
+        success: false,
+        error: `Las reservas se cancelan hasta ${HORAS_ANTES_CANCELAR} horas antes del turno. Comunicate con el club.`,
+      });
     }
 
     // Cancelar dos veces en paralelo (doble tap, dos pestañas) tiene que dejar
