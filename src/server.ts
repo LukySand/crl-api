@@ -10,6 +10,7 @@ import { bookingsRouter } from "./routes/bookings";
 import { disciplinesRouter } from "./routes/disciplines";
 import { enrollmentsRouter } from "./routes/enrollments";
 import { socioRouter } from "./routes/socio";
+import { familiesRouter } from "./routes/families";
 
 const app = express();
 app.use(express.json());
@@ -28,6 +29,7 @@ app.use("/api/bookings", bookingsRouter);
 app.use("/api/disciplines", disciplinesRouter);
 app.use("/api/enrollments", enrollmentsRouter);
 app.use("/api/socio", socioRouter);
+app.use("/api/families", familiesRouter);
 
 const port = Number(process.env.PORT ?? 3001);
 app.listen(port, () => {

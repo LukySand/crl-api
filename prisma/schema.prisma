@@ -60,25 +60,34 @@ model User {
   file_id    String?  @db.Char(128)
   birth_date DateTime
   active     Boolean  @default(true) // baja lógica: false = dado de baja (#46)
+  has_credentials Boolean @default(true)
 
   role Role  @relation(fields: [role_id], references: [id])
   file File? @relation(fields: [file_id], references: [id])
 
-  families    Family[]
-  bookings    Booking[]
-  disciplines DisciplineProfessor[] // disciplinas que dicta (rol Profesor)
-  enrollments Enrollment[] // disciplinas en las que está inscripto (rol Socio)
+  families_as_parent Family[]              @relation("FamilyParent") // hijos a cargo (es el padre/tutor)
+  families_as_child  Family[]              @relation("FamilyChild") // vínculos en los que es el hijo
+  bookings           Booking[]
+  disciplines        DisciplineProfessor[] // disciplinas que dicta (rol Profesor)
+  enrollments        Enrollment[] // disciplinas en las que está inscripto (rol Socio)
 
   @@map("users")
 }
 
+// Vínculo padre/tutor ↔ hijo a cargo. `active` es la dependencia: true = el
+// padre lo gestiona/paga desde su cuenta; false = desvinculado
 model Family {
-  id          String  @id @default(uuid())
-  parent_id   String  @db.Char(128)
-  responsible Boolean @default(false) @db.TinyInt
+  id          String   @id @default(uuid())
+  parent_id   String   @db.Char(128)
+  child_id    String   @db.Char(128)
+  responsible Boolean  @default(false) @db.TinyInt
+  active      Boolean  @default(true)
+  created_at  DateTime @default(now())
 
-  parent User @relation(fields: [parent_id], references: [id])
+  parent User @relation("FamilyParent", fields: [parent_id], references: [id])
+  child  User @relation("FamilyChild", fields: [child_id], references: [id])
 
+  @@unique([parent_id, child_id])
   @@map("families")
 }
 

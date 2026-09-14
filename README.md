@@ -39,6 +39,12 @@ API en `http://localhost:3001`. Verificá: `curl http://localhost:3001/api/healt
 | PUT | `/api/files` | Sube una imagen (`multipart/form-data`) |
 | GET | `/api/files?id=:id` | Obtiene una imagen por id |
 | DELETE | `/api/files?fileId=:id` | Elimina una imagen por id |
+| GET | `/api/families` | Hijos a cargo del usuario logueado (`?all=true` incluye desvinculados) |
+| POST | `/api/families/children` | Da de alta a un hijo y lo vincula (sin credenciales propias) |
+| PATCH | `/api/families/:id/credentials` | Carga email + password reales al hijo vinculado |
+| PATCH | `/api/families/:id/photo` | Asocia al hijo una foto ya subida con `PUT /api/files` |
+| PATCH | `/api/families/:id/unlink` | Desvincula al hijo (`Family.active = false`) |
+| PATCH | `/api/socio/password` | Cambia la contraseña propia (pide la actual) |
 
 ### Rutas de uso (`files`)
 
@@ -54,6 +60,34 @@ API en `http://localhost:3001`. Verificá: `curl http://localhost:3001/api/healt
 	- Tipo de `fileId`: `number` entero
 - Eliminar imagen: `DELETE /api/files?fileId=<fileId>`
 	- Tipo de `fileId`: `number` entero
+
+### Rutas de uso (`families`)
+
+Flujo de un padre/tutor con hijos a cargo. Todas requieren sesión; el padre sale del
+token, nunca de un id que mande el cliente. El `:id` de `/families/:id/*` es el id del
+**vínculo** (`Family`), no del hijo.
+
+- Dar de alta un hijo: `POST /api/families/children`
+	- Body: `{ name, last_name, dni, birth_date, file_id? }`
+	- El hijo se crea **sin** email/password propios (`has_credentials: false`) y queda
+	  vinculado (`Family.active: true`). Tiene que ser menor de 18.
+	- `409` si el DNI ya está registrado.
+- Listar hijos a cargo: `GET /api/families` (`?all=true` trae también los desvinculados)
+- Cargar credenciales reales al hijo: `PATCH /api/families/:id/credentials`
+	- Body: `{ email, password }`
+	- Después de esto el hijo puede loguearse solo (`has_credentials: true`).
+	- Requiere que el vínculo siga activo (`409` si ya se desvinculó).
+- Asociar una foto al hijo: `PATCH /api/families/:id/photo`
+	- Body: `{ file_id }` (de un `PUT /api/files` anterior, esto no sube nada)
+	- Mismas reglas que `credentials` (activo, dueño del vínculo).
+- Desvincular al hijo: `PATCH /api/families/:id/unlink`
+	- Pone `Family.active = false`. El hijo deja de listarse en `GET /api/families` del
+	  padre; si ya tenía credenciales propias, sigue entrando con su cuenta igual que antes.
+- Cambiar la propia contraseña: `PATCH /api/socio/password`
+	- Body: `{ current_password, new_password }` — pensado para que el hijo cambie la que
+	  le cargó el padre.
+
+Detalle completo (shapes de respuesta, códigos de error) en `FAMILY_FLOW.md`.
 
 ## Comandos
 
