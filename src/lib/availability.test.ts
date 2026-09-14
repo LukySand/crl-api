@@ -6,6 +6,7 @@ import { overlaps } from "./time";
 import {
   buildAvailability,
   buildOccupancy,
+  claseQuePisa,
   type SlotSchedule,
   type SlotBooking,
   type SlotDisciplineSchedule,
@@ -184,4 +185,41 @@ test("el borde del turno: a la hora de fin ya no está en curso", () => {
   );
 
   expect(enCurso[0]!.turno_actual).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// claseQuePisa — la misma regla la usan tres lugares (mostrar disponibilidad,
+// crear un turno y reservarlo). Si acá cambia algo, cambia en los tres.
+// ---------------------------------------------------------------------------
+
+const clase = (desde: string, hasta: string, name = "Vóley") => ({
+  start_time: t(desde),
+  end_time: t(hasta),
+  discipline: { name },
+});
+
+test("devuelve la clase que se pisa, con su nombre", () => {
+  const encontrada = claseQuePisa(t("19:00"), t("20:00"), [clase("19:30", "21:00", "Hockey")]);
+  expect(encontrada?.discipline.name).toBe("Hockey");
+});
+
+test("null cuando no hay ninguna clase", () => {
+  expect(claseQuePisa(t("19:00"), t("20:00"), [])).toBeNull();
+});
+
+test("null si sólo se tocan en el borde: la clase termina cuando el turno empieza", () => {
+  expect(claseQuePisa(t("19:00"), t("20:00"), [clase("18:00", "19:00")])).toBeNull();
+  expect(claseQuePisa(t("19:00"), t("20:00"), [clase("20:00", "21:00")])).toBeNull();
+});
+
+test("detecta la clase aunque esté contenida dentro del turno", () => {
+  expect(claseQuePisa(t("18:00"), t("22:00"), [clase("19:00", "20:00")])).not.toBeNull();
+});
+
+test("ignora las clases que no se pisan y encuentra la que sí", () => {
+  const encontrada = claseQuePisa(t("19:00"), t("20:00"), [
+    clase("08:00", "09:00", "Patín"),
+    clase("19:45", "21:00", "Básquet"),
+  ]);
+  expect(encontrada?.discipline.name).toBe("Básquet");
 });

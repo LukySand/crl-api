@@ -31,6 +31,24 @@ export type SlotDisciplineSchedule = {
 
 export type Motivo = "reserva" | "clase";
 
+/**
+ * La clase que se pisa con el rango [start,end), o null si está libre.
+ *
+ * Es la regla "una clase bloquea el espacio" en un solo lugar: la usan
+ * buildAvailability (mostrar), POST /api/schedules (no crear un turno que nace
+ * muerto) y POST /api/bookings (no reservar sobre una clase). Las tres tienen
+ * que responder igual, si no el front muestra una cosa y la API hace otra.
+ *
+ * `clases` ya viene filtrada por espacio y día de semana desde el caller.
+ */
+export function claseQuePisa(
+  start: Date,
+  end: Date,
+  clases: SlotDisciplineSchedule[],
+): SlotDisciplineSchedule | null {
+  return clases.find((c) => overlaps(start, end, c.start_time, c.end_time)) ?? null;
+}
+
 export type SlotDisponibilidad = SlotSchedule & {
   ocupado: boolean;
   motivo: Motivo | null;
@@ -57,9 +75,7 @@ export function buildAvailability(
   const reservados = new Set(bookings.map((b) => b.schedule_id));
 
   return schedules.map((s) => {
-    const clase = disciplineSchedules.find((d) =>
-      overlaps(s.start_time, s.end_time, d.start_time, d.end_time),
-    );
+    const clase = claseQuePisa(s.start_time, s.end_time, disciplineSchedules);
     if (clase) {
       return { ...s, ocupado: true, motivo: "clase", detalle: clase.discipline.name };
     }

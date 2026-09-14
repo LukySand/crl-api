@@ -5,6 +5,7 @@ import { Prisma } from "../../prisma/generated/client";
 import { requireAuth, requireAdmin } from "../lib/auth";
 import { findOrCreateFeeForPlace } from "../lib/fee";
 import { TIME, toTime, overlaps } from "../lib/time";
+import { claseQuePisa } from "../lib/availability";
 
 export const schedulesRouter = Router();
 
@@ -48,6 +49,8 @@ function validationError(res: Response, error: z.ZodError) {
 class SuperposicionError extends Error {}
 class NoEncontradoError extends Error {}
 class RangoInvalidoError extends Error {}
+/** Lleva el nombre de la disciplina para que el 409 diga cuál es. */
+class ClaseSuperpuestaError extends Error {}
 
 /**
  * ¿Hay algún turno del mismo espacio y día que se pise con [start,end)?
@@ -74,6 +77,28 @@ async function hayTurnoSuperpuesto(
     select: { start_time: true, end_time: true },
   });
   return otros.some((o) => overlaps(start, end, o.start_time, o.end_time));
+}
+
+/**
+ * ¿Hay una clase de disciplina en ese espacio y día que se pise con [start,end)?
+ * Devuelve el nombre de la disciplina, o null si está libre.
+ *
+ * Un turno que se pisa con una clase nace muerto: nadie va a poder reservarlo,
+ * porque POST /api/bookings lo rechaza por la misma razón. Mejor no dejarlo
+ * crear y que primero se mueva la clase.
+ */
+async function claseSuperpuesta(
+  tx: Prisma.TransactionClient,
+  place_id: number,
+  day_of_week: number,
+  start: Date,
+  end: Date,
+): Promise<string | null> {
+  const clases = await tx.disciplineSchedule.findMany({
+    where: { day_of_week, discipline: { place_id, active: true } },
+    select: { start_time: true, end_time: true, discipline: { select: { name: true } } },
+  });
+  return claseQuePisa(start, end, clases)?.discipline.name ?? null;
 }
 
 /** GET /api/schedules?place_id=1 — horarios, opcionalmente filtrados por espacio. */
@@ -139,6 +164,10 @@ schedulesRouter.post(
         if (await hayTurnoSuperpuesto(tx, place_id, day_of_week, start, end)) {
           throw new SuperposicionError();
         }
+        const clase = await claseSuperpuesta(tx, place_id, day_of_week, start, end);
+        if (clase) {
+          throw new ClaseSuperpuestaError(clase);
+        }
         return tx.schedule.create({
           data: {
             place_id,
@@ -156,6 +185,12 @@ schedulesRouter.post(
         return res.status(409).json({
           success: false,
           error: "Ese turno se superpone con otro ya cargado para el mismo espacio y día",
+        });
+      }
+      if (error instanceof ClaseSuperpuestaError) {
+        return res.status(409).json({
+          success: false,
+          error: `Ese horario se pisa con la clase de ${error.message} en ese espacio`,
         });
       }
       if (error?.code === "P2002") {
@@ -220,6 +255,16 @@ schedulesRouter.patch(
         if (await hayTurnoSuperpuesto(tx, actual.place_id, nuevoDia, nuevoInicio, nuevoFin, id)) {
           throw new SuperposicionError();
         }
+        const clase = await claseSuperpuesta(
+          tx,
+          actual.place_id,
+          nuevoDia,
+          nuevoInicio,
+          nuevoFin,
+        );
+        if (clase) {
+          throw new ClaseSuperpuestaError(clase);
+        }
 
         return tx.schedule.update({
           where: { id },
@@ -248,6 +293,12 @@ schedulesRouter.patch(
         return res.status(409).json({
           success: false,
           error: "Ese turno se superpone con otro ya cargado para el mismo espacio y día",
+        });
+      }
+      if (error instanceof ClaseSuperpuestaError) {
+        return res.status(409).json({
+          success: false,
+          error: `Ese horario se pisa con la clase de ${error.message} en ese espacio`,
         });
       }
       if (error?.code === "P2002") {

@@ -15,7 +15,7 @@ import {
   HORAS_ANTES_CANCELAR,
   dentroDeVentanaCancelacion,
 } from "../lib/booking-date";
-import { buildAvailability } from "../lib/availability";
+import { buildAvailability, claseQuePisa } from "../lib/availability";
 
 export const bookingsRouter = Router();
 
@@ -293,6 +293,24 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
       return res
         .status(400)
         .json({ success: false, error: "Ese horario ya pasó" });
+    }
+
+    // Un turno que se pisa con una clase de disciplina no se reserva: el espacio
+    // está ocupado dictándola. Va acá y no sólo en GET /availability: el front
+    // esconde el turno, pero un POST directo lo reservaría igual.
+    const clases = await prisma.disciplineSchedule.findMany({
+      where: {
+        day_of_week: schedule.day_of_week,
+        discipline: { place_id: schedule.place_id, active: true },
+      },
+      select: { start_time: true, end_time: true, discipline: { select: { name: true } } },
+    });
+    const clase = claseQuePisa(schedule.start_time, schedule.end_time, clases);
+    if (clase) {
+      return res.status(409).json({
+        success: false,
+        error: `Ese horario está ocupado por la clase de ${clase.discipline.name}`,
+      });
     }
 
     // El schema no puede validar esto: la fecha tiene que caer en el día de semana del turno
