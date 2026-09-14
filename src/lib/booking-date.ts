@@ -62,3 +62,55 @@ export function ultimaFechaReservable(diasAdelante: number): string {
     .toISOString()
     .slice(0, 10);
 }
+
+/**
+ * Hasta cuánto antes del turno se puede cancelar.
+ *
+ * Sin tope, un socio puede soltar la cancha diez minutos antes y dejarla muerta:
+ * nadie llega a reservarla. Diez horas alcanzan para que el turno de la noche se
+ * libere a la mañana y todavía lo tome alguien.
+ *
+ * La gestión queda exenta, igual que con DIAS_ADELANTE_ADMIN: si el socio llama
+ * por teléfono, alguien tiene que poder cancelarle igual.
+ */
+export const HORAS_ANTES_CANCELAR = 10;
+
+/**
+ * "YYYY-MM-DDTHH:MM" de un instante, en el huso del club.
+ *
+ * Es todayInClub() y nowTimeInClub() pegados en un solo string, para poder
+ * comparar día y hora de una sola vez: en este formato el orden lexicográfico es
+ * el cronológico.
+ */
+function stampInClub(d: Date): string {
+  const fecha = d.toLocaleDateString("en-CA", { timeZone: CLUB_TZ });
+  const hora = d.toLocaleTimeString("en-GB", {
+    timeZone: CLUB_TZ,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  return `${fecha}T${hora}`;
+}
+
+/**
+ * ¿Todavía se está a tiempo de cancelar esta reserva?
+ *
+ * Compara el inicio del turno contra "ahora + HORAS_ANTES_CANCELAR", los dos como
+ * stamp del club. El límite es inclusivo: con exactamente 10 horas todavía se
+ * puede. Una reserva pasada cae sola — su inicio ya quedó atrás del límite — así
+ * que no hace falta un chequeo aparte de fecha vencida.
+ *
+ * `ahora` entra por parámetro para poder testear sin tocar el reloj del sistema.
+ */
+export function dentroDeVentanaCancelacion(
+  date: Date,
+  startTime: Date,
+  ahora: Date = new Date(),
+): boolean {
+  const inicio = `${date.toISOString().slice(0, 10)}T${timeToHHMM(startTime)}`;
+  const limite = stampInClub(
+    new Date(ahora.getTime() + HORAS_ANTES_CANCELAR * 3_600_000),
+  );
+  return limite <= inicio;
+}

@@ -72,7 +72,10 @@ filesRouter.get("/", async (req: Request, res: Response) => {
 
     res.setHeader("Content-Type", file.mime);
     res.setHeader("Content-Length", file.size.toString());
-    res.setHeader("Cache-Control", "public, max-age=86400, must-revalidate");
+    // no-cache: revalida siempre con el ETag (304 si no cambió). Con max-age de
+    // un día, reemplazar una foto dejaba la vieja en pantalla hasta 24 h, porque
+    // la URL (?id=) no cambia.
+    res.setHeader("Cache-Control", "public, no-cache");
     res.setHeader("Etag", file.etag);
     res.setHeader("Last-Modified", file.lastModified.toUTCString());
 
@@ -102,13 +105,16 @@ filesRouter.put("/", requireAuth, async (req: Request, res: Response) => {
         });
     }
 
-    const { file, kind, name } = validationResult.data;
+    const { file, kind } = validationResult.data;
 
     try {
         const result = await Storage.create({
             file,
             kind: kind as Storage.FileKind,
-            name,
+            // El nombre en disco lo pone el server. El `name` del form se ignora:
+            // si coincidía con uno existente (dos "IMG_0001.jpg", o a propósito),
+            // Storage.create pisaba el archivo de otra persona.
+            name: crypto.randomUUID(),
             userId: req.user!.id,
         });
         return res.status(200).json({ fileId: result });

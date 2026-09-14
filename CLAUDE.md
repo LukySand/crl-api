@@ -143,17 +143,20 @@ que opere "sobre mí" saca el `id` del token verificado.
 ## Modelo de datos
 
 - `Role` — enum `RoleType`: `SuperAdmin` / `Administrador` / `Profesor` / `Socio`.
-- `User` — `active` es baja lógica (false = dado de baja).
+- `User` — `active` es baja lógica (false = dado de baja). `has_credentials` distingue al que
+  puede entrar solo del menor que depende del tutor.
 - `File` — un archivo subido (imagen), referenciado por `User.file_id` o `Place.file_id`.
-- `Family` — vincula un `User` menor a un `parent_id` (tutor responsable) + `responsible`.
-  El modelo existe en el schema pero **todavía no tiene ningún endpoint** que lo use.
+- `Family` — vincula un `User` menor (`child_id`) a un tutor (`parent_id`) + `responsible`.
+  Lo expone `familiesRouter` (`/api/families`).
 - `Log` — buffer de auditoría/informativos que escribe `lib/logger.ts` (tabla `logs`).
 - `Place` — espacio del club (cancha, salón); baja lógica con `active`.
 - `Schedule` — turno reservable semanal de un `Place` (día + hora + `Fee`).
 - `Booking` — una reserva de un `Schedule` para una fecha puntual. Enum `BookingStatus`
   (`Pendiente`/`Confirmada`/`Cancelada`).
-- `Discipline` — disciplina del club (fútbol, vóley…) con profesor/cuota/espacio opcionales;
-  baja lógica con `active`.
+- `Discipline` — disciplina del club (fútbol, vóley…) con cuota/espacio opcionales; baja lógica
+  con `active` y `full` para cortar inscripciones cuando se llena el cupo.
+- `DisciplineProfessor` — tabla puente: varios profes por disciplina (#6). Reemplaza a
+  `Discipline.professor_id`, que quedó **deprecado** y que nadie lee ni escribe.
 - `DisciplineSchedule` — horario semanal fijo de una `Discipline` (no se reserva, se dicta).
 - `Enrollment` — inscripción de un socio a una `Discipline`, con historial de períodos.
 - `Fee` — tarifa **inmutable** (sin endpoint de update: cambiar precio = fila nueva).
@@ -162,7 +165,7 @@ que opere "sobre mí" saca el `id` del token verificado.
 
 **IDs**: `User`, `File`, `Family` y `Booking` usan UUID (`String @id @default(uuid())`).
 El resto (`Role`, `Log`, `Fee`, `Place`, `Discipline`, `DisciplineSchedule`, `Enrollment`,
-`Schedule`) usa `Int` autoincremental.
+`Schedule`) usa `Int` autoincremental. Migrado desde int en el commit `4db61f3`.
 
 **Truco `active` nullable para uniques parciales** (`ponytail:` en el schema): tanto `Booking`
 como `Enrollment` tienen `active Boolean?` dentro de un `@@unique(...)` — `true` mientras la
@@ -255,16 +258,35 @@ En prod, `entrypoint.sh` corre `migrate deploy` + seed antes de arrancar.
 ## Estado actual
 
 **Construido**: auth completo (JWT + Google), gestión de usuarios y roles, archivos/fotos de
-perfil, espacios (`Place`) con ocupación, turnos reservables (`Schedule`) con validación de
-solapamiento, reservas (`Booking`) con cancelación y topes de anticipación, tarifas (`Fee`)
-categorizadas, disciplinas con sus horarios de clase, e inscripciones socio↔disciplina.
+perfil, familias (vínculo menor↔tutor), espacios (`Place`) con ocupación, turnos reservables
+(`Schedule`) con validación de solapamiento, reservas (`Booking`) con cancelación y topes de
+anticipación, tarifas (`Fee`) categorizadas, disciplinas con varios profesores y sus horarios
+de clase, e inscripciones socio↔disciplina.
 
 **Falta** (ni siquiera hay modelo en el schema): pagos (Mercado Pago / comprobante de
 transferencia), cuotas de socio como obligación mensual con vencimiento, publicaciones
 institucionales, locales adheridos con beneficios, y reportes de ingresos.
 
-`Family` sí tiene modelo, pero **ningún endpoint lo usa todavía** — el vínculo menor↔tutor está
-en la base y nada más.
+### Reglas temporales de las reservas
+
+Todas viven en `src/lib/booking-date.ts`, con su test en `booking-date.test.ts`. Nunca las
+metas sueltas en un handler:
+
+| Constante | Qué limita |
+| --- | --- |
+| `DIAS_ADELANTE_SOCIO` = 21 | Cuánto puede reservar hacia adelante un socio |
+| `DIAS_ADELANTE_ADMIN` = 183 | Lo mismo para la gestión (~6 meses, para eventos) |
+| `HORAS_ANTES_CANCELAR` = 10 | Hasta cuándo puede **cancelar** un socio. La gestión no tiene tope |
+
+`dentroDeVentanaCancelacion(date, start_time, ahora?)` resuelve la última: combina la fecha de
+la reserva con la hora del turno y las compara como string `"YYYY-MM-DDTHH:MM"` en huso del
+club, que es el mismo truco de `todayInClub()` / `nowTimeInClub()` (el orden lexicográfico es el
+cronológico). El límite es **inclusivo**: con 10 horas justas todavía se cancela. Una reserva
+pasada cae sola, no hace falta un chequeo aparte.
+
+`HORAS_ANTES_CANCELAR` está **duplicada** en el front (`CRL/src/app/pages/socio/reservas.ts`),
+igual que `validation.ts`: el front esconde el botón, el back rechaza el `DELETE`. Si tocás una,
+tocá la otra.
 
 ## Deuda conocida
 

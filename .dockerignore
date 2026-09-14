@@ -3,3 +3,4 @@ prisma/generated
 .env
 .git
 *.log
+uploads
