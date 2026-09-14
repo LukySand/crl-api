@@ -13,6 +13,7 @@ import {
   DIAS_ADELANTE_SOCIO,
   DIAS_ADELANTE_ADMIN,
 } from "../lib/booking-date";
+import { buildAvailability } from "../lib/availability";
 
 export const bookingsRouter = Router();
 
@@ -99,8 +100,13 @@ bookingsRouter.get("/", async (req: Request, res: Response) => {
 
 /**
  * GET /api/bookings/availability?place_id=1&date=2026-08-17 — qué turnos están
- * tomados ese día. Devuelve sólo ids, sin datos de quién reservó: el socio
- * necesita saber qué está ocupado, no de quién es.
+ * tomados ese día. Sin datos de quién reservó: el socio necesita saber qué está
+ * ocupado, no de quién es.
+ *
+ * Además de reservas, un turno también queda tomado si se pisa con una clase de
+ * disciplina en ese espacio y día (DisciplineSchedule) — ver lib/availability.ts.
+ * `taken` se mantiene por compatibilidad con el front actual (sólo ids); `slots`
+ * es la respuesta nueva con el motivo y, si es una clase, su nombre.
  *
  * Va antes de "/:id" a propósito: Express matchea por orden y si no, tomaría
  * "availability" como un id.
@@ -117,13 +123,43 @@ bookingsRouter.get("/availability", async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: "La fecha debe ser YYYY-MM-DD" });
     }
 
-    const rows = await prisma.booking.findMany({
-      // active: true deja afuera las canceladas (que quedan en null y liberan el turno)
-      where: { date: parseDate(date), active: true, schedule: { place_id: placeId } },
-      select: { schedule_id: true },
-    });
+    const when = parseDate(date);
+    if (Number.isNaN(when.getTime())) {
+      return res.status(400).json({ success: false, error: "Fecha inválida" });
+    }
+    const dayOfWeek = when.getUTCDay();
 
-    return res.json({ success: true, taken: rows.map((r) => r.schedule_id) });
+    const [schedules, bookings, disciplineSchedules] = await Promise.all([
+      prisma.schedule.findMany({
+        where: { place_id: placeId, day_of_week: dayOfWeek },
+        select: { id: true, start_time: true, end_time: true },
+        orderBy: { start_time: "asc" },
+      }),
+      prisma.booking.findMany({
+        // active: true deja afuera las canceladas (que quedan en null y liberan el turno)
+        where: { date: when, active: true, schedule: { place_id: placeId } },
+        select: { schedule_id: true },
+      }),
+      prisma.disciplineSchedule.findMany({
+        where: {
+          day_of_week: dayOfWeek,
+          discipline: { place_id: placeId, active: true },
+        },
+        select: {
+          start_time: true,
+          end_time: true,
+          discipline: { select: { name: true } },
+        },
+      }),
+    ]);
+
+    const slots = buildAvailability(schedules, bookings, disciplineSchedules);
+
+    return res.json({
+      success: true,
+      taken: slots.filter((s) => s.ocupado).map((s) => s.id),
+      slots,
+    });
   } catch (error) {
     console.error("Availability error:", error);
     return res.status(500).json({ success: false, error: "Error al consultar disponibilidad" });

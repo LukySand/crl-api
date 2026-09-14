@@ -1,9 +1,10 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
+import { Prisma } from "../../prisma/generated/client";
 import { requireAuth, requireAdmin } from "../lib/auth";
 import { findOrCreateFeeForPlace } from "../lib/fee";
-import { TIME, toTime } from "../lib/time";
+import { TIME, toTime, overlaps } from "../lib/time";
 
 export const schedulesRouter = Router();
 
@@ -41,6 +42,38 @@ function validationError(res: Response, error: z.ZodError) {
     errors[e.path[0] as string] = e.message;
   });
   return res.status(400).json({ success: false, error: "Validación fallida", errors });
+}
+
+/** Marcadores de control para el catch — no son errores reales, son resultados esperados de la transacción. */
+class SuperposicionError extends Error {}
+class NoEncontradoError extends Error {}
+class RangoInvalidoError extends Error {}
+
+/**
+ * ¿Hay algún turno del mismo espacio y día que se pise con [start,end)?
+ *
+ * El unique (place_id, day_of_week, start_time) sólo bloquea el duplicado exacto:
+ * 19:00–20:30 y 19:15–20:00 pasan las dos. Esto se valida en código porque MySQL
+ * no tiene exclusion constraints. `excludeId` es para el update: no comparar el
+ * turno contra sí mismo.
+ */
+async function hayTurnoSuperpuesto(
+  tx: Prisma.TransactionClient,
+  place_id: number,
+  day_of_week: number,
+  start: Date,
+  end: Date,
+  excludeId?: number,
+): Promise<boolean> {
+  const otros = await tx.schedule.findMany({
+    where: {
+      place_id,
+      day_of_week,
+      ...(excludeId !== undefined && { id: { not: excludeId } }),
+    },
+    select: { start_time: true, end_time: true },
+  });
+  return otros.some((o) => overlaps(start, end, o.start_time, o.end_time));
 }
 
 /** GET /api/schedules?place_id=1 — horarios, opcionalmente filtrados por espacio. */
@@ -96,19 +129,35 @@ schedulesRouter.post(
       if (!parsed.success) return validationError(res, parsed.error);
 
       const { place_id, amount, day_of_week, start_time, end_time } = parsed.data;
+      const start = toTime(start_time);
+      const end = toTime(end_time);
 
-      const schedule = await prisma.schedule.create({
-        data: {
-          place_id,
-          fee_id: await findOrCreateFeeForPlace(amount, place_id),
-          day_of_week,
-          start_time: toTime(start_time),
-          end_time: toTime(end_time),
-        },
-        include: { fee: true },
+      // Transacción: leer los turnos del día + crear tiene que ser atómico, si no
+      // dos POST superpuestos podrían leer "libre" los dos antes de que cualquiera
+      // inserte (el unique no los frena porque sus horas de inicio son distintas).
+      const schedule = await prisma.$transaction(async (tx) => {
+        if (await hayTurnoSuperpuesto(tx, place_id, day_of_week, start, end)) {
+          throw new SuperposicionError();
+        }
+        return tx.schedule.create({
+          data: {
+            place_id,
+            fee_id: await findOrCreateFeeForPlace(amount, place_id),
+            day_of_week,
+            start_time: start,
+            end_time: end,
+          },
+          include: { fee: true },
+        });
       });
       return res.status(201).json({ success: true, schedule });
     } catch (error: any) {
+      if (error instanceof SuperposicionError) {
+        return res.status(409).json({
+          success: false,
+          error: "Ese turno se superpone con otro ya cargado para el mismo espacio y día",
+        });
+      }
       if (error?.code === "P2002") {
         return res.status(409).json({
           success: false,
@@ -148,41 +197,58 @@ schedulesRouter.patch(
 
       const { amount, day_of_week, start_time, end_time } = parsed.data;
 
-      // La tarifa se resuelve dentro del espacio del turno, así que hace falta
-      // saber a qué espacio pertenece antes de tocar el precio.
-      let feeId: number | undefined;
-      if (amount !== undefined) {
-        const actual = await prisma.schedule.findUnique({
-          where: { id },
-          select: { place_id: true },
-        });
-        if (!actual) {
-          return res.status(404).json({ success: false, error: "Horario no encontrado" });
-        }
-        feeId = await findOrCreateFeeForPlace(amount, actual.place_id);
-      }
+      // Todo (leer el turno actual, chequear superposición, actualizar) va en una
+      // sola transacción: si no, dos PATCH concurrentes podrían leer "libre" los
+      // dos antes de que cualquiera escriba.
+      const schedule = await prisma.$transaction(async (tx) => {
+        const actual = await tx.schedule.findUnique({ where: { id } });
+        if (!actual) throw new NoEncontradoError();
 
-      const schedule = await prisma.schedule.update({
-        where: { id },
-        data: {
-          ...(feeId !== undefined && { fee_id: feeId }),
-          ...(day_of_week !== undefined && { day_of_week }),
-          ...(start_time !== undefined && { start_time: toTime(start_time) }),
-          ...(end_time !== undefined && { end_time: toTime(end_time) }),
-        },
-        include: { fee: true },
+        const feeId =
+          amount !== undefined
+            ? await findOrCreateFeeForPlace(amount, actual.place_id)
+            : undefined;
+
+        // Día y horas resultantes: los que manda el PATCH, o si no los que ya tenía.
+        const nuevoDia = day_of_week ?? actual.day_of_week;
+        const nuevoInicio = start_time !== undefined ? toTime(start_time) : actual.start_time;
+        const nuevoFin = end_time !== undefined ? toTime(end_time) : actual.end_time;
+
+        if (nuevoInicio >= nuevoFin) {
+          throw new RangoInvalidoError();
+        }
+        if (await hayTurnoSuperpuesto(tx, actual.place_id, nuevoDia, nuevoInicio, nuevoFin, id)) {
+          throw new SuperposicionError();
+        }
+
+        return tx.schedule.update({
+          where: { id },
+          data: {
+            ...(feeId !== undefined && { fee_id: feeId }),
+            day_of_week: nuevoDia,
+            start_time: nuevoInicio,
+            end_time: nuevoFin,
+          },
+          include: { fee: true },
+        });
       });
 
-      if (schedule.start_time >= schedule.end_time) {
+      return res.json({ success: true, schedule });
+    } catch (error: any) {
+      if (error instanceof NoEncontradoError || error?.code === "P2025") {
+        return res.status(404).json({ success: false, error: "Horario no encontrado" });
+      }
+      if (error instanceof RangoInvalidoError) {
         return res.status(400).json({
           success: false,
           error: "La hora de fin debe ser posterior a la de inicio",
         });
       }
-      return res.json({ success: true, schedule });
-    } catch (error: any) {
-      if (error?.code === "P2025") {
-        return res.status(404).json({ success: false, error: "Horario no encontrado" });
+      if (error instanceof SuperposicionError) {
+        return res.status(409).json({
+          success: false,
+          error: "Ese turno se superpone con otro ya cargado para el mismo espacio y día",
+        });
       }
       if (error?.code === "P2002") {
         return res.status(409).json({

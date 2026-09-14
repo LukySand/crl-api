@@ -2,7 +2,8 @@ import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
 import { requireAuth, requireAdmin, readToken, ADMIN_ROLES } from "../lib/auth";
-import { parseDate, todayInClub, nowTimeInClub, timeToHHMM } from "../lib/booking-date";
+import { parseDate, todayInClub, nowTimeInClub } from "../lib/booking-date";
+import { buildOccupancy } from "../lib/availability";
 
 export const placesRouter = Router();
 
@@ -56,11 +57,16 @@ placesRouter.get("/", async (req: Request, res: Response) => {
 /**
  * GET /api/places/occupancy — ocupación de hoy de cada espacio, para la gestión.
  *
- * Por espacio devuelve los turnos de hoy, cuántos están reservados y si en este
+ * Por espacio devuelve los turnos de hoy, cuántos están bloqueados y si en este
  * momento hay uno en curso ocupado. "Hoy" y "ahora" salen del huso del club, no
  * del server (ver lib/booking-date.ts).
  *
- * Dos consultas para todos los espacios, no una por espacio: la pantalla de
+ * Un turno se bloquea por una reserva activa o por una clase de disciplina en
+ * ese espacio y día (DisciplineSchedule) — el mismo criterio que
+ * /api/bookings/availability, compartido en lib/availability.ts. `reservados`
+ * sigue contando sólo reservas; `ocupados` es el total real.
+ *
+ * Tres consultas para todos los espacios, no una por espacio: la pantalla de
  * gestión la repite cada 15s y un N+1 acá se nota.
  *
  * Va antes de "/:id" a propósito: Express matchea por orden y si no tomaría
@@ -76,7 +82,7 @@ placesRouter.get(
       const now = nowTimeInClub();
       const dayOfWeek = parseDate(date).getUTCDay();
 
-      const [schedules, bookings] = await Promise.all([
+      const [schedules, bookings, disciplineSchedules] = await Promise.all([
         prisma.schedule.findMany({
           where: { day_of_week: dayOfWeek },
           select: { id: true, place_id: true, start_time: true, end_time: true },
@@ -87,53 +93,28 @@ placesRouter.get(
           where: { date: parseDate(date), active: true },
           select: { schedule_id: true },
         }),
+        prisma.disciplineSchedule.findMany({
+          where: { day_of_week: dayOfWeek, discipline: { active: true, place_id: { not: null } } },
+          select: {
+            start_time: true,
+            end_time: true,
+            discipline: { select: { name: true, place_id: true } },
+          },
+        }),
       ]);
 
-      const reservados = new Set(bookings.map((b) => b.schedule_id));
-
-      const porEspacio = new Map<
-        number,
-        {
-          place_id: number;
-          total: number;
-          reservados: number;
-          ocupado_ahora: boolean;
-          turno_actual: { start: string; end: string; reservado: boolean } | null;
-        }
-      >();
-
-      for (const s of schedules) {
-        const start = timeToHHMM(s.start_time);
-        const end = timeToHHMM(s.end_time);
-        const reservado = reservados.has(s.id);
-
-        const fila =
-          porEspacio.get(s.place_id) ??
-          {
-            place_id: s.place_id,
-            total: 0,
-            reservados: 0,
-            ocupado_ahora: false,
-            turno_actual: null,
-          };
-
-        fila.total += 1;
-        if (reservado) fila.reservados += 1;
-
-        // "HH:MM" con cero adelante compara bien como string, no hace falta parsear.
-        if (start <= now && now < end) {
-          fila.turno_actual = { start, end, reservado };
-          fila.ocupado_ahora = reservado;
-        }
-
-        porEspacio.set(s.place_id, fila);
-      }
+      const clases = disciplineSchedules.map((d) => ({
+        start_time: d.start_time,
+        end_time: d.end_time,
+        discipline: { name: d.discipline.name },
+        place_id: d.discipline.place_id as number, // el where ya descartó los null
+      }));
 
       return res.json({
         success: true,
         date,
         now,
-        occupancy: [...porEspacio.values()],
+        occupancy: buildOccupancy(schedules, bookings, clases, now),
       });
     } catch (error) {
       console.error("Occupancy error:", error);
