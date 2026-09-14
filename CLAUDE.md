@@ -38,7 +38,8 @@ Sirve **solo** `/api/*`. El frontend vive en otro repo y le pega vía proxy.
 | Teléfonos | **libphonenumber-js** |
 | Env | **dotenv** |
 
-TypeScript en todo. Sin tests configurados.
+TypeScript en todo. Tests con `bun:test` (nativo de Bun, sin framework aparte) en
+`src/lib/*.test.ts` y `src/routes/*.test.ts`.
 
 ---
 
@@ -66,35 +67,70 @@ same-origin. **Al agregar endpoints nuevos no se toca el proxy del front** — s
 
 ```
 src/
-├── server.ts             # Express: json middleware, /api/health, monta authRouter
+├── server.ts               # Express: json middleware, /api/health, monta los 10 routers
 ├── lib/
-│   ├── prisma.ts         # cliente Prisma + adapter MariaDB (singleton en dev)
-│   └── validation.ts     # Zod — DUPLICADO con el frontend (ver abajo)
+│   ├── auth.ts             # JWT: signToken/readToken, requireAuth/requireRole/requireAdmin/isAdmin
+│   ├── availability.ts     # cruza turnos con reservas + clases de disciplina (función pura, testeada)
+│   ├── availability.test.ts
+│   ├── booking-date.ts     # fechas/horas en huso del club, topes de anticipación (testeado)
+│   ├── booking-date.test.ts
+│   ├── fee.ts              # findOrCreateFeeForPlace: reusa/crea la tarifa de un turno o reserva
+│   ├── logger.ts           # buffer de logs a la tabla `logs`, flush por tamaño o cada 5s
+│   ├── prisma.ts           # cliente Prisma + adapter MariaDB (singleton en dev)
+│   ├── random-id.ts        # id numérico pseudo-aleatorio de 31 bits
+│   ├── storage.ts          # Storage: sube/lee/borra archivos en disco + fila en `files`
+│   ├── time.ts             # TIME regex, toTime, overlaps (rangos horarios)
+│   └── validation.ts       # Zod — DUPLICADO con el frontend (ver abajo)
+├── middleware/
+│   └── auth.ts             # authenticate/requireRole — usado solo por socioRouter (ver nota abajo)
 └── routes/
-    └── auth.ts           # authRouter (todos los endpoints actuales)
+    ├── admin.ts            # adminRouter — CRUD de usuarios con rol
+    ├── auth.ts             # authRouter — login/registro/Google
+    ├── booking-admin.test.ts
+    ├── bookings.ts         # bookingsRouter — reservas de espacios
+    ├── disciplines.ts      # disciplinesRouter — disciplinas + sus horarios de clase
+    ├── enrollments.ts      # enrollmentsRouter — inscripciones socio↔disciplina
+    ├── fee-category.test.ts
+    ├── fees.ts             # feesRouter — tarifas (inmutables, sin PATCH/DELETE)
+    ├── files.ts            # filesRouter — subida/descarga genérica de archivos
+    ├── places.ts           # placesRouter — espacios del club (canchas, salón)
+    ├── schedules.ts        # schedulesRouter — turnos reservables de un espacio
+    └── socio.ts            # socioRouter — foto de perfil del socio logueado
 
 prisma/
 ├── schema.prisma
-├── seed.ts               # siembra los roles
-└── migrations/
+├── seed.ts               # siembra roles, usuarios, archivos, familias, tarifas, espacios,
+│                         # turnos, disciplinas, inscripciones y reservas (idempotente)
+├── migrations/
+└── generated/            # cliente Prisma generado (bun run db:generate) — no editar a mano
 scripts/dev-setup.sh      # bun run setup
 ```
+
+`src/lib/auth.ts` y `src/middleware/auth.ts` son dos implementaciones de JWT distintas y
+duplicadas: casi todos los routers usan `lib/auth.ts` (`requireAuth`/`requireAdmin`/`isAdmin`),
+pero `socio.ts` usa `middleware/auth.ts` (`authenticate`). Mismo JWT, dos lecturas del token.
 
 ---
 
 ## Endpoints
 
-Todos en `src/routes/auth.ts`, montados bajo `/api/auth` (salvo health).
+10 routers montados en `server.ts`, todos bajo `/api/*`. Rutas sin login se marcan **público**;
+el resto exige `requireAuth`/`authenticate` y, si dice **gestión**, además `requireAdmin`
+(rol `SuperAdmin` o `Administrador`).
 
-| Método | Ruta | Qué hace |
+| Router | Base | Endpoints |
 | --- | --- | --- |
-| GET | `/api/health` | Healthcheck → `{ok:true}` |
-| POST | `/api/auth/login` | Login con `{dni, password}` → JWT 24h |
-| POST | `/api/auth/register` | Alta de Socio + auto-login |
-| GET | `/api/auth/verify` | Valida token (header `Bearer` o cookie `auth_token`) |
-| POST | `/api/auth/logout` | Limpia cookie |
-| GET | `/api/auth/google/config` | Expone el Client ID público al front |
-| POST | `/api/auth/google` | Login/alta con Google (ID token) |
+| — | `/api/health` | `GET /` — healthcheck → `{ok:true}` |
+| `authRouter` | `/api/auth` | `POST /login`, `GET /verify`, `POST /register`, `POST /logout`, `GET /google/config`, `POST /google` — todo público (ver [Auth](#auth-cómo-funciona)) |
+| `filesRouter` | `/api/files` | `GET /?id=` público; `PUT /` (auth, sube/reemplaza); `DELETE /?fileId=` (gestión) |
+| `adminRouter` | `/api/admin` | Todo gestión. `GET /users`; `POST /users`; `PUT /users/:id`; `DELETE /users/:id` (baja lógica + cancela sus reservas futuras); `PATCH /users/:id/reactivate` |
+| `placesRouter` | `/api/places` | `GET /` público (`?all=true` gestión ve inactivos); `GET /occupancy` (gestión); `GET /:id` público; `POST /`, `PATCH /:id`, `DELETE /:id` (baja lógica), `PATCH /:id/reactivate` — gestión |
+| `schedulesRouter` | `/api/schedules` | `GET /?place_id=` y `GET /:id` público; `POST /`, `PATCH /:id`, `DELETE /:id` — gestión |
+| `feesRouter` | `/api/fees` | `GET /?category=` y `GET /:id` público; `POST /` gestión. Sin PATCH/DELETE: `Fee` es inmutable |
+| `bookingsRouter` | `/api/bookings` | Todo auth. `GET /?status=&place_id=` (propias; gestión ve todas); `GET /availability?place_id=&date=`; `GET /:id`; `POST /` (gestión puede reservar a nombre de otro socio, fijar precio y estado); `PATCH /:id`; `DELETE /:id` (cancela, no borra) |
+| `disciplinesRouter` | `/api/disciplines` | `GET /` y `GET /:id` público; `POST /`, `PATCH /:id`, `DELETE /:id` (baja lógica + desinscribe a todos los socios), `PATCH /:id/reactivate` — gestión. Sub-recurso horarios: `GET /:id/schedules` público; `POST/PATCH/DELETE /:id/schedules(/:sid)` — gestión o el profesor a cargo |
+| `enrollmentsRouter` | `/api/enrollments` | Todo auth. `GET /?discipline_id=` (filtrado por rol: admin todas, profesor las que dicta, socio las propias); `POST /` (a sí mismo, o gestión inscribe a otro); `DELETE /:id` (baja lógica) |
+| `socioRouter` | `/api/socio` | Todo auth (vía `middleware/auth.ts`). `GET /files?id=` (archivo propio); `PATCH /profile-image` (reemplaza la foto de perfil) |
 
 ### Seguridad — regla al agregar endpoints
 
@@ -106,13 +142,34 @@ que opere "sobre mí" saca el `id` del token verificado.
 
 ## Modelo de datos
 
-`Role` (enum `Administrador` / `Profesor` / `Socio`), `User`, `File`, `Family` (vincula menores
-a un tutor responsable).
+- `Role` — enum `RoleType`: `SuperAdmin` / `Administrador` / `Profesor` / `Socio`.
+- `User` — `active` es baja lógica (false = dado de baja).
+- `File` — un archivo subido (imagen), referenciado por `User.file_id` o `Place.file_id`.
+- `Family` — vincula un `User` menor a un `parent_id` (tutor responsable) + `responsible`.
+  El modelo existe en el schema pero **todavía no tiene ningún endpoint** que lo use.
+- `Log` — buffer de auditoría/informativos que escribe `lib/logger.ts` (tabla `logs`).
+- `Place` — espacio del club (cancha, salón); baja lógica con `active`.
+- `Schedule` — turno reservable semanal de un `Place` (día + hora + `Fee`).
+- `Booking` — una reserva de un `Schedule` para una fecha puntual. Enum `BookingStatus`
+  (`Pendiente`/`Confirmada`/`Cancelada`).
+- `Discipline` — disciplina del club (fútbol, vóley…) con profesor/cuota/espacio opcionales;
+  baja lógica con `active`.
+- `DisciplineSchedule` — horario semanal fijo de una `Discipline` (no se reserva, se dicta).
+- `Enrollment` — inscripción de un socio a una `Discipline`, con historial de períodos.
+- `Fee` — tarifa **inmutable** (sin endpoint de update: cambiar precio = fila nueva).
+  Enum `FeeCategory`: `Reserva` / `CuotaSocio` / `Disciplina` / `Donacion` / `Otro`. La
+  categoría `Reserva` sólo la crea `findOrCreateFeeForPlace()`, nunca el admin a mano.
 
-**IDs: `User`, `File` y `Family` usan UUID (`String @id @default(uuid())`).** Solo `Role.id` es
-`Int` autoincremental. Migrado desde int en el commit `4db61f3`.
+**IDs**: `User`, `File`, `Family` y `Booking` usan UUID (`String @id @default(uuid())`).
+El resto (`Role`, `Log`, `Fee`, `Place`, `Discipline`, `DisciplineSchedule`, `Enrollment`,
+`Schedule`) usa `Int` autoincremental.
 
-Falta todo el modelo de cuotas, pagos, espacios, reservas, locales adheridos y publicaciones.
+**Truco `active` nullable para uniques parciales** (`ponytail:` en el schema): tanto `Booking`
+como `Enrollment` tienen `active Boolean?` dentro de un `@@unique(...)` — `true` mientras la
+fila está viva, `null` cuando se cancela/da de baja. MySQL no soporta índices únicos parciales,
+pero sí ignora `NULL` en un unique, así que dar de baja libera el turno/la inscripción sin
+borrar la fila (se conserva el historial). El código que da de baja es siempre el único que
+toca ese campo, en el mismo `update` que cambia el estado, para que nunca quede desincronizado.
 
 ---
 
@@ -166,8 +223,9 @@ bun dev                 # :3001, hot reload
 | `bun run db:studio` | UI de Prisma |
 | `bun run db:generate` | Regenera el cliente |
 | `bun run db:push` | Aplica el schema sin migración |
-| `bun run db:seed` | Siembra roles |
+| `bun run db:seed` | Siembra datos de prueba (roles, usuarios, espacios, turnos…) |
 | `docker compose up -d db` | Solo la base |
+| `bun test` | Corre los tests (`bun:test`) |
 
 En prod, `entrypoint.sh` corre `migrate deploy` + seed antes de arrancar.
 
@@ -186,18 +244,35 @@ En prod, `entrypoint.sh` corre `migrate deploy` + seed antes de arrancar.
    no solo la ruta del archivo — si no, Prisma intenta ejecutarlo como binario y tira `EACCES`.
 4. Al agregar deps o tocar `validation.ts`, recordá que hay **dos repos**.
 5. `JWT_SECRET=secret` en el `.env` de dev — cambiar antes de cualquier deploy.
+6. **El cliente Prisma generado se desincroniza del schema al cambiar de branch.** Da errores
+   de `tsc` que parecen bugs de código pero no lo son: campos que **sí** están en
+   `schema.prisma` y el cliente no conoce (`Fee.category`), o campos que el cliente exige y no
+   existen en el schema (un `Family.child_id` fantasma). **El fix es `bun run db:generate`, no
+   editar código.** Ante un error de tipos raro de Prisma, regenerá primero.
 
 ---
 
 ## Estado actual
 
-Construido: **solo auth**. Falta todo lo grande de la propuesta: tarjeta digital de socio con
-foto, gestión de socios y menores, cuotas de socio + de disciplina, pagos (Mercado Pago /
-comprobante de transferencia), reservas de canchas y salón, publicaciones institucionales,
-locales adheridos con beneficios, reportes de ingresos.
+**Construido**: auth completo (JWT + Google), gestión de usuarios y roles, archivos/fotos de
+perfil, espacios (`Place`) con ocupación, turnos reservables (`Schedule`) con validación de
+solapamiento, reservas (`Booking`) con cancelación y topes de anticipación, tarifas (`Fee`)
+categorizadas, disciplinas con sus horarios de clase, e inscripciones socio↔disciplina.
+
+**Falta** (ni siquiera hay modelo en el schema): pagos (Mercado Pago / comprobante de
+transferencia), cuotas de socio como obligación mensual con vencimiento, publicaciones
+institucionales, locales adheridos con beneficios, y reportes de ingresos.
+
+`Family` sí tiene modelo, pero **ningún endpoint lo usa todavía** — el vínculo menor↔tutor está
+en la base y nada más.
 
 ## Deuda conocida
 
 - El registro normal (dni+password) **no verifica el email**. Alguien podría registrar un email
-  ajeno antes de que el dueño entre por Google.
-- `email` no tiene constraint `@unique` en el schema; el register solo chequea DNI duplicado.
+  ajeno antes de que el dueño entre por Google. (`email` sí tiene `@unique` en el schema, así
+  que el duplicado explota — pero el registro nunca prueba que el mail sea tuyo.)
+- `src/lib/auth.ts` y `src/middleware/auth.ts` son dos implementaciones duplicadas del mismo
+  JWT. `socio.ts` usa la del medio, todo el resto usa la de `lib/`. Unificar.
+- El no-solapamiento de `Schedule` vive en la aplicación, no en la base: MySQL 8 no tiene
+  exclusion constraints (eso es Postgres). Si algún día se escribe en la tabla por fuera de
+  `POST/PATCH /api/schedules`, nada impide turnos pisados.
