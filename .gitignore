@@ -13,3 +13,6 @@ scripts/seed-demo-users.ts
 
 # tooling local (skill registry) — no va al repo
 .atl/
+
+# archivos subidos (fotos de perfil, espacios): default de Storage sin FILES_STORAGE_PATH
+uploads/

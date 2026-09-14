@@ -10,6 +10,9 @@ COPY --from=install /usr/src/app/node_modules node_modules
 COPY . .
 RUN bunx --bun prisma generate
 RUN chmod +x ./entrypoint.sh
+# Storage guarda en uploads/ y el server corre como `bun`, que no puede crear
+# carpetas acá. Para que las fotos sobrevivan un redeploy, montale un volumen.
+RUN mkdir -p uploads && chown bun:bun uploads
 
 ENV NODE_ENV=production
 USER bun

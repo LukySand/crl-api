@@ -373,6 +373,18 @@ export namespace Storage {
       return null;
     }
 
+    // La fila puede existir sin el archivo en disco (lo borraron, o es de las que
+    // siembra el seed). Hay que chequearlo antes: createReadStream no falla acá
+    // sino después, con los headers ya mandados, y el request queda colgado.
+    const existe = await fs.access(file.location).then(
+      () => true,
+      () => false,
+    );
+    if (!existe) {
+      console.warn("[Storage.getFile] Falta el archivo en disco:", file.location);
+      return null;
+    }
+
     try {
       const fileStream = createReadStream(file.location);
       const stream = new ReadableStream({
@@ -422,13 +434,17 @@ export namespace Storage {
     ready = true;
   }
 
+  /**
+   * Sin FILES_STORAGE_PATH, `uploads/` en la raíz del repo (está en .gitignore).
+   * Antes el default era la carpeta temporal del sistema, que macOS limpia sola:
+   * las fotos desaparecían y en la base quedaban filas apuntando a la nada.
+   * `:temp:` sigue disponible a propósito, para quien quiera archivos descartables.
+   */
   function getRootFolder(): string {
-    let p = process.env.FILES_STORAGE_PATH;
-    if (!p || p.trim() === "" || p === ":temp:") {
-      p = path.join(os.tmpdir(), "crltemp");
-    }
-
-    return p;
+    const p = process.env.FILES_STORAGE_PATH?.trim();
+    if (p === ":temp:") return path.join(os.tmpdir(), "crltemp");
+    if (p) return p;
+    return path.join(import.meta.dir, "..", "..", "uploads");
   }
 
   function getMaxFileSize(): number {
