@@ -3,7 +3,6 @@ import prisma from "./prisma";
 import * as ft from "file-type";
 import { createReadStream, createWriteStream } from "node:fs";
 import * as fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { finished } from "node:stream/promises";
@@ -438,12 +437,14 @@ export namespace Storage {
    * Sin FILES_STORAGE_PATH, `uploads/` en la raíz del repo (está en .gitignore).
    * Antes el default era la carpeta temporal del sistema, que macOS limpia sola:
    * las fotos desaparecían y en la base quedaban filas apuntando a la nada.
-   * `:temp:` sigue disponible a propósito, para quien quiera archivos descartables.
+   *
+   * `:temp:` también cae en `uploads/` a propósito: el `.env.example` viejo lo
+   * traía como valor, así que está copiado en los `.env` de todos y, si siguiera
+   * apuntando a la carpeta temporal, el arreglo no le llegaría a nadie.
    */
   function getRootFolder(): string {
     const p = process.env.FILES_STORAGE_PATH?.trim();
-    if (p === ":temp:") return path.join(os.tmpdir(), "crltemp");
-    if (p) return p;
+    if (p && p !== ":temp:") return p;
     return path.join(import.meta.dir, "..", "..", "uploads");
   }
 
