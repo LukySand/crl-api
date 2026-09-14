@@ -4,6 +4,7 @@ import { z } from "zod";
 import prisma from "../lib/prisma";
 import { Storage } from "../lib/storage";
 import { authenticate, type AuthedRequest } from "../middleware/auth";
+import { changePasswordSchema } from "../lib/validation";
 
 const uploadSchema = z.object({
     file: z.instanceof(File, { message: "Missing file" }),
@@ -167,5 +168,48 @@ socioRouter.patch("/profile-image", async (req: AuthedRequest, res: Response) =>
         return res
             .status(500)
             .json({ error: "Error al actualizar la foto de perfil" });
+    }
+});
+
+/**
+ * PATCH /api/socio/password — cambia la contraseña propia (pide la actual).
+ * Pensado sobre todo para un hijo al que el padre le cargó una contraseña
+ * (POST /api/families/:id/credentials) y quiere ponerse una propia.
+ */
+socioRouter.patch("/password", async (req: AuthedRequest, res: Response) => {
+    try {
+        const userId = req.user?.id;
+        if (!userId) {
+            return res.status(401).json({ error: "No autenticado" });
+        }
+
+        const validationResult = changePasswordSchema.safeParse(req.body ?? {});
+        if (!validationResult.success) {
+            return res.status(400).json({
+                error: "Validación fallida",
+                errors: formatValidationErrors(validationResult.error.issues),
+            });
+        }
+        const { current_password, new_password } = validationResult.data;
+
+        const user = await prisma.user.findUnique({ where: { id: userId } });
+        if (!user) {
+            return res.status(404).json({ error: "Usuario no encontrado" });
+        }
+
+        const match = await Bun.password.verify(current_password, user.password);
+        if (!match) {
+            return res.status(401).json({ error: "La contraseña actual es incorrecta" });
+        }
+
+        await prisma.user.update({
+            where: { id: userId },
+            data: { password: await Bun.password.hash(new_password), has_credentials: true },
+        });
+
+        return res.json({ success: true, message: "Contraseña actualizada" });
+    } catch (error) {
+        console.error("Change password error:", error);
+        return res.status(500).json({ error: "Error al cambiar la contraseña" });
     }
 });

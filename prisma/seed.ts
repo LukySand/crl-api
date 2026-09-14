@@ -310,8 +310,8 @@ async function seedUsers(roleIds: Map<string, number>) {
 
 async function seedFamilies() {
   const families = [
-    { id: FAMILY.martin, parent_id: USER.socioMartin, responsible: true },
-    { id: FAMILY.lucia, parent_id: USER.socioLucia, responsible: true },
+    { id: FAMILY.martin, parent_id: USER.socioMartin, child_id: USER.menorTomas, responsible: true },
+    { id: FAMILY.lucia, parent_id: USER.socioLucia, child_id: USER.menorSofia, responsible: true },
   ];
 
   for (const family of families) {

@@ -85,3 +85,46 @@ export const adminCreateUserSchema = registerSchema.extend({
 export const adminUpdateUserSchema = adminCreateUserSchema.extend({
   password: passwordSchema.optional(),
 });
+
+export const childBirthDateSchema = z
+  .string()
+  .min(1, "La fecha de nacimiento es requerida")
+  .refine(
+    (date) => new Date(date) <= new Date(),
+    "La fecha de nacimiento no puede ser futura",
+  )
+  .refine((date) => {
+    const birth = new Date(date);
+    const today = new Date();
+    const age = today.getFullYear() - birth.getFullYear();
+    const m = today.getMonth() - birth.getMonth();
+    const d = today.getDate() - birth.getDate();
+    const years = m < 0 || (m === 0 && d < 0) ? age - 1 : age;
+    return years < 18;
+  }, "El hijo a vincular debe ser menor de 18 años");
+
+export const addChildSchema = z.object({
+  name: nameSchema,
+  last_name: lastNameSchema,
+  dni: dniSchema,
+  birth_date: childBirthDateSchema,
+  file_id: fileIdSchema,
+});
+
+export type AddChildData = z.infer<typeof addChildSchema>;
+
+export const setChildCredentialsSchema = z.object({
+  email: emailSchema,
+  password: passwordSchema,
+});
+
+export type SetChildCredentialsData = z.infer<typeof setChildCredentialsSchema>;
+
+// Cambio de contraseña propio (cualquier usuario logueado, incluido un hijo
+// que ya recibió credenciales reales del padre).
+export const changePasswordSchema = z.object({
+  current_password: z.string().min(1, "La contraseña actual es requerida"),
+  new_password: passwordSchema,
+});
+
+export type ChangePasswordData = z.infer<typeof changePasswordSchema>;
