@@ -11,6 +11,8 @@ import {
   ultimaFechaReservable,
   DIAS_ADELANTE_SOCIO,
   DIAS_ADELANTE_ADMIN,
+  HORAS_ANTES_CANCELAR,
+  dentroDeVentanaCancelacion,
 } from "./booking-date";
 
 test("parsea en UTC, sin correrse por el huso del server", () => {
@@ -74,4 +76,63 @@ test("nowTimeInClub devuelve HH:MM de 24h con cero adelante", () => {
   expect(ahora).toMatch(/^([01]\d|2[0-3]):[0-5]\d$/);
   // Comparar horarios como string sólo funciona con el cero adelante
   expect("08:00" < "16:00").toBe(true);
+});
+
+// --- Ventana de cancelación -------------------------------------------------
+// ponytail: el bicho acá es el mismo de siempre — mezclar el huso del server con
+// el del club. Los casos se escriben en hora del club y se testea el borde
+// exacto de las 10 horas, que es donde un > y un >= dan distinto.
+
+/**
+ * "YYYY-MM-DDTHH:MM" en hora del club → Date.
+ * Argentina no tiene horario de verano desde 2009, así que el offset es -03:00
+ * fijo y se puede escribir a mano sin que el test mienta media parte del año.
+ */
+const enClub = (stamp: string) => new Date(`${stamp}:00-03:00`);
+
+/** Lunes 10/08/2026, turno de 19:00 a 20:00. */
+const LUNES = parseDate("2026-08-10");
+const T19 = new Date("1970-01-01T19:00:00Z");
+
+test("faltando 11 horas todavía se puede cancelar", () => {
+  expect(dentroDeVentanaCancelacion(LUNES, T19, enClub("2026-08-10T08:00"))).toBe(true);
+});
+
+test("faltando exactamente 10 horas todavía se puede cancelar (límite inclusivo)", () => {
+  expect(dentroDeVentanaCancelacion(LUNES, T19, enClub("2026-08-10T09:00"))).toBe(true);
+});
+
+test("faltando 9 horas ya no se puede", () => {
+  expect(dentroDeVentanaCancelacion(LUNES, T19, enClub("2026-08-10T10:00"))).toBe(false);
+});
+
+test("un minuto tarde tampoco: el borde no se redondea", () => {
+  expect(dentroDeVentanaCancelacion(LUNES, T19, enClub("2026-08-10T09:01"))).toBe(false);
+});
+
+test("una reserva pasada no se puede cancelar", () => {
+  const ayer = parseDate("2026-08-09");
+  expect(dentroDeVentanaCancelacion(ayer, T19, enClub("2026-08-10T08:00"))).toBe(false);
+});
+
+test("una reserva ya empezada no se puede cancelar", () => {
+  expect(dentroDeVentanaCancelacion(LUNES, T19, enClub("2026-08-10T19:30"))).toBe(false);
+});
+
+test("el cruce de medianoche se mide contra el día del turno, no contra el de hoy", () => {
+  const martes = parseDate("2026-08-11");
+  const T08 = new Date("1970-01-01T08:00:00Z");
+  // 21:00 del lunes → faltan 11 horas para el turno de las 08:00 del martes
+  expect(dentroDeVentanaCancelacion(martes, T08, enClub("2026-08-10T21:00"))).toBe(true);
+  // 23:00 del lunes → faltan 9
+  expect(dentroDeVentanaCancelacion(martes, T08, enClub("2026-08-10T23:00"))).toBe(false);
+});
+
+test("el server en UTC no adelanta la ventana", () => {
+  // 23:00 UTC del domingo = 20:00 del domingo en el club → faltan 23 horas
+  expect(dentroDeVentanaCancelacion(LUNES, T19, new Date("2026-08-09T23:00:00Z"))).toBe(true);
+});
+
+test("la ventana son 10 horas", () => {
+  expect(HORAS_ANTES_CANCELAR).toBe(10);
 });

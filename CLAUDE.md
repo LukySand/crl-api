@@ -106,13 +106,22 @@ que opere "sobre mí" saca el `id` del token verificado.
 
 ## Modelo de datos
 
-`Role` (enum `Administrador` / `Profesor` / `Socio`), `User`, `File`, `Family` (vincula menores
-a un tutor responsable).
+`Role` (enum `SuperAdmin` / `Administrador` / `Profesor` / `Socio`), `User`, `File`, `Family`
+(vincula menores a un tutor responsable).
 
-**IDs: `User`, `File` y `Family` usan UUID (`String @id @default(uuid())`).** Solo `Role.id` es
-`Int` autoincremental. Migrado desde int en el commit `4db61f3`.
+Reservas: `Place` (espacio), `Schedule` (turno recurrente: `day_of_week` + TIME, sin fecha),
+`Fee` (tarifa, inmutable) y `Booking` (la reserva: `Schedule` + una fecha concreta).
+Disciplinas: `Discipline`, `DisciplineProfessor`, `DisciplineSchedule`, `Enrollment`.
 
-Falta todo el modelo de cuotas, pagos, espacios, reservas, locales adheridos y publicaciones.
+**IDs: `User`, `File`, `Family` y `Booking` usan UUID (`String @id @default(uuid())`).** El
+resto es `Int` autoincremental. Migrado desde int en el commit `4db61f3`.
+
+`Booking.active` es `Boolean?` y forma el unique `(schedule_id, date, active)`. MySQL ignora los
+NULL en un índice único, así que poner `active: null` al cancelar libera el turno **sin borrar
+la fila**: la reserva queda en el historial. Es el truco central del modelo — el código que
+cancela es el único que toca ese campo, siempre en el mismo `update` que pone `status`.
+
+Falta el modelo de cuotas, pagos, locales adheridos y publicaciones.
 
 ---
 
@@ -191,10 +200,34 @@ En prod, `entrypoint.sh` corre `migrate deploy` + seed antes de arrancar.
 
 ## Estado actual
 
-Construido: **solo auth**. Falta todo lo grande de la propuesta: tarjeta digital de socio con
-foto, gestión de socios y menores, cuotas de socio + de disciplina, pagos (Mercado Pago /
-comprobante de transferencia), reservas de canchas y salón, publicaciones institucionales,
-locales adheridos con beneficios, reportes de ingresos.
+Construido: auth (`/api/auth/*`), gestión de usuarios y bajas (`/api/admin/*`), archivos
+(`/api/files`), espacios (`/api/places`), turnos (`/api/schedules`), tarifas (`/api/fees`),
+reservas (`/api/bookings`), disciplinas (`/api/disciplines`) e inscripciones
+(`/api/enrollments`).
+
+Falta: cuotas de socio + de disciplina, pagos (Mercado Pago / comprobante de transferencia),
+publicaciones institucionales, locales adheridos con beneficios, reportes de ingresos.
+
+### Reglas temporales de las reservas
+
+Todas viven en `src/lib/booking-date.ts`, con su test en `booking-date.test.ts`. Nunca las
+metas sueltas en un handler:
+
+| Constante | Qué limita |
+| --- | --- |
+| `DIAS_ADELANTE_SOCIO` = 21 | Cuánto puede reservar hacia adelante un socio |
+| `DIAS_ADELANTE_ADMIN` = 183 | Lo mismo para la gestión (~6 meses, para eventos) |
+| `HORAS_ANTES_CANCELAR` = 10 | Hasta cuándo puede **cancelar** un socio. La gestión no tiene tope |
+
+`dentroDeVentanaCancelacion(date, start_time, ahora?)` resuelve la última: combina la fecha de
+la reserva con la hora del turno y las compara como string `"YYYY-MM-DDTHH:MM"` en huso del
+club, que es el mismo truco de `todayInClub()` / `nowTimeInClub()` (el orden lexicográfico es el
+cronológico). El límite es **inclusivo**: con 10 horas justas todavía se cancela. Una reserva
+pasada cae sola, no hace falta un chequeo aparte.
+
+`HORAS_ANTES_CANCELAR` está **duplicada** en el front (`CRL/src/app/pages/socio/reservas.ts`),
+igual que `validation.ts`: el front esconde el botón, el back rechaza el `DELETE`. Si tocás una,
+tocá la otra.
 
 ## Deuda conocida
 
