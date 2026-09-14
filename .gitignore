@@ -3,10 +3,9 @@ prisma/generated
 dist
 *.log
 
-# env (nunca commitear secretos)
-.env
-.env.local
-.env.*.local
+# env (nunca commitear secretos) — cubre .env, .env.local, backups, etc.
+.env*
+!.env.example
 
 # helper local para poblar datos de demo (tiene passwords de prueba)
 scripts/seed-demo-users.ts
