@@ -10,3 +10,6 @@ dist
 
 # helper local para poblar datos de demo (tiene passwords de prueba)
 scripts/seed-demo-users.ts
+
+# tooling local (skill registry) — no va al repo
+.atl/

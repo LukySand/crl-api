@@ -109,15 +109,32 @@ enum BookingStatus {
   Cancelada
 }
 
+// Para qué es una tarifa. Existe porque `Fee` es una bolsa compartida por
+// Schedule, Booking y Discipline, y hasta ahora la única forma de saber de qué
+// tipo era una tarifa era mirar quién la referenciaba — imposible para las que
+// todavía no tienen modelo propio (cuota de socio, donación).
+//
+// `Reserva` la pone sola findOrCreateFeeForPlace(); el resto las elige el admin
+// en POST /api/fees. Ver el comentario de ese endpoint.
+enum FeeCategory {
+  Reserva
+  CuotaSocio
+  Disciplina
+  Donacion
+  Otro
+}
+
 // ponytail: inmutable — no hay endpoint de update. Cambiar precio = crear una
 // fila nueva y repuntar Schedule.fee_id. Así el historial de Booking (que
 // guarda su propio fee_id) nunca queda pisado por un cambio de precio.
+// La categoría entra en esa inmutabilidad: se fija al crear y no se toca.
 model Fee {
-  id          Int      @id @default(autoincrement())
-  name        String   @db.VarChar(255)
-  amount      Decimal  @db.Decimal(10, 2)
-  description String?  @db.Text
-  created_at  DateTime @default(now())
+  id          Int         @id @default(autoincrement())
+  name        String      @db.VarChar(255)
+  amount      Decimal     @db.Decimal(10, 2)
+  category    FeeCategory @default(Otro)
+  description String?     @db.Text
+  created_at  DateTime    @default(now())
 
   schedules   Schedule[]
   bookings    Booking[]

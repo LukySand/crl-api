@@ -376,7 +376,15 @@ async function seedFees() {
 
   for (const fee of fees) {
     const existing = await prisma.fee.findFirst({ where: { name: fee.name } });
-    const row = existing ?? (await prisma.fee.create({ data: fee }));
+    // Todas las de acá son alquiler de espacio por turno → category Reserva.
+    // Las existentes también se reclasifican: con `db push` la columna entra con
+    // el default 'Otro' y el backfill de la migración no llega a correr.
+    const row = existing
+      ? await prisma.fee.update({
+          where: { id: existing.id },
+          data: { category: "Reserva" },
+        })
+      : await prisma.fee.create({ data: { ...fee, category: "Reserva" } });
     byName.set(fee.name, row.id);
   }
   console.log(`Tarifas listas (${fees.length}).`);
@@ -530,28 +538,46 @@ async function seedSchedules(
   return byKey;
 }
 
-async function seedDisciplines(
-  placeIds: Map<string, number>,
-  feeIds: Map<string, number>,
-) {
-  // [nombre, profesor_id|null, nombre de tarifa|null, nombre de espacio|null]
-  const disciplines: [string, string | null, string | null, string | null][] = [
-    [
-      "Fútbol",
-      USER.profeFutbol,
-      "Cancha de fútbol 5 — 1 hora",
-      "Cancha de fútbol 5",
-    ],
-    ["Vóley", USER.profeVoley, "Cancha de vóley — 1 hora", "Cancha de vóley"],
-    ["Hockey", null, "Cancha de hockey — 1 hora", "Cancha de hockey"],
-    ["Patín", null, "Pista de patín — 1 hora", "Pista de patín"],
-    [
-      "Gimnasia Artística",
-      USER.profeVoley,
-      "Pista de patín — 1 hora",
-      "Pista de patín",
-    ], // NUEVO
-    ["Básquet", null, "Cancha de vóley — 1 hora", "Cancha de vóley"], // NUEVO
+/**
+ * Cuota mensual propia de una disciplina, en $0.
+ *
+ * Arranca en cero a propósito: el precio real lo carga la gestión. Lo que
+ * importa es que la disciplina no cuelgue más del fee del turno del espacio —
+ * alquilar la cancha una hora y la cuota mensual de la actividad son dos plata
+ * distintas, y compartir la fila hacía que tocar una tocara la otra.
+ *
+ * Reusa por nombre + categoría: una tarifa de $0 de otra categoría no sirve acá.
+ */
+async function feeCuotaDisciplina(disciplineName: string): Promise<number> {
+  const name = `${disciplineName} — cuota mensual`;
+  const existing = await prisma.fee.findFirst({
+    where: { name, category: "Disciplina" },
+    select: { id: true },
+  });
+  if (existing) return existing.id;
+
+  const creada = await prisma.fee.create({
+    data: {
+      name,
+      amount: "0.00",
+      category: "Disciplina",
+      description: "Cuota mensual de la disciplina. Cargar el precio desde gestión.",
+    },
+    select: { id: true },
+  });
+  return creada.id;
+}
+
+async function seedDisciplines(placeIds: Map<string, number>) {
+  // [nombre, profesor_id|null, nombre de espacio|null]
+  // La tarifa ya no sale de acá: cada disciplina tiene la suya (ver feeCuotaDisciplina).
+  const disciplines: [string, string | null, string | null][] = [
+    ["Fútbol", USER.profeFutbol, "Cancha de fútbol 5"],
+    ["Vóley", USER.profeVoley, "Cancha de vóley"],
+    ["Hockey", null, "Cancha de hockey"],
+    ["Patín", null, "Pista de patín"],
+    ["Gimnasia Artística", USER.profeVoley, "Pista de patín"], // NUEVO
+    ["Básquet", null, "Cancha de vóley"], // NUEVO
   ];
 
   // Horarios de clase por disciplina: [día (0=domingo), desde, hasta].
@@ -578,11 +604,11 @@ async function seedDisciplines(
 
   const byName = new Map<string, number>();
 
-  for (const [name, professor_id, feeName, placeName] of disciplines) {
+  for (const [name, professor_id, placeName] of disciplines) {
     const data = {
       name,
       professor_id,
-      fee_id: feeName ? (feeIds.get(feeName) ?? null) : null,
+      fee_id: await feeCuotaDisciplina(name),
       place_id: placeName ? (placeIds.get(placeName) ?? null) : null,
     };
     const existing = await prisma.discipline.findFirst({ where: { name } });
@@ -776,7 +802,7 @@ async function main() {
   const schedules = await seedSchedules(placeIds, feeIds);
   await seedBookings(schedules);
 
-  const disciplineIds = await seedDisciplines(placeIds, feeIds);
+  const disciplineIds = await seedDisciplines(placeIds);
   await seedEnrollments(disciplineIds);
 
   console.log(
