@@ -88,7 +88,10 @@ socioRouter.get("/files", async (req: AuthedRequest, res: Response) => {
         res.setHeader("Content-Length", String(result.size));
         res.setHeader("ETag", `"${result.etag}"`);
         res.setHeader("Last-Modified", result.lastModified.toUTCString());
-        res.setHeader("Cache-Control", "private, max-age=300");
+        // no-cache: el browser guarda la foto pero pregunta siempre con el ETag
+        // (304 si no cambió). La URL de la foto de un socio es fija (el id no
+        // cambia al reemplazarla), así que con max-age se veía la vieja un rato.
+        res.setHeader("Cache-Control", "private, no-cache");
 
         Readable.fromWeb(result.stream as never).pipe(res);
     } catch (error) {
@@ -132,7 +135,10 @@ socioRouter.patch("/profile-image", async (req: AuthedRequest, res: Response) =>
             newFileId = await Storage.create({
                 file,
                 kind: "accountImages",
-                name: file.name,
+                // El nombre en disco es el id del socio, no el de la foto: con
+                // `file.name`, dos socios que subían "IMG_0001.jpg" caían en la
+                // misma ruta y el segundo pisaba la foto del primero.
+                name: userId,
                 userId,
             });
         } catch (err) {
@@ -151,7 +157,10 @@ socioRouter.patch("/profile-image", async (req: AuthedRequest, res: Response) =>
             select: { file_id: true },
         });
 
-        if (current.file_id) {
+        // Si la foto nueva cayó en la misma ruta (mismo socio, mismo formato),
+        // Storage.create reemplaza el archivo y devuelve el mismo id: borrar "la
+        // vieja" sería borrar la que se acaba de subir.
+        if (current.file_id && current.file_id !== newFileId) {
             try {
                 await Storage.remove(String(current.file_id));
             } catch (err) {

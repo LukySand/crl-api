@@ -3,7 +3,6 @@ import prisma from "./prisma";
 import * as ft from "file-type";
 import { createReadStream, createWriteStream } from "node:fs";
 import * as fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { finished } from "node:stream/promises";
@@ -391,6 +390,18 @@ export namespace Storage {
       return null;
     }
 
+    // La fila puede existir sin el archivo en disco (lo borraron, o es de las que
+    // siembra el seed). Hay que chequearlo antes: createReadStream no falla acá
+    // sino después, con los headers ya mandados, y el request queda colgado.
+    const existe = await fs.access(file.location).then(
+      () => true,
+      () => false,
+    );
+    if (!existe) {
+      console.warn("[Storage.getFile] Falta el archivo en disco:", file.location);
+      return null;
+    }
+
     try {
       const fileStream = createReadStream(file.location);
       const stream = new ReadableStream({
@@ -440,13 +451,19 @@ export namespace Storage {
     ready = true;
   }
 
+  /**
+   * Sin FILES_STORAGE_PATH, `uploads/` en la raíz del repo (está en .gitignore).
+   * Antes el default era la carpeta temporal del sistema, que macOS limpia sola:
+   * las fotos desaparecían y en la base quedaban filas apuntando a la nada.
+   *
+   * `:temp:` también cae en `uploads/` a propósito: el `.env.example` viejo lo
+   * traía como valor, así que está copiado en los `.env` de todos y, si siguiera
+   * apuntando a la carpeta temporal, el arreglo no le llegaría a nadie.
+   */
   function getRootFolder(): string {
-    let p = process.env.FILES_STORAGE_PATH;
-    if (!p || p.trim() === "" || p === ":temp:") {
-      p = path.join(os.tmpdir(), "crltemp");
-    }
-
-    return p;
+    const p = process.env.FILES_STORAGE_PATH?.trim();
+    if (p && p !== ":temp:") return p;
+    return path.join(import.meta.dir, "..", "..", "uploads");
   }
 
   function getMaxFileSize(): number {

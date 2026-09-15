@@ -3,6 +3,7 @@ import {
   addChildSchema,
   changePasswordSchema,
   childBirthDateSchema,
+  registerSchema,
   setChildCredentialsSchema,
 } from "./validation";
 
@@ -61,6 +62,23 @@ test("addChildSchema acepta file_id opcional", () => {
     file_id: "f0000000-0000-4000-8000-000000000001",
   });
   expect(r.success).toBe(true);
+});
+
+// Si el registro aceptara file_id, cualquiera podría registrarse apuntando a la
+// foto de otro socio y, al cambiar "la suya", borrársela.
+test("registerSchema descarta un file_id aunque lo manden", () => {
+  const r = registerSchema.safeParse({
+    name: "Martín",
+    last_name: "Aguirre",
+    dni: "35112908",
+    email: "martin@ejemplo.com",
+    celular: "+5493764100004",
+    password: "Password123",
+    birth_date: birthDateYearsAgo(30),
+    file_id: "f0000000-0000-4000-8000-000000000001",
+  });
+  expect(r.success).toBe(true);
+  if (r.success) expect("file_id" in r.data).toBe(false);
 });
 
 test("addChildSchema rechaza un hijo de 18 años o más", () => {
