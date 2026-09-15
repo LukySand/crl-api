@@ -14,7 +14,7 @@ import { Readable } from "node:stream";
 import { z } from "zod";
 import prisma from "../lib/prisma";
 import { Storage } from "../lib/storage";
-import { requireAuth, requireAdmin, isAdmin } from "../lib/auth";
+import { requireAuth, requireAdmin, isAdmin, veComoGestion } from "../lib/auth";
 import { refDisciplina, serializePayment, serializePayments } from "../lib/payment";
 import {
   cursoEnPeriodo,
@@ -102,6 +102,7 @@ async function readFormData(req: Request) {
 
 /**
  * GET /api/payments — cuotas y cobros. La gestión ve todos; el resto, los propios.
+ * Con `?propias=true` sólo los propios, también para gestión.
  * Filtros: ?status=Pendiente ?concept=Disciplina ?period=2026-09 ?user_id=... ?from=&to=
  *
  * `from`/`to` filtran por vencimiento, que es lo que le importa a un socio
@@ -111,7 +112,8 @@ async function readFormData(req: Request) {
 paymentsRouter.get("/", async (req: Request, res: Response) => {
   try {
     const { status, concept, period, user_id, from, to } = req.query;
-    const admin = isAdmin(req);
+    // Gestión ve todas salvo que pida `?propias=true` (ver veComoGestion).
+    const admin = veComoGestion(req);
 
     if (typeof period === "string" && !esPeriodoValido(period)) {
       return res.status(400).json({ success: false, error: "El período debe ser YYYY-MM" });

@@ -224,14 +224,19 @@ async function seedUsers(roleIds: Map<string, number>) {
   const password = await Bun.password.hash(DEMO_PASSWORD);
   const testProfesorPassword = await Bun.password.hash(TEST_PROFESOR_PASSWORD);
 
-  const admin = roleIds.get(RoleType.Administrador)!;
-  const profesor = roleIds.get(RoleType.Profesor)!;
-  const socio = roleIds.get(RoleType.Socio)!;
+  // Roles de cada usuario, de más a menos acceso: el primero es el principal y va
+  // también en el `role_id` deprecado.
+  const admin = [RoleType.Administrador];
+  const profesor = [RoleType.Profesor];
+  const socio = [RoleType.Socio];
+  // Carolina además es socia: el caso de alguien con dos roles. Diego queda sólo
+  // Profesor, para tener también al profe que no es socio.
+  const profesorYSocio = [RoleType.Profesor, RoleType.Socio];
 
   const users = [
     {
       id: USER.admin,
-      role_id: admin,
+      roles: admin,
       name: "Ana",
       last_name: "Giménez",
       dni: "28450113",
@@ -242,7 +247,7 @@ async function seedUsers(roleIds: Map<string, number>) {
     },
     {
       id: USER.profeFutbol,
-      role_id: profesor,
+      roles: profesor,
       name: "Diego",
       last_name: "Ferreyra",
       dni: "31220874",
@@ -253,7 +258,7 @@ async function seedUsers(roleIds: Map<string, number>) {
     },
     {
       id: USER.profeVoley,
-      role_id: profesor,
+      roles: profesorYSocio,
       name: "Carolina",
       last_name: "Ojeda",
       dni: "33907461",
@@ -264,7 +269,7 @@ async function seedUsers(roleIds: Map<string, number>) {
     },
     {
       id: USER.socioMartin,
-      role_id: socio,
+      roles: socio,
       name: "Martín",
       last_name: "Aguirre",
       dni: "35112908",
@@ -275,7 +280,7 @@ async function seedUsers(roleIds: Map<string, number>) {
     },
     {
       id: USER.socioLucia,
-      role_id: socio,
+      roles: socio,
       name: "Lucía",
       last_name: "Benítez",
       dni: "37845220",
@@ -286,7 +291,7 @@ async function seedUsers(roleIds: Map<string, number>) {
     },
     {
       id: USER.socioRodrigo,
-      role_id: socio,
+      roles: socio,
       name: "Rodrigo",
       last_name: "Cáceres",
       dni: "40233167",
@@ -297,7 +302,7 @@ async function seedUsers(roleIds: Map<string, number>) {
     },
     {
       id: USER.socioValentina,
-      role_id: socio,
+      roles: socio,
       name: "Valentina",
       last_name: "Duarte",
       dni: "42990455",
@@ -308,7 +313,7 @@ async function seedUsers(roleIds: Map<string, number>) {
     },
     {
       id: USER.menorTomas,
-      role_id: socio,
+      roles: socio,
       name: "Tomás",
       last_name: "Aguirre",
       dni: "55880231",
@@ -319,7 +324,7 @@ async function seedUsers(roleIds: Map<string, number>) {
     },
     {
       id: USER.menorSofia,
-      role_id: socio,
+      roles: socio,
       name: "Sofía",
       last_name: "Benítez",
       dni: "56120789",
@@ -333,7 +338,7 @@ async function seedUsers(roleIds: Map<string, number>) {
     // tanto al crear como al actualizar (el spread de `rest` va después).
     {
       id: USER.profeTest,
-      role_id: profesor,
+      roles: profesor,
       name: "Test",
       last_name: "Profesor",
       dni: "11111111",
@@ -346,11 +351,19 @@ async function seedUsers(roleIds: Map<string, number>) {
   ];
 
   for (const user of users) {
-    const { id, ...rest } = user;
+    const { id, roles, ...rest } = user;
+    const ids = roles.map((r) => roleIds.get(r)!);
+    const data = { ...rest, role_id: ids[0]! };
     await prisma.user.upsert({
       where: { id },
-      update: rest,
-      create: { id, password, ...rest },
+      update: data,
+      create: { id, password, ...data },
+    });
+    // Deja exactamente estos roles: saca los que sobran y agrega los que faltan.
+    await prisma.userRole.deleteMany({ where: { user_id: id, role_id: { notIn: ids } } });
+    await prisma.userRole.createMany({
+      data: ids.map((role_id) => ({ user_id: id, role_id })),
+      skipDuplicates: true,
     });
   }
   console.log(`Usuarios listos (${users.length}).`);
@@ -730,6 +743,28 @@ async function backfillProfesores() {
   if (pendientes.length) {
     console.log(`Profesores migrados a la tabla nueva (${pendientes.length}).`);
   }
+}
+
+/**
+ * Migración puntual de los varios roles: a cada usuario que todavía no tiene filas
+ * en `UserRole` le copia su `role_id`. Son los que no carga este seed (los que se
+ * registraron o creó cada uno desde el panel). En prod lo hace la migración SQL;
+ * las bases de dev se armaron con `db push`, que no la corre. Idempotente.
+ *
+ * ponytail: vive acá por lo mismo que `backfillProfesores`. Se borra junto con la
+ * columna `role_id`.
+ */
+async function backfillRoles() {
+  const pendientes = await prisma.user.findMany({
+    where: { roles: { none: {} } },
+    select: { id: true, role_id: true },
+  });
+  if (!pendientes.length) return;
+  await prisma.userRole.createMany({
+    data: pendientes.map((u) => ({ user_id: u.id, role_id: u.role_id })),
+    skipDuplicates: true,
+  });
+  console.log(`Roles migrados a la tabla nueva (${pendientes.length}).`);
 }
 
 /**
@@ -1131,6 +1166,9 @@ async function seedPayments() {
 
 async function main() {
   const roleIds = await seedRoles();
+  // Antes del corte de producción: si una base vieja llega sin la migración
+  // aplicada, los usuarios no se quedan sin roles.
+  await backfillRoles();
 
   const esProduccion = process.env.NODE_ENV === "production";
   if (esProduccion && process.env.SEED_DEMO !== "true") {
@@ -1162,6 +1200,7 @@ async function main() {
   );
   console.log("  Administrador → DNI 28450113 (ana.gimenez@crl.test)");
   console.log("  Profesor      → DNI 31220874 (diego.ferreyra@crl.test)");
+  console.log("  Profe + Socia → DNI 33907461 (carolina.ojeda@crl.test)");
   console.log("  Socio         → DNI 35112908 (martin.aguirre@crl.test)");
   console.log(
     `\nProfe de prueba (contraseña "${TEST_PROFESOR_PASSWORD}"):` +

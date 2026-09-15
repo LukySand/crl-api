@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
-import { requireAuth, isAdmin } from "../lib/auth";
+import { requireAuth, isAdmin, veComoGestion } from "../lib/auth";
 import { findOrCreateFeeForPlace } from "../lib/fee";
 import { refReserva } from "../lib/payment";
 import {
@@ -76,6 +76,7 @@ const updateSchema = z.object({
 
 /**
  * GET /api/bookings — reservas. El Administrador ve todas; el resto, las propias.
+ * Con `?propias=true` sólo las propias, también para gestión.
  * Filtros: ?status=Confirmada  ?place_id=1
  */
 bookingsRouter.get("/", async (req: Request, res: Response) => {
@@ -89,8 +90,9 @@ bookingsRouter.get("/", async (req: Request, res: Response) => {
 
     const bookings = await prisma.booking.findMany({
       where: {
-        // Sale del token, nunca de la query: nadie mira las reservas de otro
-        ...(isAdmin(req) ? {} : { user_id: req.user!.id }),
+        // Sale del token, nunca de la query: nadie mira las reservas de otro.
+        // Gestión ve todas salvo que pida `?propias=true` (ver veComoGestion).
+        ...(veComoGestion(req) ? {} : { user_id: req.user!.id }),
         ...(typeof status === "string" && { status: status as any }),
         ...(placeId !== undefined && { schedule: { place_id: placeId } }),
       },

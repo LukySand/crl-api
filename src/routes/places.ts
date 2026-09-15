@@ -1,7 +1,8 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
-import { requireAuth, requireAdmin, readToken, ADMIN_ROLES } from "../lib/auth";
+import { requireAuth, requireAdmin, readToken } from "../lib/auth";
+import { esGestion } from "../lib/roles";
 import { parseDate, todayInClub } from "../lib/booking-date";
 
 export const placesRouter = Router();
@@ -39,7 +40,7 @@ placesRouter.get("/", async (req: Request, res: Response) => {
     // La ruta es pública, así que no pasa por requireAuth y req.user está vacío:
     // el token se lee a mano para saber si hay una sesión de gestión detrás.
     const sesion = readToken(req);
-    const esAdmin = !!sesion && (ADMIN_ROLES as readonly string[]).includes(sesion.role);
+    const esAdmin = !!sesion && esGestion(sesion.roles);
     const verTodos = req.query.all === "true" && esAdmin;
 
     const places = await prisma.place.findMany({

@@ -1,7 +1,8 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
-import { requireAuth, isAdmin } from "../lib/auth";
+import { requireAuth, isAdmin, hasRole, veComoGestion } from "../lib/auth";
+import { nombresDeRoles, rolesInclude } from "../lib/roles";
 import { periodoDe } from "../lib/payment-period";
 
 export const enrollmentsRouter = Router();
@@ -69,7 +70,11 @@ function validationError(res: Response, error: z.ZodError) {
  *  - Administrador → todas (o las de `?discipline_id=` si viene).
  *  - Profesor      → solo las de las disciplinas que dicta.
  *  - Socio         → solo las propias.
+ *  - `?propias=true` → solo las propias, tenga el rol que tenga.
  * Una sola query cubre las vistas de admin, profesor y socio.
+ *
+ * `propias` existe por los varios roles: una profe que además es socia vería,
+ * sin él, los alumnos de sus clases en vez de sus propias inscripciones.
  */
 enrollmentsRouter.get("/", async (req: Request, res: Response) => {
   try {
@@ -81,9 +86,10 @@ enrollmentsRouter.get("/", async (req: Request, res: Response) => {
 
     // El scope sale del token (rol + id), nunca de la query: nadie ve inscripciones ajenas.
     let scope: Record<string, unknown> = {};
-    if (isAdmin(req)) {
+    const propias = req.query.propias === "true";
+    if (veComoGestion(req)) {
       scope = {};
-    } else if (req.user!.role === "Profesor") {
+    } else if (!propias && hasRole(req, "Profesor")) {
       // Las disciplinas que dicta: ahora puede ser uno de varios profes (#6).
       scope = { discipline: { professors: { some: { professor_id: req.user!.id } } } };
     } else {
@@ -135,12 +141,12 @@ enrollmentsRouter.post("/", async (req: Request, res: Response) => {
     // El inscripto debe existir y ser Socio (los profes/admin no cursan disciplinas).
     const target = await prisma.user.findUnique({
       where: { id: targetId },
-      include: { role: true },
+      include: rolesInclude,
     });
     if (!target) {
       return res.status(404).json({ success: false, error: "El socio no existe" });
     }
-    if (target.role.name !== "Socio") {
+    if (!nombresDeRoles(target).includes("Socio")) {
       return res.status(400).json({ success: false, error: "Solo un socio puede inscribirse a una disciplina" });
     }
 
