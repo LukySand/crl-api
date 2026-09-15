@@ -202,11 +202,11 @@ La fuente de verdad es la tabla `UserRole`. Reglas:
 - **Combinaciones:** cualquiera menos SuperAdmin + Administrador. Mínimo un rol. Nadie se saca a
   sí mismo el rol de gestión. Una cuenta que es o pasa a ser SuperAdmin sólo la toca un
   SuperAdmin. Todo en `lib/roles.ts`, con tests.
-- **Transición (se borra en el PR de limpieza):** `User.role_id` y el `role` del token quedan
-  DEPRECADOS como espejo del rol principal (el de más acceso), para que las ramas que todavía
-  leen uno solo no se rompan. `/api/admin/users` acepta `roles: [...]` o el `role` suelto y
-  devuelve los dos. Los tokens viejos (sin `roles`) se completan en `readToken`. El seed hace
-  backfill a `UserRole` para las bases de dev armadas con `db push`; en prod lo hace la migración.
+- **Un usuario sin roles no existe:** `User.role_id` se borró (migración
+  `20260915200000_drop_user_role_id`, que antes copia a `UserRole` lo que falte). El token lleva
+  sólo `roles`; uno viejo con `role` se trata como vencido y hay que re-loguearse. El alta y la
+  edición de `/api/admin/users` piden `roles: [...]` (el schema está en `routes/admin.ts`, no en
+  `validation.ts`, que está duplicado con el front).
 
 ---
 

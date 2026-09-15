@@ -2,18 +2,12 @@ import { Router, type Request, type Response } from "express";
 import prisma from "../lib/prisma";
 import { z } from "zod";
 import { requireAuth, requireAdmin } from "../lib/auth";
-import {
-  adminCreateUserSchema,
-  adminUpdateUserSchema,
-  roleSchema,
-} from "../lib/validation";
+import { adminCreateUserSchema, adminUpdateUserSchema, roleSchema } from "../lib/validation";
 import {
   denyCambioDeRoles,
   nombresDeRoles,
   ordenarRoles,
   rolesInclude,
-  rolesParaGuardar,
-  rolPrincipal,
   validarRoles,
 } from "../lib/roles";
 import { parseDate, todayInClub } from "../lib/booking-date";
@@ -39,25 +33,9 @@ const userSelect = {
 } as const;
 
 /**
- * Aplana los roles: `roles` es la lista y `role` el principal, que va por
- * compatibilidad con las pantallas que todavía esperan uno solo.
- */
-const flatten = <T extends { role: { name: string }; roles: { role: { name: string } }[] }>(u: T) => {
-  const roles = nombresDeRoles(u);
-  return { ...u, roles, role: rolPrincipal(roles) };
-};
-
-/**
- * Los roles vienen como `roles: [...]`, ordenados y sin repetidos al parsear. El
- * `role` suelto se sigue aceptando (se pasa a `roles`) mientras el front de
- * gestión no mande la lista.
- *
- * Se validan dentro del schema y no después, para que un formulario con varios
- * errores los reciba todos juntos, el de roles incluido.
- *
- * ponytail: se extiende acá y no en `validation.ts` porque ese archivo está
- * duplicado con el front y el front todavía no manda `roles`. Pasa allá (en los
- * dos repos) cuando la pantalla de Usuarios elija varios roles.
+ * Los roles del body: lista, ordenada y sin repetidos al parsear. Se validan
+ * dentro del schema y no después, para que un formulario con varios errores los
+ * reciba todos juntos, el de roles incluido.
  */
 const rolesField = z
   .array(roleSchema, "Elegí al menos un rol")
@@ -67,15 +45,14 @@ const rolesField = z
     if (error) ctx.addIssue({ code: "custom", message: error });
   });
 
-/** `role` suelto → `roles: [role]`, si no vino la lista. */
-const roleSueltoALista = (body: unknown) =>
-  body && typeof body === "object" && !("roles" in body) && "role" in body
-    ? { ...body, roles: [(body as { role: unknown }).role] }
-    : body;
+const createSchema = adminCreateUserSchema.extend({ roles: rolesField });
+const updateSchema = adminUpdateUserSchema.extend({ roles: rolesField });
 
-const conRoles = { role: roleSchema.optional(), roles: rolesField };
-const createSchema = z.preprocess(roleSueltoALista, adminCreateUserSchema.extend(conRoles));
-const updateSchema = z.preprocess(roleSueltoALista, adminUpdateUserSchema.extend(conRoles));
+/** Aplana los roles de la relación a una lista de nombres. */
+const flatten = <T extends { roles: { role: { name: string } }[] }>(u: T) => ({
+  ...u,
+  roles: nombresDeRoles(u),
+});
 
 /** Ids de los roles, en el mismo orden. null si alguno no existe en la tabla. */
 async function idsDeRoles(roles: string[]) {
@@ -123,7 +100,7 @@ adminRouter.post("/users", async (req: Request, res: Response) => {
         errors: zodErrors(parsed.error),
       });
     }
-    const { role: _role, roles, password, celular, birth_date, ...rest } = parsed.data;
+    const { roles, password, celular, birth_date, ...rest } = parsed.data;
 
     if (roles.includes("SuperAdmin") && !req.user!.roles.includes("SuperAdmin")) {
       return res.status(403).json({
@@ -152,7 +129,6 @@ adminRouter.post("/users", async (req: Request, res: Response) => {
         celular: celular ?? null,
         birth_date: new Date(birth_date),
         password: await Bun.password.hash(password),
-        role_id: roleIds[0]!, // espejo del principal (DEPRECADO)
         roles: { create: roleIds.map((role_id) => ({ role_id })) },
       },
       select: userSelect,
@@ -188,7 +164,7 @@ adminRouter.put("/users/:id", async (req: Request, res: Response) => {
         errors: zodErrors(parsed.error),
       });
     }
-    const { role: _role, roles: pedidos, password, celular, birth_date, ...rest } = parsed.data;
+    const { roles, password, celular, birth_date, ...rest } = parsed.data;
 
     const target = await prisma.user.findUnique({
       where: { id },
@@ -198,11 +174,6 @@ adminRouter.put("/users/:id", async (req: Request, res: Response) => {
       return res.status(404).json({ success: false, error: "Usuario no encontrado" });
     }
     const antes = nombresDeRoles(target);
-    const roles = rolesParaGuardar({
-      pedidos,
-      antes,
-      vinoRolSuelto: !("roles" in req.body) && "role" in req.body,
-    });
     const deny = denyCambioDeRoles({
       actorId: req.user!.id,
       actorRoles: req.user!.roles,
@@ -242,7 +213,6 @@ adminRouter.put("/users/:id", async (req: Request, res: Response) => {
         ...rest,
         celular: celular ?? null,
         birth_date: new Date(birth_date),
-        role_id: roleIds[0]!, // espejo del principal (DEPRECADO)
         roles: { deleteMany: {}, create: roleIds.map((role_id) => ({ role_id })) },
         ...(password ? { password: await Bun.password.hash(password) } : {}),
       },
