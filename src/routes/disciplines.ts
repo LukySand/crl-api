@@ -1,12 +1,22 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
-import { requireAuth, requireAdmin } from "../lib/auth";
+import { requireAuth, requireAdmin, isAdmin } from "../lib/auth";
+import { findOrCreateFeeForDiscipline } from "../lib/fee";
 import { TIME, toTime } from "../lib/time";
 import { turnoQuePisa } from "../lib/availability";
 import { timeToHHMM } from "../lib/booking-date";
 
 export const disciplinesRouter = Router();
+
+// Monto de la cuota. El front pinta el error bajo el campo usando la clave
+// `amount`, así que los mensajes tienen que salir por ahí (validationError usa
+// path[0]).
+export const cuotaAmountSchema = z.coerce
+  .number({ error: "El monto debe ser un número" })
+  .int("El monto debe ser un número entero de pesos")
+  .positive("El monto debe ser mayor a cero")
+  .max(99_999_999, "El monto es demasiado grande");
 
 // ponytail: schema acá y no en lib/validation.ts — ese archivo está duplicado con
 // el front y solo sincroniza lo que ambos validan. Acá el front manda y el server valida.
@@ -17,6 +27,12 @@ const disciplineSchema = z.object({
   // sigue aceptando para no romper a los clientes viejos mientras migran.
   professor_ids: z.array(z.string().min(1)).optional(),
   professor_id: z.string().min(1).optional().nullable(),
+  // La cuota se manda como MONTO en pesos, no como id de tarifa: quien carga una
+  // disciplina piensa en "la cuota sale $9.000". La tarifa la resuelve
+  // findOrCreateFeeForDiscipline. Entero porque la cuota se cobra en pesos.
+  amount: cuotaAmountSchema.optional().nullable(),
+  // ponytail: `fee_id` se sigue aceptando para los clientes viejos que todavía
+  // eligen una tarifa existente. Si vienen los dos, gana `amount`.
   fee_id: z.coerce.number().int().positive().optional().nullable(),
   place_id: z.coerce.number().int().positive().optional().nullable(),
 });
@@ -34,6 +50,26 @@ function profesoresPedidos(data: {
 }): string[] | undefined {
   if (data.professor_ids !== undefined) return [...new Set(data.professor_ids)];
   if (data.professor_id !== undefined) return data.professor_id ? [data.professor_id] : [];
+  return undefined;
+}
+
+/**
+ * Resuelve qué `fee_id` tiene que quedar en la disciplina a partir del body.
+ *
+ * `amount` le gana a `fee_id` cuando vienen los dos. Devuelve `undefined` cuando
+ * el request no menciona ninguno de los dos — en un PATCH eso significa "no
+ * toques la cuota" — y `null` para dejarla sin cuota.
+ */
+async function feeIdPedido(
+  data: { amount?: number | null; fee_id?: number | null },
+  disciplineName: string,
+): Promise<number | null | undefined> {
+  if (data.amount !== undefined) {
+    return data.amount === null
+      ? null
+      : findOrCreateFeeForDiscipline(data.amount, disciplineName);
+  }
+  if (data.fee_id !== undefined) return data.fee_id ?? null;
   return undefined;
 }
 
@@ -163,7 +199,7 @@ disciplinesRouter.post(
       const parsed = disciplineSchema.safeParse(req.body ?? {});
       if (!parsed.success) return validationError(res, parsed.error);
 
-      const { name, fee_id, place_id } = parsed.data;
+      const { name, place_id } = parsed.data;
       const profesores = profesoresPedidos(parsed.data) ?? [];
       const profError = await invalidProfessors(profesores);
       if (profError) {
@@ -173,7 +209,7 @@ disciplinesRouter.post(
       const discipline = await prisma.discipline.create({
         data: {
           name,
-          fee_id: fee_id ?? null,
+          fee_id: (await feeIdPedido(parsed.data, name)) ?? null,
           place_id: place_id ?? null,
           professors: { create: profesores.map((professor_id) => ({ professor_id })) },
         },
@@ -205,8 +241,9 @@ disciplinesRouter.patch(
       const parsed = disciplineUpdateSchema.safeParse(req.body ?? {});
       if (!parsed.success) return validationError(res, parsed.error);
 
-      // Los profesores no son una columna: van aparte, en la tabla puente.
-      const { professor_ids: _pi, professor_id: _p, ...campos } = parsed.data;
+      // Ni los profesores ni la cuota son una columna directa: los profesores van
+      // en la tabla puente, y la cuota se resuelve de `amount` a un `fee_id`.
+      const { professor_ids: _pi, professor_id: _p, amount: _a, fee_id: _f, ...campos } = parsed.data;
       const profesores = profesoresPedidos(parsed.data);
 
       const profError = await invalidProfessors(profesores);
@@ -214,10 +251,27 @@ disciplinesRouter.patch(
         return res.status(400).json({ success: false, error: profError, errors: { professor_ids: profError } });
       }
 
+      // La tarifa se nombra con el nombre de la disciplina: el que trae este
+      // PATCH, o el que ya tiene. Se lee sólo cuando hace falta (hay monto y no
+      // viene nombre nuevo), para no agregar una query a todos los updates.
+      let nombreParaCuota = campos.name;
+      if (nombreParaCuota === undefined && typeof parsed.data.amount === "number") {
+        const actual = await prisma.discipline.findUnique({
+          where: { id },
+          select: { name: true },
+        });
+        if (!actual) {
+          return res.status(404).json({ success: false, error: "Disciplina no encontrada" });
+        }
+        nombreParaCuota = actual.name;
+      }
+      const feeId = await feeIdPedido(parsed.data, nombreParaCuota ?? "");
+
       const discipline = await prisma.discipline.update({
         where: { id },
         data: {
           ...campos,
+          ...(feeId !== undefined && { fee_id: feeId }),
           // Reemplazo completo: la lista que llega es la que queda. Si el request
           // no menciona profesores, no se tocan.
           ...(profesores !== undefined && {
@@ -312,7 +366,7 @@ disciplinesRouter.patch(
       if (!disc) {
         return res.status(404).json({ success: false, error: "Disciplina no encontrada" });
       }
-      const esAdmin = req.user!.role === "Administrador";
+      const esAdmin = isAdmin(req);
       // Cualquiera de los profes que la dicta puede marcar el cupo (#6).
       const esProfeAsignado =
         req.user!.role === "Profesor" && disc.professors.some((p) => p.professor_id === req.user!.id);
@@ -383,7 +437,7 @@ async function denyScheduleEdit(
     select: { professors: { select: { professor_id: true } } },
   });
   if (!discipline) return { status: 404, error: "Disciplina no encontrada" };
-  if (req.user?.role === "Administrador") return null;
+  if (isAdmin(req)) return null;
   // Cualquiera de los profes que la dicta (#6), no solo el primero.
   if (
     req.user?.role === "Profesor" &&

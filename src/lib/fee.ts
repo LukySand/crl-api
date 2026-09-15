@@ -57,3 +57,43 @@ export async function findOrCreateFeeForPlace(amount: number, placeId: number): 
   });
   return creada.id;
 }
+
+/**
+ * Espejo de `findOrCreateFeeForPlace`, pero para la **cuota mensual de una
+ * disciplina**: la gestión piensa en "la cuota sale $9.000", no en elegir una
+ * fila de tarifas.
+ *
+ * Acota por nombre + categoría y no sólo por monto, por la misma razón que el de
+ * los espacios: una cuota de vóley de $9.000 no tiene que terminar apuntando a
+ * "Fútbol — cuota mensual", ni a un alquiler de cancha que cueste lo mismo. El
+ * nombre es exactamente el que siembra `feeCuotaDisciplina` en el seed, así que
+ * cargar el precio de una disciplina sembrada reusa esa fila en vez de duplicarla.
+ *
+ * Reasignar la tarifa de una disciplina no toca nada ya emitido: `Fee` es
+ * inmutable y lo emitido guarda su propio `fee_id`, igual que las reservas
+ * respecto del turno.
+ */
+export async function findOrCreateFeeForDiscipline(
+  amount: number,
+  disciplineName: string,
+): Promise<number> {
+  const name = `${disciplineName} — cuota mensual`;
+
+  const existente = await prisma.fee.findFirst({
+    where: { name, amount, category: "Disciplina" },
+    orderBy: { created_at: "desc" },
+    select: { id: true },
+  });
+  if (existente) return existente.id;
+
+  const creada = await prisma.fee.create({
+    data: {
+      name,
+      amount,
+      category: "Disciplina",
+      description: "Cuota mensual de la disciplina, creada al cargar el monto desde gestión.",
+    },
+    select: { id: true },
+  });
+  return creada.id;
+}
