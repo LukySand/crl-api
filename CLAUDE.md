@@ -66,12 +66,21 @@ same-origin. **Al agregar endpoints nuevos no se toca el proxy del front** — s
 
 ```
 src/
-├── server.ts             # Express: json middleware, /api/health, monta authRouter
+├── server.ts             # Express: json middleware, /api/health, monta los routers
 ├── lib/
 │   ├── prisma.ts         # cliente Prisma + adapter MariaDB (singleton en dev)
+│   ├── auth.ts           # JWT: requireAuth / requireAdmin / isAdmin — LA canónica
+│   ├── booking-date.ts   # reglas temporales de reservas
+│   ├── payment-period.ts # períodos y vencimientos de cuotas
+│   ├── payment.ts        # claves `ref` + serialización de Decimal
+│   ├── fee.ts            # findOrCreateFeeForPlace
+│   ├── storage.ts        # archivos en disco (mime permitido por kind)
 │   └── validation.ts     # Zod — DUPLICADO con el frontend (ver abajo)
 └── routes/
-    └── auth.ts           # authRouter (todos los endpoints actuales)
+    ├── auth.ts, admin.ts, socio.ts, families.ts, files.ts
+    ├── places.ts, schedules.ts, fees.ts, bookings.ts
+    ├── disciplines.ts, enrollments.ts
+    └── payments.ts, reports.ts
 
 prisma/
 ├── schema.prisma
@@ -96,6 +105,34 @@ Todos en `src/routes/auth.ts`, montados bajo `/api/auth` (salvo health).
 | GET | `/api/auth/google/config` | Expone el Client ID público al front |
 | POST | `/api/auth/google` | Login/alta con Google (ID token) |
 
+### Cuotas y reportes
+
+| Método | Ruta | Guard | Qué hace |
+| --- | --- | --- | --- |
+| GET | `/api/payments` | sesión | Propias; gestión ve todas. `?status= &concept= &period= &user_id= &from= &to=` |
+| GET | `/api/payments/resumen` | sesión | Totales del socio: pendiente, vencido, próximo vencimiento |
+| POST | `/api/payments/generate` | gestión | Genera las cuotas de un período. **Idempotente** |
+| GET | `/api/payments/:id` | dueño o gestión | Una cuota |
+| POST | `/api/payments/:id/comprobante` | dueño | Sube el comprobante (multipart) → `EnRevision` |
+| PATCH | `/api/payments/:id` | gestión | `{action: confirmar\|rechazar\|anular}` |
+| GET | `/api/reports/ingresos` | gestión | Totales + un corte. `?from= &to= &concept= &group=mes\|concepto\|metodo\|disciplina\|espacio` |
+| GET | `/api/reports/series` | gestión | Serie temporal. `?bucket=dia\|semana\|mes &by=espacio\|disciplina\|concepto\|metodo &from= &to=` |
+| GET | `/api/reports/morosos` | gestión | Quién debe y desde cuándo |
+
+`/ingresos` corta por **una** dimensión; `/series` es la de **dos** (tiempo × algo), que es lo
+que hace falta para "cuánto facturó cada cancha por día". Tres reglas de `/series`:
+
+- **El eje X no tiene huecos.** `rangoBuckets()` emite todos los cajones y los vacíos van en
+  cero. Agrupando sólo los cobros que existen, un día muerto desaparece y las columnas se
+  corren: el gráfico miente sobre su propia forma.
+- **La ventana tiene tope por bucket** (30 días / 12 semanas / 12 meses). Sin tope,
+  `bucket=dia` sobre todo el historial son cientos de columnas.
+- **La semana se etiqueta por su lunes.** Orden lexicográfico = cronológico, el mismo truco que
+  `todayInClub()` y `period`.
+
+`/resumen` y `/generate` van declaradas **antes** de `/:id`, igual que `/availability` en
+`bookings.ts`: Express matchea por orden y si no las tomaría como un id.
+
 ### Seguridad — regla al agregar endpoints
 
 El usuario **siempre** se resuelve desde el JWT, nunca desde un `user_id` del body/query/params.
@@ -110,8 +147,9 @@ que opere "sobre mí" saca el `id` del token verificado.
 (vincula menores a un tutor responsable).
 
 Reservas: `Place` (espacio), `Schedule` (turno recurrente: `day_of_week` + TIME, sin fecha),
-`Fee` (tarifa, inmutable) y `Booking` (la reserva: `Schedule` + una fecha concreta).
+`Fee` (tarifa, inmutable, con `kind`) y `Booking` (la reserva: `Schedule` + una fecha concreta).
 Disciplinas: `Discipline`, `DisciplineProfessor`, `DisciplineSchedule`, `Enrollment`.
+Plata: `Payment` (ver "Cuotas y pagos" abajo).
 
 **IDs: `User`, `File`, `Family` y `Booking` usan UUID (`String @id @default(uuid())`).** El
 resto es `Int` autoincremental. Migrado desde int en el commit `4db61f3`.
@@ -202,11 +240,50 @@ En prod, `entrypoint.sh` corre `migrate deploy` + seed antes de arrancar.
 
 Construido: auth (`/api/auth/*`), gestión de usuarios y bajas (`/api/admin/*`), archivos
 (`/api/files`), espacios (`/api/places`), turnos (`/api/schedules`), tarifas (`/api/fees`),
-reservas (`/api/bookings`), disciplinas (`/api/disciplines`) e inscripciones
-(`/api/enrollments`).
+reservas (`/api/bookings`), disciplinas (`/api/disciplines`), inscripciones
+(`/api/enrollments`), cuotas y cobros (`/api/payments`) y reportes de ingresos
+(`/api/reports`).
 
-Falta: cuotas de socio + de disciplina, pagos (Mercado Pago / comprobante de transferencia),
-publicaciones institucionales, locales adheridos con beneficios, reportes de ingresos.
+Falta: cuota de socio (el enum ya tiene el valor `Socio`, falta decidir dónde vive el monto
+vigente del club), Mercado Pago, publicaciones institucionales, locales adheridos con
+beneficios.
+
+### Cuotas y pagos
+
+`Payment` es el ledger: **una fila = un período adeudado que además registra cómo se saldó**.
+Cubre las reservas de cancha (pago único) y las cuotas de disciplina (mensuales). Antes de
+esto, `BookingStatus.Confirmada` hacía de "pagada" sin registrar quién cobró, cuándo ni cómo.
+
+Reglas que no se rompen:
+
+- **El monto se congela.** `Payment.amount` es una copia, no un join. `fee_id` va igual como
+  snapshot. Sin la copia, repuntar `Discipline.fee_id` repreciaría todo el historial.
+  Mismo criterio que `Booking.fee_id`.
+- **No hay estado "Vencido".** Se deriva de `due_date < hoy` con status `Pendiente`.
+  Guardarlo pediría un job a medianoche.
+- **No hay `next_due_date`.** Es `min(due_date) where status = Pendiente`.
+- **`ref` es único** (`reserva:<id>`, `disciplina:<enrollment>:<YYYY-MM>`,
+  `socio:<user>:<YYYY-MM>`): hace idempotente a `POST /api/payments/generate`, que si no
+  cobraría el mes dos veces cuando alguien lo corre de nuevo.
+- **El pago viaja en la misma transacción que lo que lo origina.** Crear/cancelar una reserva,
+  desinscribirse, dar de baja un socio o una disciplina: todo toca el pago en el mismo
+  `$transaction`, por lo mismo que `status` y `active` de `Booking` nunca se separan.
+- **Lo ya `Pagado` no se anula nunca.** La plata entró de verdad; borrarla falsearía los
+  ingresos del mes. Las devoluciones no existen todavía.
+
+Constantes en `src/lib/payment-period.ts` (nunca sueltas en un handler, igual que
+`booking-date.ts`): `DIA_VENCIMIENTO = 10`. `cursoEnPeriodo()` decide a quién le toca la cuota
+del mes — se cobra el mes completo si cursó aunque sea un día, sin prorrateo. Ahí viven también
+los buckets de los reportes (`lunesDe`, `bucketDe`, `rangoBuckets`, `ventanaPorDefecto`).
+
+⚠️ **"Hoy" siempre con `todayInClub()`, nunca con el reloj UTC** — incluido el seed. Corriendo
+el seed de noche en Argentina (UTC-3) el UTC ya está en el día siguiente, así que los cobros
+quedaban fechados mañana: se caían de la ventana del reporte y volvían a meter ingresos futuros.
+
+`Fee.kind` (`Reserva | Disciplina | Socio`) separa el alquiler por hora de la cuota mensual:
+la cancha de vóley sale $9.000/hora y la disciplina vóley $8.000/mes, y antes las dos podían
+terminar siendo la misma fila. El front tiene que pedir `GET /api/fees?kind=Disciplina` al
+elegir la cuota de una disciplina — el backend además lo valida.
 
 ### Reglas temporales de las reservas
 
