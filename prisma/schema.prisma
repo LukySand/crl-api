@@ -380,3 +380,15 @@ model Payment {
   @@index([concept, due_date])
   @@map("payments")
 }
+
+// Local adherido con beneficio para socios. La API recorta y valida los textos;
+// `active` cambia únicamente mediante baja o reactivación lógica.
+model PartnerStore {
+  id                   Int     @id @default(autoincrement())
+  name                 String  @db.VarChar(100)
+  address              String  @db.VarChar(255)
+  discount_description String  @db.Text
+  active               Boolean @default(true)
+
+  @@map("partner_stores")
+}
