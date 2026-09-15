@@ -161,7 +161,6 @@ authRouter.post("/register", async (req: Request, res: Response) => {
         celular,
         password: hashedPassword,
         birth_date: new Date(birth_date),
-        role_id: socioRole.id,
         roles: { create: { role_id: socioRole.id } },
         // Sin foto: se sube después, ya logueado, desde PATCH /api/socio/profile-image.
       },
@@ -303,7 +302,6 @@ authRouter.post("/google", async (req: Request, res: Response) => {
           email,
           password,
           birth_date: new Date(parsed.data.birth_date),
-          role_id: socioRole.id,
           roles: { create: { role_id: socioRole.id } },
         },
         include: rolesInclude,

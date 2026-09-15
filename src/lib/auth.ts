@@ -2,7 +2,7 @@
 // no dupliquen la lectura/verificación del token. Una sola fuente de verdad.
 import jwt from "jsonwebtoken";
 import type { Request, Response, NextFunction } from "express";
-import { ADMIN_ROLES, esGestion, nombresDeRoles, rolPrincipal, tieneRol } from "./roles";
+import { ADMIN_ROLES, esGestion, nombresDeRoles, tieneRol } from "./roles";
 
 export { ADMIN_ROLES };
 
@@ -15,11 +15,6 @@ export interface JWTPayload {
   email: string;
   /** Todos sus roles, de más a menos acceso. Los permisos se chequean contra esta lista. */
   roles: string[];
-  /**
-   * DEPRECADO: el rol principal (`roles[0]`). Sigue viajando para el código que
-   * todavía lee uno solo; se saca en el PR de limpieza.
-   */
-  role: string;
   name: string;
   last_name: string;
   file_id: string | null;
@@ -41,16 +36,13 @@ export function sessionPayload(user: {
   name: string;
   last_name: string;
   file_id: string | null;
-  role: { name: string };
   roles: { role: { name: string } }[];
 }): JWTPayload {
-  const roles = nombresDeRoles(user);
   return {
     id: user.id,
     dni: user.dni,
     email: user.email,
-    roles,
-    role: rolPrincipal(roles),
+    roles: nombresDeRoles(user),
     name: user.name,
     last_name: user.last_name,
     file_id: user.file_id ?? null,
@@ -96,10 +88,10 @@ export function readToken(req: Request): JWTPayload | null {
   try {
     const payload = jwt.verify(token, JWT_SECRET) as JWTPayload;
     if (typeof payload?.id !== "string" || !payload.id) return null;
-    // Los tokens emitidos antes de los varios roles traen sólo `role` y viven 24h:
-    // se completan acá, en un solo lugar, para que ningún chequeo tenga que
-    // acordarse de ese caso.
-    if (!Array.isArray(payload.roles)) payload.roles = [payload.role];
+    // Un token sin `roles` es de antes de la migración (viven 24h): se trata como
+    // vencido, así el front cierra la sesión y se vuelve a loguear, en vez de
+    // dejar a alguien navegando sin permisos.
+    if (!Array.isArray(payload.roles) || !payload.roles.length) return null;
     return payload;
   } catch {
     return null;

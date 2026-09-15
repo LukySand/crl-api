@@ -224,8 +224,7 @@ async function seedUsers(roleIds: Map<string, number>) {
   const password = await Bun.password.hash(DEMO_PASSWORD);
   const testProfesorPassword = await Bun.password.hash(TEST_PROFESOR_PASSWORD);
 
-  // Roles de cada usuario, de más a menos acceso: el primero es el principal y va
-  // también en el `role_id` deprecado.
+  // Roles de cada usuario, de más a menos acceso.
   const admin = [RoleType.Administrador];
   const profesor = [RoleType.Profesor];
   const socio = [RoleType.Socio];
@@ -351,9 +350,8 @@ async function seedUsers(roleIds: Map<string, number>) {
   ];
 
   for (const user of users) {
-    const { id, roles, ...rest } = user;
+    const { id, roles, ...data } = user;
     const ids = roles.map((r) => roleIds.get(r)!);
-    const data = { ...rest, role_id: ids[0]! };
     await prisma.user.upsert({
       where: { id },
       update: data,
@@ -743,28 +741,6 @@ async function backfillProfesores() {
   if (pendientes.length) {
     console.log(`Profesores migrados a la tabla nueva (${pendientes.length}).`);
   }
-}
-
-/**
- * Migración puntual de los varios roles: a cada usuario que todavía no tiene filas
- * en `UserRole` le copia su `role_id`. Son los que no carga este seed (los que se
- * registraron o creó cada uno desde el panel). En prod lo hace la migración SQL;
- * las bases de dev se armaron con `db push`, que no la corre. Idempotente.
- *
- * ponytail: vive acá por lo mismo que `backfillProfesores`. Se borra junto con la
- * columna `role_id`.
- */
-async function backfillRoles() {
-  const pendientes = await prisma.user.findMany({
-    where: { roles: { none: {} } },
-    select: { id: true, role_id: true },
-  });
-  if (!pendientes.length) return;
-  await prisma.userRole.createMany({
-    data: pendientes.map((u) => ({ user_id: u.id, role_id: u.role_id })),
-    skipDuplicates: true,
-  });
-  console.log(`Roles migrados a la tabla nueva (${pendientes.length}).`);
 }
 
 /**
@@ -1166,9 +1142,15 @@ async function seedPayments() {
 
 async function main() {
   const roleIds = await seedRoles();
-  // Antes del corte de producción: si una base vieja llega sin la migración
-  // aplicada, los usuarios no se quedan sin roles.
-  await backfillRoles();
+
+  // Aviso, no arreglo: `role_id` ya no existe, así que un usuario sin roles sólo
+  // se resuelve asignándoselos desde el panel.
+  const sinRoles = await prisma.user.count({ where: { roles: { none: {} } } });
+  if (sinRoles) {
+    console.warn(
+      `⚠️  ${sinRoles} usuario(s) sin roles: asignáselos desde Gestión de usuarios.`,
+    );
+  }
 
   const esProduccion = process.env.NODE_ENV === "production";
   if (esProduccion && process.env.SEED_DEMO !== "true") {
