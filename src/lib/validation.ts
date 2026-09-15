@@ -48,8 +48,11 @@ export const birthDateSchema = z
     return (m < 0 || (m === 0 && d < 0) ? age - 1 : age) >= 13;
   }, "Debes tener al menos 13 años para registrarte");
 
-// file_id opcional en el registro: el UUID de una imagen ya subida (o nada).
-// File.id es un UUID (String), no un número — nada de regex de dígitos ni Number().
+// file_id opcional: el UUID de una imagen ya subida (o nada). File.id es un
+// UUID (String), no un número — nada de regex de dígitos ni Number(). Solo lo usa
+// `addChildSchema` (foto del hijo). El registro NO lleva foto: subir exige sesión
+// y la cuenta todavía no existe, y aceptar un file_id ahí dejaba que alguien se
+// registrara apuntando a la foto de otro socio (y la borrara al cambiar "la suya").
 const fileIdSchema = z.string().min(1).optional().nullable();
 
 // ── Schemas compuestos ──────────────────────────────────────────────────
@@ -61,7 +64,6 @@ export const registerSchema = z.object({
   celular: celularSchema,
   password: passwordSchema,
   birth_date: birthDateSchema,
-  file_id: fileIdSchema,
 });
 
 export type RegisterData = z.infer<typeof registerSchema>;
@@ -85,3 +87,46 @@ export const adminCreateUserSchema = registerSchema.extend({
 export const adminUpdateUserSchema = adminCreateUserSchema.extend({
   password: passwordSchema.optional(),
 });
+
+export const childBirthDateSchema = z
+  .string()
+  .min(1, "La fecha de nacimiento es requerida")
+  .refine(
+    (date) => new Date(date) <= new Date(),
+    "La fecha de nacimiento no puede ser futura",
+  )
+  .refine((date) => {
+    const birth = new Date(date);
+    const today = new Date();
+    const age = today.getFullYear() - birth.getFullYear();
+    const m = today.getMonth() - birth.getMonth();
+    const d = today.getDate() - birth.getDate();
+    const years = m < 0 || (m === 0 && d < 0) ? age - 1 : age;
+    return years < 18;
+  }, "El hijo a vincular debe ser menor de 18 años");
+
+export const addChildSchema = z.object({
+  name: nameSchema,
+  last_name: lastNameSchema,
+  dni: dniSchema,
+  birth_date: childBirthDateSchema,
+  file_id: fileIdSchema,
+});
+
+export type AddChildData = z.infer<typeof addChildSchema>;
+
+export const setChildCredentialsSchema = z.object({
+  email: emailSchema,
+  password: passwordSchema,
+});
+
+export type SetChildCredentialsData = z.infer<typeof setChildCredentialsSchema>;
+
+// Cambio de contraseña propio (cualquier usuario logueado, incluido un hijo
+// que ya recibió credenciales reales del padre).
+export const changePasswordSchema = z.object({
+  current_password: z.string().min(1, "La contraseña actual es requerida"),
+  new_password: passwordSchema,
+});
+
+export type ChangePasswordData = z.infer<typeof changePasswordSchema>;

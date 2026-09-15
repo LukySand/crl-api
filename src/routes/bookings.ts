@@ -12,7 +12,10 @@ import {
   ultimaFechaReservable,
   DIAS_ADELANTE_SOCIO,
   DIAS_ADELANTE_ADMIN,
+  HORAS_ANTES_CANCELAR,
+  dentroDeVentanaCancelacion,
 } from "../lib/booking-date";
+import { buildAvailability, claseQuePisa } from "../lib/availability";
 
 export const bookingsRouter = Router();
 
@@ -99,8 +102,13 @@ bookingsRouter.get("/", async (req: Request, res: Response) => {
 
 /**
  * GET /api/bookings/availability?place_id=1&date=2026-08-17 — qué turnos están
- * tomados ese día. Devuelve sólo ids, sin datos de quién reservó: el socio
- * necesita saber qué está ocupado, no de quién es.
+ * tomados ese día. Sin datos de quién reservó: el socio necesita saber qué está
+ * ocupado, no de quién es.
+ *
+ * Además de reservas, un turno también queda tomado si se pisa con una clase de
+ * disciplina en ese espacio y día (DisciplineSchedule) — ver lib/availability.ts.
+ * `taken` se mantiene por compatibilidad con el front actual (sólo ids); `slots`
+ * es la respuesta nueva con el motivo y, si es una clase, su nombre.
  *
  * Va antes de "/:id" a propósito: Express matchea por orden y si no, tomaría
  * "availability" como un id.
@@ -117,13 +125,44 @@ bookingsRouter.get("/availability", async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: "La fecha debe ser YYYY-MM-DD" });
     }
 
-    const rows = await prisma.booking.findMany({
-      // active: true deja afuera las canceladas (que quedan en null y liberan el turno)
-      where: { date: parseDate(date), active: true, schedule: { place_id: placeId } },
-      select: { schedule_id: true },
-    });
+    const when = parseDate(date);
+    if (Number.isNaN(when.getTime())) {
+      return res.status(400).json({ success: false, error: "Fecha inválida" });
+    }
+    const dayOfWeek = when.getUTCDay();
 
-    return res.json({ success: true, taken: rows.map((r) => r.schedule_id) });
+    const [schedules, bookings, disciplineSchedules] = await Promise.all([
+      prisma.schedule.findMany({
+        // active: true deja afuera los turnos dados de baja
+        where: { place_id: placeId, day_of_week: dayOfWeek, active: true },
+        select: { id: true, start_time: true, end_time: true },
+        orderBy: { start_time: "asc" },
+      }),
+      prisma.booking.findMany({
+        // active: true deja afuera las canceladas (que quedan en null y liberan el turno)
+        where: { date: when, active: true, schedule: { place_id: placeId } },
+        select: { schedule_id: true },
+      }),
+      prisma.disciplineSchedule.findMany({
+        where: {
+          day_of_week: dayOfWeek,
+          discipline: { place_id: placeId, active: true },
+        },
+        select: {
+          start_time: true,
+          end_time: true,
+          discipline: { select: { name: true } },
+        },
+      }),
+    ]);
+
+    const slots = buildAvailability(schedules, bookings, disciplineSchedules);
+
+    return res.json({
+      success: true,
+      taken: slots.filter((s) => s.ocupado).map((s) => s.id),
+      slots,
+    });
   } catch (error) {
     console.error("Availability error:", error);
     return res.status(500).json({ success: false, error: "Error al consultar disponibilidad" });
@@ -235,12 +274,20 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
       });
     }
 
-    const schedule = await prisma.schedule.findUnique({
+    // findFirst y no findUnique: hay que filtrar por active, que no es único.
+    const schedule = await prisma.schedule.findFirst({
       where: { id: schedule_id },
       include: { place: { select: { active: true } } },
     });
     if (!schedule) {
       return res.status(404).json({ success: false, error: "El horario no existe" });
+    }
+    // Un turno dado de baja sigue existiendo (conserva su historial de reservas)
+    // pero ya no se reserva. Por eso 409 y no 404: la fila está, el turno no.
+    if (schedule.active !== true) {
+      return res
+        .status(409)
+        .json({ success: false, error: "El horario ya no está disponible" });
     }
     // Un espacio dado de baja no se puede reservar (las reservas viejas siguen ahí)
     if (!schedule.place.active) {
@@ -255,6 +302,24 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
       return res
         .status(400)
         .json({ success: false, error: "Ese horario ya pasó" });
+    }
+
+    // Un turno que se pisa con una clase de disciplina no se reserva: el espacio
+    // está ocupado dictándola. Va acá y no sólo en GET /availability: el front
+    // esconde el turno, pero un POST directo lo reservaría igual.
+    const clases = await prisma.disciplineSchedule.findMany({
+      where: {
+        day_of_week: schedule.day_of_week,
+        discipline: { place_id: schedule.place_id, active: true },
+      },
+      select: { start_time: true, end_time: true, discipline: { select: { name: true } } },
+    });
+    const clase = claseQuePisa(schedule.start_time, schedule.end_time, clases);
+    if (clase) {
+      return res.status(409).json({
+        success: false,
+        error: `Ese horario está ocupado por la clase de ${clase.discipline.name}`,
+      });
     }
 
     // El schema no puede validar esto: la fecha tiene que caer en el día de semana del turno
@@ -395,15 +460,36 @@ bookingsRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response)
  * DELETE /api/bookings/:id — cancela (no borra). status = Cancelada y active = null
  * en el mismo update: el NULL saca la fila de la unique constraint y libera el turno,
  * pero la reserva queda para el historial.
+ *
+ * El socio tiene ventana: hasta HORAS_ANTES_CANCELAR antes de que arranque el turno.
+ * La gestión no.
  */
 bookingsRouter.delete("/:id", async (req: Request<{ id: string }>, res: Response) => {
   try {
-    const existing = await prisma.booking.findUnique({ where: { id: req.params.id } });
+    // Trae el turno porque la ventana de cancelación necesita la hora de inicio:
+    // la reserva sola sólo sabe el día.
+    const existing = await prisma.booking.findUnique({
+      where: { id: req.params.id },
+      include: { schedule: true },
+    });
     if (!existing) {
       return res.status(404).json({ success: false, error: "Reserva no encontrada" });
     }
     if (!isAdmin(req) && existing.user_id !== req.user!.id) {
       return res.status(403).json({ success: false, error: "No tenés permisos para esta acción" });
+    }
+
+    // La gestión cancela siempre; el socio, hasta HORAS_ANTES_CANCELAR antes del
+    // turno. Va en el backend y no sólo en el front: escondiendo el botón, un
+    // DELETE a mano seguiría liberando la cancha cinco minutos antes.
+    if (
+      !isAdmin(req) &&
+      !dentroDeVentanaCancelacion(existing.date, existing.schedule.start_time)
+    ) {
+      return res.status(409).json({
+        success: false,
+        error: `Las reservas se cancelan hasta ${HORAS_ANTES_CANCELAR} horas antes del turno. Comunicate con el club.`,
+      });
     }
 
     // Cancelar dos veces en paralelo (doble tap, dos pestañas) tiene que dejar

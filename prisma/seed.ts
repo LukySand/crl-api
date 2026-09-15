@@ -1,5 +1,9 @@
 import { PrismaClient, RoleType } from "./generated/client";
 import { PrismaMariaDb } from "@prisma/adapter-mariadb";
+// El huso sale de la app y no de una constante local: si el club se muda, se
+// cambia en un solo lugar y el seed sigue generando datos coherentes.
+import { CLUB_TZ, timeToHHMM } from "../src/lib/booking-date";
+import { turnoQuePisa } from "../src/lib/availability";
 
 // ponytail: se conecta por DATABASE_URL (127.0.0.1) y no armando el host a mano.
 // Con DB_HOST=localhost, en Mac Bun resuelve a IPv6 y el adapter se cuelga 10s.
@@ -54,6 +58,8 @@ const BOOKING = {
   pendienteVoley: "c0000000-0000-4000-8000-000000000004",
   cancelada: "c0000000-0000-4000-8000-000000000005",
   pasada: "c0000000-0000-4000-8000-000000000006",
+  pasadaMartin: "c0000000-0000-4000-8000-000000000007",
+  ventanaCerrada: "c0000000-0000-4000-8000-000000000008",
 } as const;
 
 const DIRECCION = "Av. Libertador 1234, Posadas, Misiones";
@@ -310,8 +316,8 @@ async function seedUsers(roleIds: Map<string, number>) {
 
 async function seedFamilies() {
   const families = [
-    { id: FAMILY.martin, parent_id: USER.socioMartin, responsible: true },
-    { id: FAMILY.lucia, parent_id: USER.socioLucia, responsible: true },
+    { id: FAMILY.martin, parent_id: USER.socioMartin, child_id: USER.menorTomas, responsible: true },
+    { id: FAMILY.lucia, parent_id: USER.socioLucia, child_id: USER.menorSofia, responsible: true },
   ];
 
   for (const family of families) {
@@ -515,12 +521,17 @@ async function seedSchedules(
     const fee_id = feeIds.get(feeName)!;
     const start_time = toTime(from);
 
+    // active: true en el where y en el create. El seed sólo siembra turnos
+    // vivos, así que el unique compuesto se consulta siempre con una clave
+    // no-NULL — un turno dado de baja no lo pisa, y volver a sembrar crea uno
+    // nuevo en su lugar, que es lo que corresponde.
     const row = await prisma.schedule.upsert({
       where: {
-        place_id_day_of_week_start_time: {
+        place_id_day_of_week_start_time_active: {
           place_id,
           day_of_week: day,
           start_time,
+          active: true,
         },
       },
       update: { fee_id, end_time: toTime(to) },
@@ -530,6 +541,7 @@ async function seedSchedules(
         day_of_week: day,
         start_time,
         end_time: toTime(to),
+        active: true,
       },
     });
     byKey.set(`${placeName}|${day}|${from}`, row);
@@ -568,46 +580,105 @@ async function feeCuotaDisciplina(disciplineName: string): Promise<number> {
   return creada.id;
 }
 
+/**
+ * Corta el seed ANTES de escribir si alguna clase se pisa con un turno
+ * reservable vivo del mismo espacio y día.
+ *
+ * Existe porque el seed escribe con prisma.disciplineSchedule.upsert, o sea
+ * salteándose la validación HTTP: sin este chequeo no falla, simplemente
+ * siembra en silencio el estado que la API rechaza con 409. Cuando se escribió
+ * esto había 13 choques sembrados así.
+ *
+ * Reusa turnoQuePisa de lib/availability — la MISMA función que usan los
+ * endpoints. Una segunda implementación del solapamiento acá sería exactamente
+ * la forma de que el seed y la API vuelvan a discrepar.
+ */
+async function verificarClasesSinTurnos(
+  disciplines: readonly (readonly [string, string[], string | null])[],
+  classSchedules: Record<string, [number, string, string][]>,
+  placeIds: Map<string, number>,
+) {
+  const choques: string[] = [];
+
+  for (const [name, , placeName] of disciplines) {
+    if (!placeName) continue; // sin espacio asignado no ocupa nada
+    const place_id = placeIds.get(placeName);
+    if (place_id === undefined) continue;
+
+    for (const [day, from, to] of classSchedules[name] ?? []) {
+      const turnos = await prisma.schedule.findMany({
+        where: { place_id, day_of_week: day, active: true },
+        select: { id: true, start_time: true, end_time: true },
+      });
+      const turno = turnoQuePisa(toTime(from), toTime(to), turnos);
+      if (turno) {
+        choques.push(
+          `  ${placeName} · día ${day} · clase de ${name} ${from}-${to} ` +
+            `pisa el turno ${timeToHHMM(turno.start_time)}-${timeToHHMM(turno.end_time)}`,
+        );
+      }
+    }
+  }
+
+  if (choques.length > 0) {
+    throw new Error(
+      `El seed intentó sembrar ${choques.length} clase(s) encima de turnos reservables:\n` +
+        `${choques.join("\n")}\n\n` +
+        `La API rechaza esto con 409. Mové el horario de la clase, o dá de baja el turno.`,
+    );
+  }
+}
+
 async function seedDisciplines(placeIds: Map<string, number>) {
-  // [nombre, profesor_id|null, nombre de espacio|null]
+  // [nombre, profesores (0..n), nombre de espacio|null]
   // La tarifa ya no sale de acá: cada disciplina tiene la suya (ver feeCuotaDisciplina).
-  const disciplines: [string, string | null, string | null][] = [
-    ["Fútbol", USER.profeFutbol, "Cancha de fútbol 5"],
-    ["Vóley", USER.profeVoley, "Cancha de vóley"],
-    ["Hockey", null, "Cancha de hockey"],
-    ["Patín", null, "Pista de patín"],
-    ["Gimnasia Artística", USER.profeVoley, "Pista de patín"], // NUEVO
-    ["Básquet", null, "Cancha de vóley"], // NUEVO
+  // Fútbol va con dos profes a propósito: es el caso de #6 y así queda dato de
+  // ejemplo para probar que un profe ve las disciplinas que comparte con otro.
+  const disciplines: [string, string[], string | null][] = [
+    ["Fútbol", [USER.profeFutbol, USER.profeVoley], "Cancha de fútbol 5"],
+    ["Vóley", [USER.profeVoley], "Cancha de vóley"],
+    ["Hockey", [], "Cancha de hockey"],
+    ["Patín", [], "Pista de patín"],
+    ["Gimnasia Artística", [USER.profeVoley], "Pista de patín"], // NUEVO
+    ["Básquet", [], "Cancha de vóley"], // NUEVO
   ];
 
   // Horarios de clase por disciplina: [día (0=domingo), desde, hasta].
+  // Las clases van en horarios que NO pisan los turnos reservables del mismo
+  // espacio: la API rechaza esa combinación con 409 y el seed no puede crearla
+  // por la puerta de atrás. Se eligieron huecos de la grilla (las canchas se
+  // alquilan de tarde-noche, así que las clases quedan a la siesta).
+  // verificarClasesSinTurnos() más abajo corta el seed si esto se rompe.
   const classSchedules: Record<string, [number, string, string][]> = {
     Fútbol: [
-      [1, "18:00", "19:30"],
-      [3, "18:00", "19:30"],
-    ],
-    Vóley: [
-      [2, "19:00", "20:30"],
-      [4, "19:00", "20:30"],
-    ],
-    Hockey: [[5, "17:30", "19:00"]],
-    Patín: [[6, "10:00", "11:30"]],
-    "Gimnasia Artística": [
       [1, "16:00", "17:30"],
       [3, "16:00", "17:30"],
+    ],
+    Vóley: [
+      [2, "15:30", "17:00"],
+      [4, "15:30", "17:00"],
+    ],
+    Hockey: [[5, "15:30", "17:00"]],
+    Patín: [[6, "10:00", "11:30"]],
+    "Gimnasia Artística": [
+      [1, "14:00", "15:30"],
+      [3, "14:00", "15:30"],
     ], // NUEVO
     Básquet: [
-      [2, "17:30", "19:00"],
-      [4, "17:30", "19:00"],
+      [2, "10:00", "11:30"],
+      [4, "10:00", "11:30"],
     ], // NUEVO
   };
 
+  await verificarClasesSinTurnos(disciplines, classSchedules, placeIds);
+
   const byName = new Map<string, number>();
 
-  for (const [name, professor_id, placeName] of disciplines) {
+  // professor_id (singular) quedó deprecado por #6: no se escribe más, los
+  // profes van a la tabla puente más abajo.
+  for (const [name, professorIds, placeName] of disciplines) {
     const data = {
       name,
-      professor_id,
       fee_id: await feeCuotaDisciplina(name),
       place_id: placeName ? (placeIds.get(placeName) ?? null) : null,
     };
@@ -617,6 +688,18 @@ async function seedDisciplines(placeIds: Map<string, number>) {
       : await prisma.discipline.create({ data });
 
     byName.set(name, discipline.id);
+
+    // #6: los profes viven en la tabla puente. Idempotente por la PK compuesta.
+    // No borra los que alguien haya agregado a mano desde el panel.
+    for (const professor_id of professorIds) {
+      await prisma.disciplineProfessor.upsert({
+        where: {
+          discipline_id_professor_id: { discipline_id: discipline.id, professor_id },
+        },
+        update: {},
+        create: { discipline_id: discipline.id, professor_id },
+      });
+    }
 
     for (const [day, from, to] of classSchedules[name] ?? []) {
       const start_time = toTime(from);
@@ -640,6 +723,30 @@ async function seedDisciplines(placeIds: Map<string, number>) {
   }
   console.log(`Disciplinas listas (${disciplines.length}).`);
   return byName;
+}
+
+/**
+ * Migración puntual de #6: pasa las asignaciones del viejo `professor_id` a la
+ * tabla puente, para las disciplinas que no cargó este seed (las que cada uno
+ * creó a mano desde el panel). Idempotente y sin efecto una vez migradas.
+ *
+ * ponytail: vive acá y no en un script aparte porque el seed ya es el "poné la
+ * base al día" del equipo. Se borra junto con la columna `professor_id`.
+ */
+async function backfillProfesores() {
+  const pendientes = await prisma.discipline.findMany({
+    where: { professor_id: { not: null }, professors: { none: {} } },
+    select: { id: true, professor_id: true },
+  });
+
+  for (const d of pendientes) {
+    await prisma.disciplineProfessor.create({
+      data: { discipline_id: d.id, professor_id: d.professor_id! },
+    });
+  }
+  if (pendientes.length) {
+    console.log(`Profesores migrados a la tabla nueva (${pendientes.length}).`);
+  }
 }
 
 /**
@@ -741,6 +848,18 @@ async function seedBookings(
       "Confirmada",
       "Reserva vieja, queda como historial.",
     ],
+    // Martín es el socio con el que se prueba la app: tiene que ver los tres
+    // casos de cancelación sin cambiar de cuenta. La futura cancelable es
+    // `confirmadaF5` (una semana adelante), la de ventana cerrada la arma
+    // `seedBookingEnVentana`, y esta es la pasada.
+    [
+      BOOKING.pasadaMartin,
+      "Cancha de hockey|5|18:00",
+      USER.socioMartin,
+      -1,
+      "Confirmada",
+      "Ya jugada: queda en el historial y no se puede cancelar.",
+    ],
   ];
 
   let creadas = 0;
@@ -782,6 +901,104 @@ async function seedBookings(
   console.log(`Reservas listas (${creadas}).`);
 }
 
+/** Cuántas horas adelante se pone el turno de prueba de "ya no se puede cancelar". */
+const HORAS_VENTANA_DEMO = 2;
+
+/**
+ * Una reserva que arranca dentro de la ventana de cancelación, para poder probar
+ * que el botón desaparece y que el backend rechaza el DELETE igual.
+ *
+ * No sale de la grilla fija de `CANCHAS` a propósito: el seed corre a cualquier
+ * hora del día, así que ningún turno fijo garantiza caer dentro de las próximas
+ * horas. Se calcula contra el reloj y se hace upsert por la clave natural
+ * (espacio, día, hora): re-sembrar a la misma hora reutiliza la fila en vez de
+ * duplicarla, y las horas posibles son 7×24, no infinitas.
+ *
+ * Va sobre la pista de patín porque es el espacio con la grilla más floja y sin
+ * tarifa nocturna, así que la hora que toque nunca choca con un turno real.
+ */
+async function seedBookingEnVentana(
+  placeIds: Map<string, number>,
+  feeIds: Map<string, number>,
+) {
+  const ESPACIO = "Pista de patín";
+  const TARIFA = "Pista de patín — 1 hora";
+
+  const place_id = placeIds.get(ESPACIO);
+  const fee_id = feeIds.get(TARIFA);
+  if (!place_id || !fee_id) {
+    console.warn(`Falta ${ESPACIO}, se saltea la reserva de ventana cerrada.`);
+    return;
+  }
+
+  // En hora del club, no la del server: corriendo en UTC, a las 22:00 de
+  // Argentina ya sería mañana y el turno caería en el día equivocado.
+  const objetivo = new Date(Date.now() + HORAS_VENTANA_DEMO * 3_600_000);
+  const fecha = objetivo.toLocaleDateString("en-CA", { timeZone: CLUB_TZ });
+  const hhmm = objetivo.toLocaleTimeString("en-GB", {
+    timeZone: CLUB_TZ,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  // Redondear a la hora en punto saca como mucho 59 minutos de las dos horas:
+  // el turno sigue quedando adelante en el tiempo y dentro de la ventana.
+  const desde = `${hhmm.slice(0, 2)}:00`;
+  // horaSiguiente("23:00") daría "24:00", que no es un TIME válido.
+  const hasta = desde === "23:00" ? "23:59" : horaSiguiente(desde);
+
+  const date = utcDate(fecha);
+  const start_time = toTime(desde);
+  const day_of_week = date.getUTCDay();
+
+  const schedule = await prisma.schedule.upsert({
+    where: {
+      place_id_day_of_week_start_time_active: {
+        place_id,
+        day_of_week,
+        start_time,
+        active: true,
+      },
+    },
+    update: { fee_id, end_time: toTime(hasta) },
+    create: {
+      place_id,
+      fee_id,
+      day_of_week,
+      start_time,
+      end_time: toTime(hasta),
+      active: true,
+    },
+  });
+
+  const data = {
+    schedule_id: schedule.id,
+    fee_id: schedule.fee_id,
+    user_id: USER.socioMartin,
+    date,
+    status: "Confirmada" as const,
+    notes: "Arranca en un rato: ya no entra en la ventana de cancelación.",
+    active: true,
+  };
+
+  try {
+    await prisma.booking.upsert({
+      where: { id: BOOKING.ventanaCerrada },
+      update: data,
+      create: { id: BOOKING.ventanaCerrada, ...data },
+    });
+    console.log(`Reserva de ventana cerrada lista (${ESPACIO}, ${fecha} ${desde}).`);
+  } catch (error: any) {
+    if (error?.code === "P2002") {
+      console.warn(
+        `El turno ${ESPACIO} ${fecha} ${desde} ya está reservado, se saltea la reserva de ventana cerrada.`,
+      );
+      return;
+    }
+    throw error;
+  }
+}
+
 async function main() {
   const roleIds = await seedRoles();
 
@@ -801,8 +1018,10 @@ async function main() {
   const placeIds = await seedPlaces();
   const schedules = await seedSchedules(placeIds, feeIds);
   await seedBookings(schedules);
+  await seedBookingEnVentana(placeIds, feeIds);
 
   const disciplineIds = await seedDisciplines(placeIds);
+  await backfillProfesores();
   await seedEnrollments(disciplineIds);
 
   console.log(

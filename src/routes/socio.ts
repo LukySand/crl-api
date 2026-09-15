@@ -4,6 +4,7 @@ import { z } from "zod";
 import prisma from "../lib/prisma";
 import { Storage } from "../lib/storage";
 import { authenticate, type AuthedRequest } from "../middleware/auth";
+import { changePasswordSchema } from "../lib/validation";
 
 const uploadSchema = z.object({
     file: z.instanceof(File, { message: "Missing file" }),
@@ -87,7 +88,10 @@ socioRouter.get("/files", async (req: AuthedRequest, res: Response) => {
         res.setHeader("Content-Length", String(result.size));
         res.setHeader("ETag", `"${result.etag}"`);
         res.setHeader("Last-Modified", result.lastModified.toUTCString());
-        res.setHeader("Cache-Control", "private, max-age=300");
+        // no-cache: el browser guarda la foto pero pregunta siempre con el ETag
+        // (304 si no cambió). La URL de la foto de un socio es fija (el id no
+        // cambia al reemplazarla), así que con max-age se veía la vieja un rato.
+        res.setHeader("Cache-Control", "private, no-cache");
 
         Readable.fromWeb(result.stream as never).pipe(res);
     } catch (error) {
@@ -131,7 +135,10 @@ socioRouter.patch("/profile-image", async (req: AuthedRequest, res: Response) =>
             newFileId = await Storage.create({
                 file,
                 kind: "accountImages",
-                name: file.name,
+                // El nombre en disco es el id del socio, no el de la foto: con
+                // `file.name`, dos socios que subían "IMG_0001.jpg" caían en la
+                // misma ruta y el segundo pisaba la foto del primero.
+                name: userId,
                 userId,
             });
         } catch (err) {
@@ -150,7 +157,10 @@ socioRouter.patch("/profile-image", async (req: AuthedRequest, res: Response) =>
             select: { file_id: true },
         });
 
-        if (current.file_id) {
+        // Si la foto nueva cayó en la misma ruta (mismo socio, mismo formato),
+        // Storage.create reemplaza el archivo y devuelve el mismo id: borrar "la
+        // vieja" sería borrar la que se acaba de subir.
+        if (current.file_id && current.file_id !== newFileId) {
             try {
                 await Storage.remove(String(current.file_id));
             } catch (err) {
@@ -167,5 +177,48 @@ socioRouter.patch("/profile-image", async (req: AuthedRequest, res: Response) =>
         return res
             .status(500)
             .json({ error: "Error al actualizar la foto de perfil" });
+    }
+});
+
+/**
+ * PATCH /api/socio/password — cambia la contraseña propia (pide la actual).
+ * Pensado sobre todo para un hijo al que el padre le cargó una contraseña
+ * (POST /api/families/:id/credentials) y quiere ponerse una propia.
+ */
+socioRouter.patch("/password", async (req: AuthedRequest, res: Response) => {
+    try {
+        const userId = req.user?.id;
+        if (!userId) {
+            return res.status(401).json({ error: "No autenticado" });
+        }
+
+        const validationResult = changePasswordSchema.safeParse(req.body ?? {});
+        if (!validationResult.success) {
+            return res.status(400).json({
+                error: "Validación fallida",
+                errors: formatValidationErrors(validationResult.error.issues),
+            });
+        }
+        const { current_password, new_password } = validationResult.data;
+
+        const user = await prisma.user.findUnique({ where: { id: userId } });
+        if (!user) {
+            return res.status(404).json({ error: "Usuario no encontrado" });
+        }
+
+        const match = await Bun.password.verify(current_password, user.password);
+        if (!match) {
+            return res.status(401).json({ error: "La contraseña actual es incorrecta" });
+        }
+
+        await prisma.user.update({
+            where: { id: userId },
+            data: { password: await Bun.password.hash(new_password), has_credentials: true },
+        });
+
+        return res.json({ success: true, message: "Contraseña actualizada" });
+    } catch (error) {
+        console.error("Change password error:", error);
+        return res.status(500).json({ error: "Error al cambiar la contraseña" });
     }
 });

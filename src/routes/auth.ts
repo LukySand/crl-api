@@ -143,7 +143,7 @@ authRouter.post("/register", async (req: Request, res: Response) => {
         .json({ success: false, error: "Validación fallida", errors });
     }
 
-    const { name, last_name, dni, email, celular, password, birth_date, file_id } =
+    const { name, last_name, dni, email, celular, password, birth_date } =
       validationResult.data;
 
     if (await prisma.user.findFirst({ where: { dni } })) {
@@ -177,7 +177,7 @@ authRouter.post("/register", async (req: Request, res: Response) => {
         password: hashedPassword,
         birth_date: new Date(birth_date),
         role_id: socioRole.id,
-        file_id: file_id ?? null,
+        // Sin foto: se sube después, ya logueado, desde PATCH /api/socio/profile-image.
       },
       include: { role: true },
     });
