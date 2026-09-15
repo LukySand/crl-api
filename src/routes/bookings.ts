@@ -3,6 +3,7 @@ import { z } from "zod";
 import prisma from "../lib/prisma";
 import { requireAuth, isAdmin } from "../lib/auth";
 import { findOrCreateFeeForPlace } from "../lib/fee";
+import { refReserva } from "../lib/payment";
 import {
   parseDate,
   matchesDayOfWeek,
@@ -57,6 +58,9 @@ const createSchema = z.object({
   user_id: z.uuid("user_id inválido").optional(),
   amount: amountSchema.optional(),
   status: z.enum(["Pendiente", "Confirmada"]).optional(),
+  // Cómo cobró la gestión al confirmar en el acto. Sólo se mira si status es
+  // Confirmada; si no viene, se asume efectivo (es el mostrador del club).
+  method: z.enum(["Efectivo", "Transferencia", "MercadoPago"]).optional(),
 });
 
 const updateSchema = z.object({
@@ -65,6 +69,8 @@ const updateSchema = z.object({
   // Precio puntual de esta reserva. No toca Schedule.fee_id: las próximas
   // reservas de ese turno siguen saliendo al precio del turno.
   amount: amountSchema.optional(),
+  // Medio de cobro, sólo se mira al confirmar. Como en el POST.
+  method: z.enum(["Efectivo", "Transferencia", "MercadoPago"]).optional(),
 });
 
 
@@ -200,6 +206,11 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
           .status(403)
           .json({ success: false, error: "No podés fijar el estado de la reserva" });
       }
+      if (parsed.data.method !== undefined) {
+        return res
+          .status(403)
+          .json({ success: false, error: "No podés registrar el cobro de la reserva" });
+      }
     }
 
     let userId = req.user!.id;
@@ -239,7 +250,11 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
 
     const schedule = await prisma.schedule.findUnique({
       where: { id: schedule_id },
-      include: { place: { select: { active: true } } },
+      include: {
+        place: { select: { active: true } },
+        // El monto se congela en el pago, así que hace falta acá y no sólo el fee_id.
+        fee: { select: { amount: true } },
+      },
     });
     if (!schedule) {
       return res.status(404).json({ success: false, error: "El horario no existe" });
@@ -278,18 +293,58 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
         ? await findOrCreateFeeForPlace(parsed.data.amount, schedule.place_id)
         : schedule.fee_id;
 
-    const booking = await prisma.booking.create({
-      data: {
-        schedule_id,
-        fee_id: feeId,
-        user_id: userId,
-        date: when,
-        notes,
-        // La gestión puede darla por paga en el acto (cobró en el club).
-        ...(admin && parsed.data.status ? { status: parsed.data.status } : {}),
-        active: true,
-      },
-      include: bookingInclude,
+    // Monto congelado del cobro. Sale del mismo lado que el fee_id: el override
+    // de la gestión si lo hay, si no el precio del turno.
+    const monto =
+      admin && parsed.data.amount !== undefined
+        ? parsed.data.amount
+        : schedule.fee.amount;
+
+    // La gestión puede darla por paga en el acto (cobró en el club).
+    const cobrada = admin && parsed.data.status === "Confirmada";
+
+    // La reserva y su cobro nacen juntos o no nace ninguno: si el INSERT del
+    // pago fallara aparte, quedaría una cancha ocupada que no le figura a nadie
+    // como deuda. El P2002 del turno duplicado sigue saliendo del create de
+    // abajo y se maneja en el catch igual que antes.
+    const booking = await prisma.$transaction(async (tx) => {
+      const creada = await tx.booking.create({
+        data: {
+          schedule_id,
+          fee_id: feeId,
+          user_id: userId,
+          date: when,
+          notes,
+          ...(admin && parsed.data.status ? { status: parsed.data.status } : {}),
+          active: true,
+        },
+        include: bookingInclude,
+      });
+
+      await tx.payment.create({
+        data: {
+          user_id: userId,
+          concept: "Reserva",
+          booking_id: creada.id,
+          fee_id: feeId,
+          amount: monto,
+          // Sin período: la reserva no es mensual, se paga una sola vez.
+          period: null,
+          // Vence el día del turno: se juega pagando.
+          due_date: when,
+          ref: refReserva(creada.id),
+          ...(cobrada
+            ? {
+                status: "Pagado" as const,
+                paid_at: new Date(),
+                method: parsed.data.method ?? ("Efectivo" as const),
+                registered_by: req.user!.id,
+              }
+            : {}),
+        },
+      });
+
+      return creada;
     });
 
     return res.status(201).json({ success: true, booking });
@@ -358,6 +413,11 @@ bookingsRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response)
         .status(403)
         .json({ success: false, error: "Solo un administrador puede cambiar el precio" });
     }
+    if (parsed.data.method !== undefined && !isAdmin(req)) {
+      return res
+        .status(403)
+        .json({ success: false, error: "Solo un administrador puede registrar el cobro" });
+    }
 
     // No toca Schedule.fee_id: el resto de las reservas de ese turno sigue
     // saliendo al precio del turno, esto sólo repuntea ESTA reserva.
@@ -369,13 +429,42 @@ bookingsRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response)
     // El estado sí puede cambiar entre la lectura y la escritura (otra pestaña
     // cancelando). Va como condición del UPDATE, no como if previo: si alguien
     // canceló en el medio, count sale 0 y no se pisa nada.
-    const { count } = await prisma.booking.updateMany({
-      where: { id: req.params.id, status: { not: "Cancelada" } },
-      data: {
-        ...(notes !== undefined && { notes }),
-        ...(status !== undefined && { status }),
-        ...(feeId !== undefined && { fee_id: feeId }),
-      },
+    const count = await prisma.$transaction(async (tx) => {
+      const { count } = await tx.booking.updateMany({
+        where: { id: req.params.id, status: { not: "Cancelada" } },
+        data: {
+          ...(notes !== undefined && { notes }),
+          ...(status !== undefined && { status }),
+          ...(feeId !== undefined && { fee_id: feeId }),
+        },
+      });
+      if (count === 0) return 0;
+
+      // El cobro acompaña a la reserva en la misma transacción, igual que en la
+      // cancelación: si no, confirmar dejaría la reserva paga y la deuda viva.
+      if (amount !== undefined) {
+        // Repreciar sólo sirve mientras no se cobró: si ya se pagó, el monto que
+        // entró a la caja es el que entró y no se reescribe.
+        await tx.payment.updateMany({
+          where: { booking_id: req.params.id, status: { not: "Pagado" } },
+          data: { amount, fee_id: feeId },
+        });
+      }
+      if (status === "Confirmada") {
+        await tx.payment.updateMany({
+          where: {
+            booking_id: req.params.id,
+            status: { in: ["Pendiente", "EnRevision"] },
+          },
+          data: {
+            status: "Pagado",
+            paid_at: new Date(),
+            method: parsed.data.method ?? "Efectivo",
+            registered_by: req.user!.id,
+          },
+        });
+      }
+      return count;
     });
     if (count === 0) {
       return res.status(409).json({ success: false, error: "La reserva está cancelada" });
@@ -431,9 +520,27 @@ bookingsRouter.delete("/:id", async (req: Request<{ id: string }>, res: Response
 
     // Cancelar dos veces en paralelo (doble tap, dos pestañas) tiene que dejar
     // una sola cancelación: la condición va en el UPDATE y gana el primero.
-    const { count } = await prisma.booking.updateMany({
-      where: { id: req.params.id, status: { not: "Cancelada" } },
-      data: { status: "Cancelada", active: null },
+    const count = await prisma.$transaction(async (tx) => {
+      const { count } = await tx.booking.updateMany({
+        where: { id: req.params.id, status: { not: "Cancelada" } },
+        data: { status: "Cancelada", active: null },
+      });
+      if (count === 0) return 0;
+
+      // El pago se anula en la misma transacción que la cancelación, por lo
+      // mismo que `status` y `active` viajan juntos (ver el comentario del
+      // modelo Booking): si se separan, un fallo entre medio deja una reserva
+      // cancelada con la deuda todavía viva.
+      //
+      // Un pago ya cobrado NO se anula: la plata entró de verdad y borrarla del
+      // ledger falsearía los ingresos del mes. Queda Pagado contra una reserva
+      // cancelada, que es exactamente lo que pasó. La devolución es otro tema y
+      // todavía no existe.
+      await tx.payment.updateMany({
+        where: { booking_id: req.params.id, status: { not: "Pagado" } },
+        data: { status: "Anulado" },
+      });
+      return count;
     });
     if (count === 0) {
       return res.status(409).json({ success: false, error: "La reserva ya estaba cancelada" });

@@ -8,19 +8,42 @@ import { requireAuth, requireAdmin } from "../lib/auth";
 
 export const feesRouter = Router();
 
+const KINDS = ["Reserva", "Disciplina", "Socio"] as const;
+
 const feeSchema = z.object({
   name: z.string().min(1, "El nombre es requerido").max(255),
   amount: z.coerce
     .number()
     .positive("El monto debe ser mayor a cero")
     .max(99_999_999.99, "El monto es demasiado grande"),
+  // Para qué sirve la tarifa. Por defecto Reserva, que es lo que había antes de
+  // que Fee tuviera tipo.
+  kind: z.enum(KINDS).default("Reserva"),
   description: z.string().optional(),
 });
 
-/** GET /api/fees — lista de tarifas (histórico incluido, las viejas siguen existiendo). */
-feesRouter.get("/", async (_req: Request, res: Response) => {
+/**
+ * GET /api/fees — lista de tarifas (histórico incluido, las viejas siguen existiendo).
+ * Filtro: ?kind=Disciplina
+ *
+ * El filtro existe para que el selector de cuota de una disciplina no ofrezca
+ * tarifas de cancha: sin él, la lista trae todo y se puede terminar cobrando
+ * "Cancha de fútbol 5 — $12.000" como cuota mensual de vóley.
+ */
+feesRouter.get("/", async (req: Request, res: Response) => {
   try {
-    const fees = await prisma.fee.findMany({ orderBy: { created_at: "desc" } });
+    const { kind } = req.query;
+    if (typeof kind === "string" && !KINDS.includes(kind as any)) {
+      return res.status(400).json({
+        success: false,
+        error: `kind tiene que ser uno de: ${KINDS.join(", ")}`,
+      });
+    }
+
+    const fees = await prisma.fee.findMany({
+      where: { ...(typeof kind === "string" && { kind: kind as any }) },
+      orderBy: { created_at: "desc" },
+    });
     return res.json({ success: true, fees });
   } catch (error) {
     console.error("List fees error:", error);

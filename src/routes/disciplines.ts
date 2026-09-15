@@ -3,6 +3,7 @@ import { z } from "zod";
 import prisma from "../lib/prisma";
 import { requireAuth, requireAdmin } from "../lib/auth";
 import { TIME, toTime } from "../lib/time";
+import { periodoDe } from "../lib/payment-period";
 
 export const disciplinesRouter = Router();
 
@@ -98,6 +99,31 @@ function validationError(res: Response, error: z.ZodError) {
   return res.status(400).json({ success: false, error: "Validación fallida", errors });
 }
 
+/**
+ * La cuota de una disciplina tiene que ser una tarifa de disciplina.
+ *
+ * Devuelve un mensaje si no sirve, o null si está bien. `undefined`/`null` pasan:
+ * una disciplina puede no tener cuota asignada todavía.
+ *
+ * ponytail: antes esto no se chequeaba y `GET /api/fees` devuelve todas, así que
+ * el selector del admin ofrecía también las tarifas de cancha — se podía dejar a
+ * vóley cobrando "Cancha de fútbol 5 — $12.000" por mes. El front ahora pide
+ * `GET /api/fees?kind=Disciplina`; esto es la otra mitad, la que no depende de
+ * que el cliente se porte bien.
+ */
+async function invalidFee(feeId: number | null | undefined): Promise<string | null> {
+  if (feeId === undefined || feeId === null) return null;
+  const fee = await prisma.fee.findUnique({
+    where: { id: feeId },
+    select: { kind: true },
+  });
+  if (!fee) return "La cuota indicada no existe";
+  if (fee.kind !== "Disciplina") {
+    return "Esa tarifa no es una cuota de disciplina";
+  }
+  return null;
+}
+
 // Los profesores asignados tienen que ser Users con rol Profesor (no Socios/Admins).
 // Devuelve un mensaje de error si alguno no sirve, o null si están todos bien.
 async function invalidProfessors(ids: string[] | undefined): Promise<string | null> {
@@ -167,6 +193,10 @@ disciplinesRouter.post(
       if (profError) {
         return res.status(400).json({ success: false, error: profError, errors: { professor_ids: profError } });
       }
+      const feeError = await invalidFee(fee_id);
+      if (feeError) {
+        return res.status(400).json({ success: false, error: feeError, errors: { fee_id: feeError } });
+      }
 
       const discipline = await prisma.discipline.create({
         data: {
@@ -210,6 +240,11 @@ disciplinesRouter.patch(
       const profError = await invalidProfessors(profesores);
       if (profError) {
         return res.status(400).json({ success: false, error: profError, errors: { professor_ids: profError } });
+      }
+      // Sólo si el request la menciona: un PATCH que no toca fee_id no la revalida.
+      const feeError = await invalidFee(campos.fee_id);
+      if (feeError) {
+        return res.status(400).json({ success: false, error: feeError, errors: { fee_id: feeError } });
       }
 
       const discipline = await prisma.discipline.update({
@@ -260,7 +295,8 @@ disciplinesRouter.delete(
       if (!Number.isInteger(id)) {
         return res.status(400).json({ success: false, error: "ID inválido" });
       }
-      const [discipline, desinscriptos] = await prisma.$transaction([
+      const baja = new Date();
+      const [discipline, desinscriptos, anuladas] = await prisma.$transaction([
         prisma.discipline.update({
           where: { id },
           data: { active: false },
@@ -268,13 +304,26 @@ disciplinesRouter.delete(
         }),
         prisma.enrollment.updateMany({
           where: { discipline_id: id, active: true },
-          data: { active: null, left_at: new Date() },
+          data: { active: null, left_at: baja },
+        }),
+        // Las cuotas de meses posteriores a la baja se anulan: si la disciplina
+        // ya no se dicta, nadie la cursa el mes que viene. El mes de la baja
+        // queda debiéndose — se cursó parte y el club cobra el mes completo,
+        // mismo criterio que al desinscribirse solo. Lo ya pagado no se toca.
+        prisma.payment.updateMany({
+          where: {
+            enrollment: { discipline_id: id },
+            status: { in: ["Pendiente", "EnRevision"] },
+            period: { gt: periodoDe(baja) },
+          },
+          data: { status: "Anulado" },
         }),
       ]);
       return res.json({
         success: true,
         discipline: serialize(discipline),
         desinscriptos: desinscriptos.count,
+        cuotasAnuladas: anuladas.count,
       });
     } catch (error: any) {
       if (error?.code === "P2025") {

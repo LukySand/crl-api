@@ -2,7 +2,7 @@ import { PrismaClient, RoleType } from "./generated/client";
 import { PrismaMariaDb } from "@prisma/adapter-mariadb";
 // El huso sale de la app y no de una constante local: si el club se muda, se
 // cambia en un solo lugar y el seed sigue generando datos coherentes.
-import { CLUB_TZ } from "../src/lib/booking-date";
+import { CLUB_TZ, parseDate, todayInClub } from "../src/lib/booking-date";
 
 // ponytail: se conecta por DATABASE_URL (127.0.0.1) y no armando el host a mano.
 // Con DB_HOST=localhost, en Mac Bun resuelve a IPv6 y el adapter se cuelga 10s.
@@ -24,6 +24,12 @@ const prisma = new PrismaClient({ adapter });
 
 const DEMO_PASSWORD = "Password123";
 
+// Profesor de prueba con contraseña propia, corta de tipear, para entrar al panel
+// de profesor. No pasa `passwordSchema` (exige 8 caracteres), así que esta cuenta
+// no se puede crear desde el registro: sale sólo de acá. El login no valida largo
+// —sólo verifica el hash— por eso entra igual.
+const TEST_PROFESOR_PASSWORD = "Test123";
+
 // UUIDs fijos: son la clave de la idempotencia. Si fueran aleatorios, cada
 // corrida crearía usuarios nuevos en vez de actualizar los de la anterior.
 const FILE = {
@@ -43,6 +49,7 @@ const USER = {
   socioValentina: "a0000000-0000-4000-8000-000000000007",
   menorTomas: "a0000000-0000-4000-8000-000000000008",
   menorSofia: "a0000000-0000-4000-8000-000000000009",
+  profeTest: "a0000000-0000-4000-8000-000000000010",
 } as const;
 
 const FAMILY = {
@@ -92,6 +99,26 @@ const CANCHAS = [
 
 const esNoche = (hhmm: string) => hhmm >= DESDE_NOCHE;
 const feeNoche = (fee: string) => `${fee} (noche)`;
+
+/** Nombre de la cuota mensual de una disciplina. */
+const cuotaDisciplina = (disciplina: string) => `Cuota mensual — ${disciplina}`;
+
+/**
+ * Cuota mensual de cada disciplina, en pesos.
+ *
+ * Separadas de las tarifas de cancha a propósito: la cuota de vóley (8000/mes)
+ * no es el alquiler de la cancha de vóley (9000/hora), aunque el espacio sea el
+ * mismo. Antes las disciplinas apuntaban a la tarifa por hora de su cancha, que
+ * es justo lo que `Fee.kind` vino a impedir.
+ */
+const DISCIPLINAS_CUOTA: [string, number][] = [
+  ["Fútbol", 10000],
+  ["Vóley", 8000],
+  ["Hockey", 9000],
+  ["Patín", 7500],
+  ["Gimnasia Artística", 8500],
+  ["Básquet", 8000],
+];
 const horaSiguiente = (hhmm: string) =>
   `${String(Number(hhmm.slice(0, 2)) + 1).padStart(2, "0")}:${hhmm.slice(3)}`;
 
@@ -195,6 +222,7 @@ async function seedFiles() {
 
 async function seedUsers(roleIds: Map<string, number>) {
   const password = await Bun.password.hash(DEMO_PASSWORD);
+  const testProfesorPassword = await Bun.password.hash(TEST_PROFESOR_PASSWORD);
 
   const admin = roleIds.get(RoleType.Administrador)!;
   const profesor = roleIds.get(RoleType.Profesor)!;
@@ -300,6 +328,21 @@ async function seedUsers(roleIds: Map<string, number>) {
       file_id: null,
       birth_date: utcDate("2011-12-05"),
     },
+    // Profe de prueba: DNI y contraseña cortos para entrar rápido al panel de
+    // profesor. Lleva `password` propio, que pisa el DEMO_PASSWORD compartido
+    // tanto al crear como al actualizar (el spread de `rest` va después).
+    {
+      id: USER.profeTest,
+      role_id: profesor,
+      name: "Test",
+      last_name: "Profesor",
+      dni: "11111111",
+      email: "test.profesor@crl.test",
+      celular: null,
+      file_id: null,
+      birth_date: utcDate("1990-01-01"),
+      password: testProfesorPassword,
+    },
   ];
 
   for (const user of users) {
@@ -334,47 +377,67 @@ async function seedFees() {
   const nocturnas = CANCHAS.map((c) => ({
     name: feeNoche(c.fee),
     amount: (c.base + RECARGO_NOCHE).toFixed(2),
+    kind: "Reserva" as const,
     description: `Tarifa a partir de las ${DESDE_NOCHE}. $${RECARGO_NOCHE.toLocaleString("es-AR")} más que la de día.`,
   }));
 
+  // ponytail: `kind` va explícito aunque el default sea Reserva. El seed es la
+  // documentación ejecutable del modelo, y acá está justo la distinción que la
+  // columna vino a hacer: alquilar la cancha de vóley una hora no es lo mismo
+  // que la cuota mensual de la disciplina vóley, aunque las dos digan "vóley".
   const fees = [
     {
       name: "Cancha de fútbol 5 — 1 hora",
       amount: "12000.00",
+      kind: "Reserva" as const,
       description: "Tarifa vigente para socios. Incluye luz artificial.",
     },
     {
       name: "Cancha de fútbol 11 — 1 hora",
       amount: "25000.00",
+      kind: "Reserva" as const,
       description: "Tarifa vigente para socios.",
     },
     {
       name: "Cancha de vóley — 1 hora",
       amount: "9000.00",
+      kind: "Reserva" as const,
       description: "Tarifa vigente para socios.",
     },
     {
       name: "Cancha de hockey — 1 hora",
       amount: "15000.00",
+      kind: "Reserva" as const,
       description: "Tarifa vigente para socios.",
     },
     {
       name: "Pista de patín — 1 hora",
       amount: "7000.00",
+      kind: "Reserva" as const,
       description: "Tarifa vigente para socios.",
     },
     {
       name: "Salón de eventos — turno",
       amount: "90000.00",
+      kind: "Reserva" as const,
       description: "Turno de 6 horas. No incluye servicio de catering.",
     },
     {
       name: "Cancha de fútbol 5 — 1 hora (2025)",
       amount: "9000.00",
+      kind: "Reserva" as const,
       description:
         "Tarifa histórica, reemplazada por la de 2026. Queda para no pisar el precio de las reservas viejas.",
     },
     ...nocturnas,
+    // Cuotas mensuales de las disciplinas. Son otra cosa que el alquiler por hora
+    // del mismo espacio: se cobran una vez por mes cursado, no por turno usado.
+    ...DISCIPLINAS_CUOTA.map(([disciplina, monto]) => ({
+      name: cuotaDisciplina(disciplina),
+      amount: monto.toFixed(2),
+      kind: "Disciplina" as const,
+      description: `Cuota mensual de ${disciplina}. Incluye las clases del mes.`,
+    })),
   ];
 
   const byName = new Map<string, number>();
@@ -542,23 +605,34 @@ async function seedDisciplines(
   // [nombre, profesores (0..n), nombre de tarifa|null, nombre de espacio|null]
   // Fútbol va con dos a propósito: es el caso de #6 y así queda dato de ejemplo
   // para probar que un profe ve las disciplinas que comparte con otro.
+  //
+  // La tarifa es la cuota MENSUAL de la disciplina, no el alquiler por hora del
+  // espacio donde se dicta: son dos tarifas distintas aunque el lugar sea el
+  // mismo (ver DISCIPLINAS_CUOTA).
   const disciplines: [string, string[], string | null, string | null][] = [
     [
       "Fútbol",
       [USER.profeFutbol, USER.profeVoley],
-      "Cancha de fútbol 5 — 1 hora",
+      cuotaDisciplina("Fútbol"),
       "Cancha de fútbol 5",
     ],
-    ["Vóley", [USER.profeVoley], "Cancha de vóley — 1 hora", "Cancha de vóley"],
-    ["Hockey", [], "Cancha de hockey — 1 hora", "Cancha de hockey"],
-    ["Patín", [], "Pista de patín — 1 hora", "Pista de patín"],
+    // Vóley queda con dos: sirve para ver el panel del profe de prueba con una
+    // disciplina compartida, además de las dos que dicta solo.
+    [
+      "Vóley",
+      [USER.profeVoley, USER.profeTest],
+      cuotaDisciplina("Vóley"),
+      "Cancha de vóley",
+    ],
+    ["Hockey", [USER.profeTest], cuotaDisciplina("Hockey"), "Cancha de hockey"],
+    ["Patín", [USER.profeTest], cuotaDisciplina("Patín"), "Pista de patín"],
     [
       "Gimnasia Artística",
       [USER.profeVoley],
-      "Pista de patín — 1 hora",
+      cuotaDisciplina("Gimnasia Artística"),
       "Pista de patín",
     ], // NUEVO
-    ["Básquet", [], "Cancha de vóley — 1 hora", "Cancha de vóley"], // NUEVO
+    ["Básquet", [], cuotaDisciplina("Básquet"), "Cancha de vóley"], // NUEVO
   ];
 
   // Horarios de clase por disciplina: [día (0=domingo), desde, hasta].
@@ -902,6 +976,159 @@ async function seedBookingEnVentana(
   }
 }
 
+/** Cuántos meses hacia atrás se siembran cuotas de disciplina. */
+const MESES_DE_HISTORIAL = 3;
+
+/** "YYYY-MM" de N meses atrás, contando desde el mes corriente. */
+function periodoAtras(meses: number): string {
+  const hoy = todayUTC();
+  const d = new Date(Date.UTC(hoy.getUTCFullYear(), hoy.getUTCMonth() - meses, 1));
+  return d.toISOString().slice(0, 7);
+}
+
+/** Vencimiento de un período: el día 10, igual que DIA_VENCIMIENTO en la app. */
+function vencimientoDe(periodo: string): Date {
+  return new Date(`${periodo}-10T00:00:00Z`);
+}
+
+/**
+ * Cuotas y cobros de ejemplo.
+ *
+ * Siembra las dos mitades del ledger:
+ *  - Un pago por cada reserva sembrada, con el estado que le corresponde a la
+ *    reserva (confirmada = cobrada, cancelada = anulada).
+ *  - Cuotas de disciplina de los últimos meses, con una mezcla de estados para
+ *    que la pantalla de reportes tenga una serie con forma y no una barra sola.
+ *
+ * Idempotente por `ref` (unique): correrlo dos veces no duplica nada. Vale la
+ * pena correrlo dos veces justamente para comprobarlo.
+ */
+async function seedPayments() {
+  let creados = 0;
+  // ponytail: el huso del club, NO todayUTC(). Corriendo el seed a la noche en
+  // Argentina (UTC-3) el reloj UTC ya está en el día siguiente, así que los
+  // cobros quedaban fechados mañana: caían fuera de la ventana del reporte y
+  // volvían a meter ingresos futuros. Los reportes calculan "hoy" con
+  // todayInClub(), y el seed tiene que usar la misma definición.
+  const hoy = parseDate(todayInClub());
+
+  // ── Reservas ───────────────────────────────────────────────────────────
+  const bookings = await prisma.booking.findMany({
+    include: { fee: { select: { id: true, amount: true } } },
+  });
+
+  for (const b of bookings) {
+    // El estado del cobro sale del de la reserva: confirmada es "ya se cobró en
+    // el club" (es lo que significaba antes de que existiera esta tabla),
+    // cancelada no se cobra, y pendiente sigue debiéndose.
+    const status =
+      b.status === "Confirmada"
+        ? ("Pagado" as const)
+        : b.status === "Cancelada"
+          ? ("Anulado" as const)
+          : ("Pendiente" as const);
+
+    const data = {
+      user_id: b.user_id,
+      concept: "Reserva" as const,
+      booking_id: b.id,
+      fee_id: b.fee.id,
+      amount: b.fee.amount,
+      period: null,
+      due_date: b.date, // la reserva se paga el día del turno
+      status,
+      ...(status === "Pagado"
+        ? {
+            // El día del turno si ya pasó, hoy si todavía no: la gestión cobra
+            // cuando confirma, no el día del partido. Sin el tope, una reserva
+            // confirmada para dentro de tres semanas metía plata en el mes que
+            // viene y el reporte mostraba ingresos futuros.
+            paid_at: b.date < hoy ? b.date : hoy,
+            method: "Efectivo" as const,
+            registered_by: USER.admin,
+          }
+        : {}),
+    };
+
+    await prisma.payment.upsert({
+      where: { ref: `reserva:${b.id}` },
+      update: data,
+      create: { ref: `reserva:${b.id}`, ...data },
+    });
+    creados++;
+  }
+
+  // ── Cuotas de disciplina ───────────────────────────────────────────────
+  const enrollments = await prisma.enrollment.findMany({
+    where: { active: true, discipline: { fee_id: { not: null } } },
+    include: { discipline: { select: { fee: { select: { id: true, amount: true } } } } },
+  });
+
+  // Períodos de más viejo a más nuevo: el corriente es el último.
+  const periodos = Array.from({ length: MESES_DE_HISTORIAL }, (_, i) =>
+    periodoAtras(MESES_DE_HISTORIAL - 1 - i),
+  );
+
+  for (const [indice, periodo] of periodos.entries()) {
+    const esCorriente = indice === periodos.length - 1;
+    const due = vencimientoDe(periodo);
+
+    for (const [posicion, e] of enrollments.entries()) {
+      const fee = e.discipline.fee!;
+
+      // Los meses cerrados están casi todos cobrados; el corriente es el que
+      // tiene mezcla, que es donde se ve si la pantalla distingue los estados.
+      // El reparto es determinístico (por posición) y no al azar: si el seed
+      // sorteara, cada corrida cambiaría los números del reporte y no habría
+      // forma de saber si una diferencia es un bug o el dado.
+      const status = !esCorriente
+        ? posicion % 7 === 0
+          ? ("Pendiente" as const) // un moroso por mes, para el reporte de deuda
+          : ("Pagado" as const)
+        : posicion % 3 === 0
+          ? ("Pagado" as const)
+          : posicion % 3 === 1
+            ? ("Pendiente" as const)
+            : ("EnRevision" as const); // comprobante subido, esperando a la gestión
+
+      // Transferencia y efectivo alternados, para que el corte por medio de
+      // cobro tenga las dos barras.
+      const method = posicion % 2 === 0 ? ("Transferencia" as const) : ("Efectivo" as const);
+
+      const data = {
+        user_id: e.user_id,
+        concept: "Disciplina" as const,
+        enrollment_id: e.id,
+        fee_id: fee.id,
+        amount: fee.amount,
+        period: periodo,
+        due_date: due,
+        status,
+        ...(status === "Pagado"
+          ? {
+              // Se paga cerca del vencimiento, no el mismo día siempre.
+              paid_at: new Date(due.getTime() - (posicion % 5) * 86_400_000),
+              method,
+              registered_by: USER.admin,
+            }
+          : {}),
+      };
+
+      const ref = `disciplina:${e.id}:${periodo}`;
+      await prisma.payment.upsert({
+        where: { ref },
+        update: data,
+        create: { ref, ...data },
+      });
+      creados++;
+    }
+  }
+
+  console.log(
+    `Cuotas y cobros listos (${creados}: ${bookings.length} de reservas, ${enrollments.length * periodos.length} de disciplinas en ${periodos.length} meses).`,
+  );
+}
+
 async function main() {
   const roleIds = await seedRoles();
 
@@ -927,12 +1154,19 @@ async function main() {
   await backfillProfesores();
   await seedEnrollments(disciplineIds);
 
+  // Va último: las cuotas cuelgan de las reservas y las inscripciones.
+  await seedPayments();
+
   console.log(
     `\nSeed completado. Usuarios de ejemplo con contraseña "${DEMO_PASSWORD}":`,
   );
   console.log("  Administrador → DNI 28450113 (ana.gimenez@crl.test)");
   console.log("  Profesor      → DNI 31220874 (diego.ferreyra@crl.test)");
   console.log("  Socio         → DNI 35112908 (martin.aguirre@crl.test)");
+  console.log(
+    `\nProfe de prueba (contraseña "${TEST_PROFESOR_PASSWORD}"):` +
+      "\n  Profesor      → DNI 11111111 (test.profesor@crl.test) — Vóley, Hockey, Patín",
+  );
 }
 
 main()

@@ -42,8 +42,9 @@ model File {
   size          BigInt
   mime          String   @db.VarChar(255)
 
-  users  User[]
-  places Place[]
+  users    User[]
+  places   Place[]
+  payments Payment[] // comprobantes de transferencia
 
   @@map("files")
 }
@@ -70,6 +71,11 @@ model User {
   bookings           Booking[]
   disciplines        DisciplineProfessor[] // disciplinas que dicta (rol Profesor)
   enrollments        Enrollment[] // disciplinas en las que está inscripto (rol Socio)
+
+  // Dos relaciones a Payment, así que van nombradas: una es lo que el usuario
+  // debe, la otra los cobros que registró (sólo gestión).
+  payments            Payment[] @relation("PaymentUser")
+  payments_registered Payment[] @relation("PaymentRegistrar")
 
   @@map("users")
 }
@@ -118,6 +124,31 @@ enum BookingStatus {
   Cancelada
 }
 
+// Clasifica una tarifa y, con los mismos valores, el concepto de un pago. Un
+// solo enum para las dos cosas a propósito: mantiene alineado que un Payment de
+// concepto Disciplina apunte a una Fee de disciplina y no a una de cancha.
+//
+// Hasta ahora Fee no tenía tipo, y como GET /api/fees devuelve todas, nada
+// impedía que una disciplina terminara apuntando a "Cancha de fútbol 5 — $12.000".
+enum FeeKind {
+  Reserva
+  Disciplina
+  Socio // todavía sin usar: la cuota de socio entra por acá sin migrar nada
+}
+
+enum PaymentStatus {
+  Pendiente
+  EnRevision // el socio subió comprobante, administración todavía no lo confirmó
+  Pagado
+  Anulado
+}
+
+enum PaymentMethod {
+  Efectivo
+  Transferencia
+  MercadoPago
+}
+
 // ponytail: inmutable — no hay endpoint de update. Cambiar precio = crear una
 // fila nueva y repuntar Schedule.fee_id. Así el historial de Booking (que
 // guarda su propio fee_id) nunca queda pisado por un cambio de precio.
@@ -125,12 +156,14 @@ model Fee {
   id          Int      @id @default(autoincrement())
   name        String   @db.VarChar(255)
   amount      Decimal  @db.Decimal(10, 2)
+  kind        FeeKind  @default(Reserva) // para qué sirve esta tarifa
   description String?  @db.Text
   created_at  DateTime @default(now())
 
   schedules   Schedule[]
   bookings    Booking[]
   disciplines Discipline[]
+  payments    Payment[]
 
   @@map("fees")
 }
@@ -228,6 +261,7 @@ model Enrollment {
 
   user       User       @relation(fields: [user_id], references: [id])
   discipline Discipline @relation(fields: [discipline_id], references: [id])
+  payments   Payment[] // una cuota por mes cursado
 
   @@unique([user_id, discipline_id, active]) // una sola inscripción activa por par
   @@map("enrollments")
@@ -270,7 +304,91 @@ model Booking {
   schedule Schedule @relation(fields: [schedule_id], references: [id])
   fee      Fee      @relation(fields: [fee_id], references: [id])
   user     User     @relation(fields: [user_id], references: [id])
+  payment  Payment? // el cobro de esta reserva (1:1)
 
   @@unique([schedule_id, date, active])
   @@map("bookings")
+}
+
+// Una fila = un período adeudado, que además registra cómo se saldó.
+// Cubre las reservas de cancha (pago único) y las cuotas de disciplina (mensuales).
+//
+// ponytail: acá vive tanto la deuda como el cobro a propósito. Separarlo en dos
+// tablas (cargo + pago) sólo hace falta para pagos parciales, que el club no
+// tiene: se paga la cuota entera o no se paga. Con una sola tabla, "qué debe
+// Martín" es un WHERE status = Pendiente y no un LEFT JOIN con sumas.
+model Payment {
+  id String @id @default(uuid())
+
+  user_id String  @db.Char(128) // quién debe
+  concept FeeKind
+
+  // Origen: exactamente uno según el concepto. Reserva → booking_id,
+  // Disciplina → enrollment_id, Socio → ninguno de los dos.
+  //
+  // Apunta a Enrollment y no a Discipline porque la inscripción ya tiene el
+  // historial de períodos (created_at → left_at): así se generan cuotas
+  // exactamente por los meses que el socio cursó. La disciplina se llega igual
+  // navegando enrollment.discipline.
+  enrollment_id Int?
+  booking_id    String? @unique @db.Char(128) // una reserva = un solo pago
+
+  // ponytail: mismo criterio que Booking.fee_id. `fee_id` es el snapshot de la
+  // tarifa y `amount` una copia congelada del monto. Las dos cosas: el snapshot
+  // por trazabilidad, la copia porque la inmutabilidad de Fee es una convención
+  // (no hay endpoint de update, pero la base no lo impide) y un cobro manual
+  // puede no corresponder a ninguna tarifa cargada.
+  //
+  // Sin la copia, repuntar Discipline.fee_id repreciaría todo el historial: las
+  // cuotas de marzo cambiarían de monto porque alguien editó una tarifa en
+  // septiembre.
+  fee_id Int?
+  amount Decimal @db.Decimal(10, 2)
+
+  period   String?  @db.Char(7) // "YYYY-MM" en las mensuales; null en las reservas
+  due_date DateTime @db.Date
+
+  // ponytail: no hay estado "Vencido". Se deriva de due_date < hoy con status
+  // Pendiente — guardarlo obligaría a un job que a medianoche dé vuelta filas, y
+  // el front ya lo trata como presentacional (DueStatus: ok | warn | late).
+  status PaymentStatus @default(Pendiente)
+
+  paid_at       DateTime?
+  method        PaymentMethod?
+  file_id       String?        @db.Char(128) // comprobante de transferencia
+  registered_by String?        @db.Char(128) // admin que confirmó el cobro
+  external_id   String?        @unique @db.VarChar(120) // id de Mercado Pago, a futuro
+  notes         String?        @db.Text
+
+  // ponytail: clave de idempotencia. "reserva:<bookingId>",
+  // "disciplina:<enrollmentId>:<YYYY-MM>", "socio:<userId>:<YYYY-MM>".
+  // Hace que la generación mensual se pueda volver a correr sin duplicar, igual
+  // que el seed con sus UUID fijos.
+  ref String @unique @db.VarChar(160)
+
+  created_at DateTime @default(now())
+
+  user       User        @relation("PaymentUser", fields: [user_id], references: [id])
+  registrar  User?       @relation("PaymentRegistrar", fields: [registered_by], references: [id])
+  enrollment Enrollment? @relation(fields: [enrollment_id], references: [id])
+  booking    Booking?    @relation(fields: [booking_id], references: [id])
+  fee        Fee?        @relation(fields: [fee_id], references: [id])
+  file       File?       @relation(fields: [file_id], references: [id])
+
+  @@index([user_id, status])
+  @@index([status, due_date])
+  @@index([concept, due_date])
+  @@map("payments")
+}
+
+// Local adherido con beneficio para socios. La API recorta y valida los textos;
+// `active` cambia únicamente mediante baja o reactivación lógica.
+model PartnerStore {
+  id                   Int     @id @default(autoincrement())
+  name                 String  @db.VarChar(100)
+  address              String  @db.VarChar(255)
+  discount_description String  @db.Text
+  active               Boolean @default(true)
+
+  @@map("partner_stores")
 }

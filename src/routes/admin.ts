@@ -225,7 +225,7 @@ adminRouter.delete("/users/:id", async (req: Request, res: Response) => {
     }
 
     const hoy = parseDate(todayInClub());
-    const [user, canceladas] = await prisma.$transaction([
+    const [user, canceladas, anuladas] = await prisma.$transaction([
       prisma.user.update({
         where: { id },
         data: { active: false },
@@ -236,8 +236,29 @@ adminRouter.delete("/users/:id", async (req: Request, res: Response) => {
         where: { user_id: id, date: { gte: hoy }, status: { not: "Cancelada" } },
         data: { status: "Cancelada", active: null },
       }),
+      // Y anula el cobro de esas reservas, en la misma transacción: una cancha
+      // que ya no va a usar no se le cobra. Se acota por `due_date` (que en una
+      // reserva es el día del turno) para no tocar la deuda vieja: lo que quedó
+      // debiendo antes de la baja se sigue debiendo.
+      //
+      // Lo ya pagado no se toca, igual que al cancelar una reserva suelta: la
+      // plata entró y borrarla falsearía los ingresos.
+      prisma.payment.updateMany({
+        where: {
+          user_id: id,
+          concept: "Reserva",
+          due_date: { gte: hoy },
+          status: { in: ["Pendiente", "EnRevision"] },
+        },
+        data: { status: "Anulado" },
+      }),
     ]);
-    res.json({ success: true, user: flatten(user), reservasCanceladas: canceladas.count });
+    res.json({
+      success: true,
+      user: flatten(user),
+      reservasCanceladas: canceladas.count,
+      cuotasAnuladas: anuladas.count,
+    });
   } catch (error) {
     console.error("Deactivate user error:", error);
     res.status(500).json({ success: false, error: "Error al dar de baja al usuario" });

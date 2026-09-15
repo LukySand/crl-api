@@ -11,6 +11,9 @@ import { disciplinesRouter } from "./routes/disciplines";
 import { enrollmentsRouter } from "./routes/enrollments";
 import { socioRouter } from "./routes/socio";
 import { familiesRouter } from "./routes/families";
+import { paymentsRouter } from "./routes/payments";
+import { reportsRouter } from "./routes/reports";
+import { partnerStoresRouter } from "./routes/partner-stores";
 
 const app = express();
 app.use(express.json());
@@ -30,6 +33,9 @@ app.use("/api/disciplines", disciplinesRouter);
 app.use("/api/enrollments", enrollmentsRouter);
 app.use("/api/socio", socioRouter);
 app.use("/api/families", familiesRouter);
+app.use("/api/payments", paymentsRouter);
+app.use("/api/reports", reportsRouter);
+app.use("/api/partner-stores", partnerStoresRouter);
 
 const port = Number(process.env.PORT ?? 3001);
 app.listen(port, () => {
