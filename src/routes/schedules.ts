@@ -6,6 +6,7 @@ import { requireAuth, requireAdmin } from "../lib/auth";
 import { findOrCreateFeeForPlace } from "../lib/fee";
 import { TIME, toTime, overlaps } from "../lib/time";
 import { claseQuePisa } from "../lib/availability";
+import { parseDate, todayInClub } from "../lib/booking-date";
 
 export const schedulesRouter = Router();
 
@@ -72,6 +73,10 @@ async function hayTurnoSuperpuesto(
     where: {
       place_id,
       day_of_week,
+      // Un turno dado de baja no bloquea nada: si no filtráramos acá, el muerto
+      // seguiría reservando su horario y no se podría volver a crear uno igual,
+      // que es justo lo que la baja lógica viene a destrabar.
+      active: true,
       ...(excludeId !== undefined && { id: { not: excludeId } }),
     },
     select: { start_time: true, end_time: true },
@@ -110,7 +115,7 @@ schedulesRouter.get("/", async (req: Request, res: Response) => {
     }
 
     const schedules = await prisma.schedule.findMany({
-      where: placeId ? { place_id: placeId } : undefined,
+      where: { active: true, ...(placeId ? { place_id: placeId } : {}) },
       include: { fee: true, place: true },
       orderBy: [{ day_of_week: "asc" }, { start_time: "asc" }],
     });
@@ -129,8 +134,8 @@ schedulesRouter.get("/:id", async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: "ID inválido" });
     }
 
-    const schedule = await prisma.schedule.findUnique({
-      where: { id },
+    const schedule = await prisma.schedule.findFirst({
+      where: { id, active: true },
       include: { fee: true, place: true },
     });
     if (!schedule) {
@@ -236,7 +241,9 @@ schedulesRouter.patch(
       // sola transacción: si no, dos PATCH concurrentes podrían leer "libre" los
       // dos antes de que cualquiera escriba.
       const schedule = await prisma.$transaction(async (tx) => {
-        const actual = await tx.schedule.findUnique({ where: { id } });
+        // findFirst con active: un turno dado de baja no se edita, se crea uno
+        // nuevo. Si no filtráramos, se podría revivir por la puerta de atrás.
+        const actual = await tx.schedule.findFirst({ where: { id, active: true } });
         if (!actual) throw new NoEncontradoError();
 
         const feeId =
@@ -325,17 +332,46 @@ schedulesRouter.delete(
         return res.status(400).json({ success: false, error: "ID inválido" });
       }
 
-      await prisma.schedule.delete({ where: { id } });
-      return res.json({ success: true, message: "Horario eliminado" });
-    } catch (error: any) {
-      if (error?.code === "P2025") {
-        return res.status(404).json({ success: false, error: "Horario no encontrado" });
-      }
-      if (error?.code === "P2003") {
+      // Transacción: contar y marcar tiene que ser atómico. Si no, una reserva
+      // creada entre las dos sentencias sobrevive colgada de un turno muerto.
+      const reservas_futuras = await prisma.$transaction(async (tx) => {
+        const schedule = await tx.schedule.findFirst({
+          where: { id, active: true },
+          select: { id: true },
+        });
+        if (!schedule) throw new NoEncontradoError();
+
+        // Sólo las vivas de hoy en adelante. Las pasadas y las canceladas no
+        // bloquean: antes cualquier reserva, aunque estuviera cancelada hacía
+        // meses, dejaba el turno ineliminable para siempre.
+        const futuras = await tx.booking.count({
+          where: {
+            schedule_id: id,
+            active: true,
+            date: { gte: parseDate(todayInClub()) },
+          },
+        });
+        if (futuras > 0) return futuras;
+
+        // Baja lógica. El where va por PRIMARY KEY, nunca por el unique
+        // compuesto: Prisma no acepta null cómodo en los unique compuestos
+        // (discussions #23522 / #21322). Misma forma que usa cancelar Booking.
+        await tx.schedule.update({ where: { id }, data: { active: null } });
+        return 0;
+      });
+
+      if (reservas_futuras > 0) {
         return res.status(409).json({
           success: false,
-          error: "No se puede eliminar: el horario tiene reservas asociadas",
+          error: `No se puede dar de baja: el horario tiene ${reservas_futuras} reserva(s) futura(s) sin cancelar`,
+          reservas_futuras,
         });
+      }
+
+      return res.json({ success: true, message: "Horario dado de baja" });
+    } catch (error: any) {
+      if (error instanceof NoEncontradoError || error?.code === "P2025") {
+        return res.status(404).json({ success: false, error: "Horario no encontrado" });
       }
       console.error("Delete schedule error:", error);
       return res.status(500).json({ success: false, error: "Error al eliminar el horario" });

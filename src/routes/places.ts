@@ -84,7 +84,8 @@ placesRouter.get(
 
       const [schedules, bookings, disciplineSchedules] = await Promise.all([
         prisma.schedule.findMany({
-          where: { day_of_week: dayOfWeek },
+          // active: true deja afuera los turnos dados de baja
+          where: { day_of_week: dayOfWeek, active: true },
           select: { id: true, place_id: true, start_time: true, end_time: true },
           orderBy: { start_time: "asc" },
         }),
@@ -136,7 +137,12 @@ placesRouter.get("/:id", async (req: Request, res: Response) => {
     const place = await prisma.place.findUnique({
       where: { id },
       include: {
-        schedules: { include: { fee: true }, orderBy: [{ day_of_week: "asc" }, { start_time: "asc" }] },
+        // where active: los turnos dados de baja no se muestran junto al espacio
+        schedules: {
+          where: { active: true },
+          include: { fee: true },
+          orderBy: [{ day_of_week: "asc" }, { start_time: "asc" }],
+        },
       },
     });
 

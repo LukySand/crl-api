@@ -7,6 +7,7 @@ import {
   buildAvailability,
   buildOccupancy,
   claseQuePisa,
+  turnoQuePisa,
   type SlotSchedule,
   type SlotBooking,
   type SlotDisciplineSchedule,
@@ -222,4 +223,44 @@ test("ignora las clases que no se pisan y encuentra la que sí", () => {
     clase("19:45", "21:00", "Básquet"),
   ]);
   expect(encontrada?.discipline.name).toBe("Básquet");
+});
+
+// ---------------------------------------------------------------------------
+// turnoQuePisa — espejo de claseQuePisa. Los tests son deliberadamente
+// paralelos a los de arriba: si las dos direcciones de la regla se
+// desincronizan, la diferencia tiene que saltar leyendo el archivo.
+// ---------------------------------------------------------------------------
+
+test("turnoQuePisa: devuelve el turno que se pisa", () => {
+  const encontrado = turnoQuePisa(t("19:00"), t("20:30"), [schedule(4, "19:00", "20:00")]);
+  expect(encontrado?.id).toBe(4);
+});
+
+test("turnoQuePisa: null cuando no hay ningún turno", () => {
+  expect(turnoQuePisa(t("19:00"), t("20:00"), [])).toBeNull();
+});
+
+test("turnoQuePisa: null si sólo se tocan en el borde", () => {
+  // S5.3 — una clase 20:00-21:00 sobre un turno que termina 20:00 es legal
+  expect(turnoQuePisa(t("20:00"), t("21:00"), [schedule(1, "19:00", "20:00")])).toBeNull();
+  expect(turnoQuePisa(t("19:00"), t("20:00"), [schedule(1, "20:00", "21:00")])).toBeNull();
+});
+
+test("turnoQuePisa: detecta el turno contenido dentro del rango de la clase", () => {
+  expect(turnoQuePisa(t("18:00"), t("22:00"), [schedule(1, "19:00", "20:00")])).not.toBeNull();
+});
+
+test("turnoQuePisa: ignora los que no se pisan y encuentra el que sí", () => {
+  const encontrado = turnoQuePisa(t("19:00"), t("20:30"), [
+    schedule(1, "08:00", "09:00"),
+    schedule(2, "17:00", "18:00"),
+    schedule(3, "20:00", "21:00"),
+  ]);
+  expect(encontrado?.id).toBe(3);
+});
+
+test("turnoQuePisa: el caller filtra los dados de baja, así que una lista vacía no bloquea", () => {
+  // S5.7 — un turno con active=null nunca llega acá; el where del caller lo saca.
+  // Este test fija el contrato: la función no sabe de `active`, sólo de rangos.
+  expect(turnoQuePisa(t("19:00"), t("20:00"), [])).toBeNull();
 });

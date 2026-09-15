@@ -3,6 +3,8 @@ import { z } from "zod";
 import prisma from "../lib/prisma";
 import { requireAuth, requireAdmin } from "../lib/auth";
 import { TIME, toTime } from "../lib/time";
+import { turnoQuePisa } from "../lib/availability";
+import { timeToHHMM } from "../lib/booking-date";
 
 export const disciplinesRouter = Router();
 
@@ -392,6 +394,39 @@ async function denyScheduleEdit(
   return { status: 403, error: "No podés editar los horarios de esta disciplina" };
 }
 
+/**
+ * ¿La clase [start,end) de ese día se pisa con un turno reservable vivo del
+ * espacio de la disciplina? Devuelve el mensaje de error, o null si está libre.
+ *
+ * Es el espejo de lo que hace schedules.ts al revés: un turno no se crea sobre
+ * una clase, y una clase no se crea sobre un turno. Bloquea tenga o no reservas
+ * el turno — para poner la clase ahí, primero se da de baja el turno.
+ *
+ * Una disciplina sin espacio asignado (place_id null) no ocupa nada y nunca se
+ * bloquea.
+ */
+async function turnoEnConflicto(
+  discipline_id: number,
+  day_of_week: number,
+  start: Date,
+  end: Date,
+): Promise<string | null> {
+  const discipline = await prisma.discipline.findUnique({
+    where: { id: discipline_id },
+    select: { place_id: true },
+  });
+  if (!discipline?.place_id) return null;
+
+  const turnos = await prisma.schedule.findMany({
+    where: { place_id: discipline.place_id, day_of_week, active: true },
+    select: { id: true, start_time: true, end_time: true },
+  });
+
+  const turno = turnoQuePisa(start, end, turnos);
+  if (!turno) return null;
+  return `Ese horario se pisa con un turno reservable de ese espacio (${timeToHHMM(turno.start_time)} a ${timeToHHMM(turno.end_time)}). Dá de baja el turno primero.`;
+}
+
 /** GET /api/disciplines/:id/schedules — horarios de la clase. Abierto, como el listado. */
 disciplinesRouter.get("/:id/schedules", async (req: Request, res: Response) => {
   try {
@@ -428,6 +463,15 @@ disciplinesRouter.post("/:id/schedules", requireAuth, async (req: Request, res: 
     if (!parsed.success) return validationError(res, parsed.error);
 
     const { day_of_week, start_time, end_time } = parsed.data;
+
+    const conflicto = await turnoEnConflicto(
+      id,
+      day_of_week,
+      toTime(start_time),
+      toTime(end_time),
+    );
+    if (conflicto) return res.status(409).json({ success: false, error: conflicto });
+
     const schedule = await prisma.disciplineSchedule.create({
       data: {
         discipline_id: id,
@@ -475,6 +519,18 @@ disciplinesRouter.patch(
       }
 
       const { day_of_week, start_time, end_time } = parsed.data;
+
+      // Se valida el estado POSTERIOR a la edición, no lo que vino en el body:
+      // si no, se crea la clase en un hueco libre y después se la mueve encima
+      // de un turno, esquivando el chequeo del POST.
+      const conflicto = await turnoEnConflicto(
+        id,
+        day_of_week ?? actual.day_of_week,
+        start_time !== undefined ? toTime(start_time) : actual.start_time,
+        end_time !== undefined ? toTime(end_time) : actual.end_time,
+      );
+      if (conflicto) return res.status(409).json({ success: false, error: conflicto });
+
       const schedule = await prisma.disciplineSchedule.update({
         where: { id: sid },
         data: {

@@ -15,3 +15,6 @@ scripts/seed-demo-users.ts
 
 # archivos subidos (fotos de perfil, espacios): default de Storage sin FILES_STORAGE_PATH
 uploads/
+
+# artefactos de planificación SDD — no van al repo
+openspec/

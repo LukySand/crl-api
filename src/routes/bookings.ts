@@ -133,7 +133,8 @@ bookingsRouter.get("/availability", async (req: Request, res: Response) => {
 
     const [schedules, bookings, disciplineSchedules] = await Promise.all([
       prisma.schedule.findMany({
-        where: { place_id: placeId, day_of_week: dayOfWeek },
+        // active: true deja afuera los turnos dados de baja
+        where: { place_id: placeId, day_of_week: dayOfWeek, active: true },
         select: { id: true, start_time: true, end_time: true },
         orderBy: { start_time: "asc" },
       }),
@@ -273,12 +274,20 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
       });
     }
 
-    const schedule = await prisma.schedule.findUnique({
+    // findFirst y no findUnique: hay que filtrar por active, que no es único.
+    const schedule = await prisma.schedule.findFirst({
       where: { id: schedule_id },
       include: { place: { select: { active: true } } },
     });
     if (!schedule) {
       return res.status(404).json({ success: false, error: "El horario no existe" });
+    }
+    // Un turno dado de baja sigue existiendo (conserva su historial de reservas)
+    // pero ya no se reserva. Por eso 409 y no 404: la fila está, el turno no.
+    if (schedule.active !== true) {
+      return res
+        .status(409)
+        .json({ success: false, error: "El horario ya no está disponible" });
     }
     // Un espacio dado de baja no se puede reservar (las reservas viejas siguen ahí)
     if (!schedule.place.active) {

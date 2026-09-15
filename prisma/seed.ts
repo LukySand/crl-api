@@ -2,7 +2,8 @@ import { PrismaClient, RoleType } from "./generated/client";
 import { PrismaMariaDb } from "@prisma/adapter-mariadb";
 // El huso sale de la app y no de una constante local: si el club se muda, se
 // cambia en un solo lugar y el seed sigue generando datos coherentes.
-import { CLUB_TZ } from "../src/lib/booking-date";
+import { CLUB_TZ, timeToHHMM } from "../src/lib/booking-date";
+import { turnoQuePisa } from "../src/lib/availability";
 
 // ponytail: se conecta por DATABASE_URL (127.0.0.1) y no armando el host a mano.
 // Con DB_HOST=localhost, en Mac Bun resuelve a IPv6 y el adapter se cuelga 10s.
@@ -520,12 +521,17 @@ async function seedSchedules(
     const fee_id = feeIds.get(feeName)!;
     const start_time = toTime(from);
 
+    // active: true en el where y en el create. El seed sólo siembra turnos
+    // vivos, así que el unique compuesto se consulta siempre con una clave
+    // no-NULL — un turno dado de baja no lo pisa, y volver a sembrar crea uno
+    // nuevo en su lugar, que es lo que corresponde.
     const row = await prisma.schedule.upsert({
       where: {
-        place_id_day_of_week_start_time: {
+        place_id_day_of_week_start_time_active: {
           place_id,
           day_of_week: day,
           start_time,
+          active: true,
         },
       },
       update: { fee_id, end_time: toTime(to) },
@@ -535,6 +541,7 @@ async function seedSchedules(
         day_of_week: day,
         start_time,
         end_time: toTime(to),
+        active: true,
       },
     });
     byKey.set(`${placeName}|${day}|${from}`, row);
@@ -573,6 +580,55 @@ async function feeCuotaDisciplina(disciplineName: string): Promise<number> {
   return creada.id;
 }
 
+/**
+ * Corta el seed ANTES de escribir si alguna clase se pisa con un turno
+ * reservable vivo del mismo espacio y día.
+ *
+ * Existe porque el seed escribe con prisma.disciplineSchedule.upsert, o sea
+ * salteándose la validación HTTP: sin este chequeo no falla, simplemente
+ * siembra en silencio el estado que la API rechaza con 409. Cuando se escribió
+ * esto había 13 choques sembrados así.
+ *
+ * Reusa turnoQuePisa de lib/availability — la MISMA función que usan los
+ * endpoints. Una segunda implementación del solapamiento acá sería exactamente
+ * la forma de que el seed y la API vuelvan a discrepar.
+ */
+async function verificarClasesSinTurnos(
+  disciplines: readonly (readonly [string, string[], string | null])[],
+  classSchedules: Record<string, [number, string, string][]>,
+  placeIds: Map<string, number>,
+) {
+  const choques: string[] = [];
+
+  for (const [name, , placeName] of disciplines) {
+    if (!placeName) continue; // sin espacio asignado no ocupa nada
+    const place_id = placeIds.get(placeName);
+    if (place_id === undefined) continue;
+
+    for (const [day, from, to] of classSchedules[name] ?? []) {
+      const turnos = await prisma.schedule.findMany({
+        where: { place_id, day_of_week: day, active: true },
+        select: { id: true, start_time: true, end_time: true },
+      });
+      const turno = turnoQuePisa(toTime(from), toTime(to), turnos);
+      if (turno) {
+        choques.push(
+          `  ${placeName} · día ${day} · clase de ${name} ${from}-${to} ` +
+            `pisa el turno ${timeToHHMM(turno.start_time)}-${timeToHHMM(turno.end_time)}`,
+        );
+      }
+    }
+  }
+
+  if (choques.length > 0) {
+    throw new Error(
+      `El seed intentó sembrar ${choques.length} clase(s) encima de turnos reservables:\n` +
+        `${choques.join("\n")}\n\n` +
+        `La API rechaza esto con 409. Mové el horario de la clase, o dá de baja el turno.`,
+    );
+  }
+}
+
 async function seedDisciplines(placeIds: Map<string, number>) {
   // [nombre, profesores (0..n), nombre de espacio|null]
   // La tarifa ya no sale de acá: cada disciplina tiene la suya (ver feeCuotaDisciplina).
@@ -588,26 +644,33 @@ async function seedDisciplines(placeIds: Map<string, number>) {
   ];
 
   // Horarios de clase por disciplina: [día (0=domingo), desde, hasta].
+  // Las clases van en horarios que NO pisan los turnos reservables del mismo
+  // espacio: la API rechaza esa combinación con 409 y el seed no puede crearla
+  // por la puerta de atrás. Se eligieron huecos de la grilla (las canchas se
+  // alquilan de tarde-noche, así que las clases quedan a la siesta).
+  // verificarClasesSinTurnos() más abajo corta el seed si esto se rompe.
   const classSchedules: Record<string, [number, string, string][]> = {
     Fútbol: [
-      [1, "18:00", "19:30"],
-      [3, "18:00", "19:30"],
-    ],
-    Vóley: [
-      [2, "19:00", "20:30"],
-      [4, "19:00", "20:30"],
-    ],
-    Hockey: [[5, "17:30", "19:00"]],
-    Patín: [[6, "10:00", "11:30"]],
-    "Gimnasia Artística": [
       [1, "16:00", "17:30"],
       [3, "16:00", "17:30"],
+    ],
+    Vóley: [
+      [2, "15:30", "17:00"],
+      [4, "15:30", "17:00"],
+    ],
+    Hockey: [[5, "15:30", "17:00"]],
+    Patín: [[6, "10:00", "11:30"]],
+    "Gimnasia Artística": [
+      [1, "14:00", "15:30"],
+      [3, "14:00", "15:30"],
     ], // NUEVO
     Básquet: [
-      [2, "17:30", "19:00"],
-      [4, "17:30", "19:00"],
+      [2, "10:00", "11:30"],
+      [4, "10:00", "11:30"],
     ], // NUEVO
   };
+
+  await verificarClasesSinTurnos(disciplines, classSchedules, placeIds);
 
   const byName = new Map<string, number>();
 
@@ -890,7 +953,12 @@ async function seedBookingEnVentana(
 
   const schedule = await prisma.schedule.upsert({
     where: {
-      place_id_day_of_week_start_time: { place_id, day_of_week, start_time },
+      place_id_day_of_week_start_time_active: {
+        place_id,
+        day_of_week,
+        start_time,
+        active: true,
+      },
     },
     update: { fee_id, end_time: toTime(hasta) },
     create: {
@@ -899,6 +967,7 @@ async function seedBookingEnVentana(
       day_of_week,
       start_time,
       end_time: toTime(hasta),
+      active: true,
     },
   });
 

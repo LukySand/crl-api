@@ -49,6 +49,25 @@ export function claseQuePisa(
   return clases.find((c) => overlaps(start, end, c.start_time, c.end_time)) ?? null;
 }
 
+/**
+ * El turno reservable vivo que se pisa con el rango [start,end), o null.
+ *
+ * Es el espejo de claseQuePisa y vive al lado a propósito: son las dos
+ * direcciones de la misma regla (un espacio no se puede estar usando para dos
+ * cosas a la vez) y tienen que quedar simétricas. Si una cambia, la otra
+ * también.
+ *
+ * `turnos` ya viene filtrada por espacio, día de semana y active=true desde el
+ * caller: un turno dado de baja no bloquea nada.
+ */
+export function turnoQuePisa(
+  start: Date,
+  end: Date,
+  turnos: SlotSchedule[],
+): SlotSchedule | null {
+  return turnos.find((t) => overlaps(start, end, t.start_time, t.end_time)) ?? null;
+}
+
 export type SlotDisponibilidad = SlotSchedule & {
   ocupado: boolean;
   motivo: Motivo | null;

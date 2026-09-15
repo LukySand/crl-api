@@ -258,11 +258,20 @@ model Schedule {
   start_time  DateTime @db.Time()
   end_time    DateTime @db.Time()
 
+  // ponytail: mismo truco que Booking y Enrollment — true mientras el turno está
+  // vivo, null cuando se da de baja. Va DENTRO del unique de abajo a propósito:
+  // MySQL ignora los null en los índices únicos, así que muchos turnos muertos y
+  // uno vivo conviven en la misma clave. Con un Boolean común, dar de baja el
+  // martes 19:00 ocuparía esa clave para siempre y no se podría volver a crear
+  // ese turno nunca más — el arreglo sería peor que el bug.
+  // Sin @default a propósito, igual que Booking: cada alta lo setea explícito.
+  active Boolean?
+
   place    Place     @relation(fields: [place_id], references: [id])
   fee      Fee       @relation(fields: [fee_id], references: [id])
   bookings Booking[]
 
-  @@unique([place_id, day_of_week, start_time])
+  @@unique([place_id, day_of_week, start_time, active])
   @@map("schedules")
 }
 

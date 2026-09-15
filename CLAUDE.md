@@ -125,10 +125,10 @@ el resto exige `requireAuth`/`authenticate` y, si dice **gestión**, además `re
 | `filesRouter` | `/api/files` | `GET /?id=` público; `PUT /` (auth, sube/reemplaza); `DELETE /?fileId=` (gestión) |
 | `adminRouter` | `/api/admin` | Todo gestión. `GET /users`; `POST /users`; `PUT /users/:id`; `DELETE /users/:id` (baja lógica + cancela sus reservas futuras); `PATCH /users/:id/reactivate` |
 | `placesRouter` | `/api/places` | `GET /` público (`?all=true` gestión ve inactivos); `GET /occupancy` (gestión); `GET /:id` público; `POST /`, `PATCH /:id`, `DELETE /:id` (baja lógica), `PATCH /:id/reactivate` — gestión |
-| `schedulesRouter` | `/api/schedules` | `GET /?place_id=` y `GET /:id` público; `POST /`, `PATCH /:id`, `DELETE /:id` — gestión |
+| `schedulesRouter` | `/api/schedules` | `GET /?place_id=` y `GET /:id` público (sólo turnos vivos); `POST /`, `PATCH /:id` — gestión, rechazan superponerse con otro turno o con una clase; `DELETE /:id` — gestión, **baja lógica**: 409 si tiene reservas futuras sin cancelar |
 | `feesRouter` | `/api/fees` | `GET /?category=` y `GET /:id` público; `POST /` gestión. Sin PATCH/DELETE: `Fee` es inmutable |
 | `bookingsRouter` | `/api/bookings` | Todo auth. `GET /?status=&place_id=` (propias; gestión ve todas); `GET /availability?place_id=&date=`; `GET /:id`; `POST /` (gestión puede reservar a nombre de otro socio, fijar precio y estado); `PATCH /:id`; `DELETE /:id` (cancela, no borra) |
-| `disciplinesRouter` | `/api/disciplines` | `GET /` y `GET /:id` público; `POST /`, `PATCH /:id`, `DELETE /:id` (baja lógica + desinscribe a todos los socios), `PATCH /:id/reactivate` — gestión. Sub-recurso horarios: `GET /:id/schedules` público; `POST/PATCH/DELETE /:id/schedules(/:sid)` — gestión o el profesor a cargo |
+| `disciplinesRouter` | `/api/disciplines` | `GET /` y `GET /:id` público; `POST /`, `PATCH /:id`, `DELETE /:id` (baja lógica + desinscribe a todos los socios), `PATCH /:id/reactivate` — gestión. Sub-recurso horarios: `GET /:id/schedules` público; `POST/PATCH/DELETE /:id/schedules(/:sid)` — gestión o el profesor a cargo. `POST` y `PATCH` dan 409 si la clase se pisa con un turno reservable vivo del espacio |
 | `enrollmentsRouter` | `/api/enrollments` | Todo auth. `GET /?discipline_id=` (filtrado por rol: admin todas, profesor las que dicta, socio las propias); `POST /` (a sí mismo, o gestión inscribe a otro); `DELETE /:id` (baja lógica) |
 | `socioRouter` | `/api/socio` | Todo auth (vía `middleware/auth.ts`). `GET /files?id=` (archivo propio); `PATCH /profile-image` (reemplaza la foto de perfil) |
 
@@ -167,12 +167,23 @@ que opere "sobre mí" saca el `id` del token verificado.
 El resto (`Role`, `Log`, `Fee`, `Place`, `Discipline`, `DisciplineSchedule`, `Enrollment`,
 `Schedule`) usa `Int` autoincremental. Migrado desde int en el commit `4db61f3`.
 
-**Truco `active` nullable para uniques parciales** (`ponytail:` en el schema): tanto `Booking`
-como `Enrollment` tienen `active Boolean?` dentro de un `@@unique(...)` — `true` mientras la
+**Truco `active` nullable para uniques parciales** (`ponytail:` en el schema): `Booking`,
+`Enrollment` y `Schedule` tienen `active Boolean?` dentro de un `@@unique(...)` — `true` mientras la
 fila está viva, `null` cuando se cancela/da de baja. MySQL no soporta índices únicos parciales,
 pero sí ignora `NULL` en un unique, así que dar de baja libera el turno/la inscripción sin
 borrar la fila (se conserva el historial). El código que da de baja es siempre el único que
 toca ese campo, en el mismo `update` que cambia el estado, para que nunca quede desincronizado.
+
+En `Schedule` el truco además es lo que hace posible la baja lógica: sin `active` dentro del
+unique, dar de baja el turno del martes 19:00 ocuparía `(place_id, day_of_week, start_time)`
+para siempre y no se podría volver a crear ese turno nunca más.
+
+**Ojo con el unique compuesto en Prisma**: los mantenedores confirmaron (discussions
+[#23522](https://github.com/prisma/prisma/discussions/23522) y
+[#21322](https://github.com/prisma/prisma/discussions/21322)) que el input de unique compuesto
+exige un valor para cada campo aunque sea nullable, y no acepta `null` cómodo. Por eso la baja
+lógica actualiza por `where: { id }`, nunca por el tuple. Apuntarle al tuple sólo es válido con
+un valor concreto (el seed usa `active: true`).
 
 ---
 
@@ -247,11 +258,18 @@ En prod, `entrypoint.sh` corre `migrate deploy` + seed antes de arrancar.
    no solo la ruta del archivo — si no, Prisma intenta ejecutarlo como binario y tira `EACCES`.
 4. Al agregar deps o tocar `validation.ts`, recordá que hay **dos repos**.
 5. `JWT_SECRET=secret` en el `.env` de dev — cambiar antes de cualquier deploy.
-6. **El cliente Prisma generado se desincroniza del schema al cambiar de branch.** Da errores
-   de `tsc` que parecen bugs de código pero no lo son: campos que **sí** están en
-   `schema.prisma` y el cliente no conoce (`Fee.category`), o campos que el cliente exige y no
-   existen en el schema (un `Family.child_id` fantasma). **El fix es `bun run db:generate`, no
-   editar código.** Ante un error de tipos raro de Prisma, regenerá primero.
+6. **El cliente Prisma se desincroniza de tres formas distintas.** Las tres dan errores que
+   parecen bugs de código y no lo son. Identificá cuál es antes de tocar nada:
+
+   | Síntoma | Qué está desfasado | Fix |
+   | --- | --- | --- |
+   | `tsc` se queja de un campo que **sí** está en `schema.prisma` (o exige uno que no está) | cliente generado viejo, schema nuevo | `bun run db:generate` |
+   | En runtime: `The column X does not exist in the current database` (P2022) | cliente nuevo, **base** vieja | aplicar la migración con `prisma db execute --file` |
+   | En runtime: `Unknown argument 'X'` pero `tsc` pasa limpio | cliente ok en disco, **el proceso de `bun dev` tiene el viejo en memoria** | reiniciar `bun dev` (Ctrl+C y de nuevo) |
+
+   El tercero es el más confuso justamente porque `tsc --noEmit` sale en 0: `bun --hot`
+   recarga tu código, pero no vuelve a evaluar el cliente generado. Si regeneraste con el
+   server levantado, reinicialo.
 
 ---
 
