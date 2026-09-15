@@ -28,6 +28,11 @@ export async function findOrCreateFeeForPlace(amount: number, placeId: number): 
   const existente = await prisma.fee.findFirst({
     where: {
       amount,
+      // Acotado a tarifas de cancha: sin esto, una tarifa de disciplina del mismo
+      // monto y lugar (vóley cuesta 9000 las dos cosas) podía quedar compartida
+      // entre la cuota mensual y el alquiler del turno, y después no había forma
+      // de separar los ingresos por concepto en los reportes.
+      kind: "Reserva",
       OR: [
         { schedules: { some: { place_id: placeId } } },
         { bookings: { some: { schedule: { place_id: placeId } } } },
@@ -43,6 +48,7 @@ export async function findOrCreateFeeForPlace(amount: number, placeId: number): 
       // Nombre derivado del lugar y el monto: nadie lo elige, tiene que ser predecible.
       name: `${place.name} — $${amount.toLocaleString("es-AR")}`,
       amount,
+      kind: "Reserva",
       description: "Creada automáticamente al cargar un horario o una reserva.",
     },
     select: { id: true },

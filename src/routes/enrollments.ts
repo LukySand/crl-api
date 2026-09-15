@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
 import { requireAuth, isAdmin } from "../lib/auth";
+import { periodoDe } from "../lib/payment-period";
 
 export const enrollmentsRouter = Router();
 
@@ -193,14 +194,39 @@ enrollmentsRouter.delete("/:id", async (req: Request<{ id: string }>, res: Respo
     }
 
     // Solo si sigue activa: dos bajas en paralelo (doble tap) dejan una sola.
-    const { count } = await prisma.enrollment.updateMany({
-      where: { id, active: true },
-      data: { active: null, left_at: new Date() },
+    const baja = new Date();
+    const { count, anuladas } = await prisma.$transaction(async (tx) => {
+      const { count } = await tx.enrollment.updateMany({
+        where: { id, active: true },
+        data: { active: null, left_at: baja },
+      });
+      if (count === 0) return { count: 0, anuladas: 0 };
+
+      // Las cuotas de meses posteriores a la baja se anulan: si alguien generó
+      // el período que viene por adelantado, al socio que se fue no se le cobra
+      // un mes que no va a cursar.
+      //
+      // El mes de la baja NO se toca: cursó parte de ese mes y el club cobra el
+      // mes completo, sin prorrateo (mismo criterio que cursoEnPeriodo al
+      // generar). Y una cuota ya pagada tampoco: la plata entró de verdad.
+      const { count: anuladas } = await tx.payment.updateMany({
+        where: {
+          enrollment_id: id,
+          status: { in: ["Pendiente", "EnRevision"] },
+          period: { gt: periodoDe(baja) },
+        },
+        data: { status: "Anulado" },
+      });
+      return { count, anuladas };
     });
     if (count === 0) {
       return res.status(409).json({ success: false, error: "La inscripción ya estaba dada de baja" });
     }
-    return res.json({ success: true, message: "Inscripción dada de baja" });
+    return res.json({
+      success: true,
+      message: "Inscripción dada de baja",
+      cuotas_anuladas: anuladas,
+    });
   } catch (error) {
     console.error("Delete enrollment error:", error);
     return res.status(500).json({ success: false, error: "Error al dar de baja la inscripción" });
