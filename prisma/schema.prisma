@@ -25,9 +25,24 @@ model Role {
   id   Int      @id @default(autoincrement())
   name RoleType @unique
 
-  users User[]
+  users      User[]
+  user_roles UserRole[]
 
   @@map("roles")
+}
+
+// Qué roles tiene cada usuario (M:N): una persona puede ser Profesor y Socio a la
+// vez, y los permisos se suman. Reemplaza a `User.role_id`, que admitía uno solo.
+model UserRole {
+  user_id    String   @db.Char(128)
+  role_id    Int
+  created_at DateTime @default(now())
+
+  user User @relation(fields: [user_id], references: [id])
+  role Role @relation(fields: [role_id], references: [id])
+
+  @@id([user_id, role_id]) // un rol no se repite en el mismo usuario
+  @@map("user_roles")
 }
 
 model File {
@@ -51,6 +66,11 @@ model File {
 
 model User {
   id         String   @id @default(uuid())
+
+  // ponytail: DEPRECADO por varios roles. La fuente de verdad es `roles`
+  // (UserRole). Se sigue escribiendo con el rol principal (el de más acceso) para
+  // que las ramas que todavía leen `role` no se rompan mientras migran. Borrarla
+  // en el PR de limpieza, igual que `Discipline.professor_id`.
   role_id    Int
   name       String   @db.VarChar(50)
   last_name  String   @db.VarChar(50)
@@ -63,8 +83,9 @@ model User {
   active     Boolean  @default(true) // baja lógica: false = dado de baja (#46)
   has_credentials Boolean @default(true)
 
-  role Role  @relation(fields: [role_id], references: [id])
-  file File? @relation(fields: [file_id], references: [id])
+  role  Role       @relation(fields: [role_id], references: [id])
+  roles UserRole[] // todos sus roles; los permisos son la suma
+  file  File?      @relation(fields: [file_id], references: [id])
 
   families_as_parent Family[]              @relation("FamilyParent") // hijos a cargo (es el padre/tutor)
   families_as_child  Family[]              @relation("FamilyChild") // vínculos en los que es el hijo

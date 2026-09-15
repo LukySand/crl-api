@@ -69,7 +69,8 @@ src/
 ├── server.ts             # Express: json middleware, /api/health, monta los routers
 ├── lib/
 │   ├── prisma.ts         # cliente Prisma + adapter MariaDB (singleton en dev)
-│   ├── auth.ts           # JWT: requireAuth / requireAdmin / isAdmin — LA canónica
+│   ├── auth.ts           # JWT: requireAuth / requireAdmin / isAdmin / hasRole — LA canónica
+│   ├── roles.ts          # varios roles por usuario: orden, validación y reglas de gestión
 │   ├── booking-date.ts   # reglas temporales de reservas
 │   ├── payment-period.ts # períodos y vencimientos de cuotas
 │   ├── payment.ts        # claves `ref` + serialización de Decimal
@@ -143,8 +144,9 @@ que opere "sobre mí" saca el `id` del token verificado.
 
 ## Modelo de datos
 
-`Role` (enum `SuperAdmin` / `Administrador` / `Profesor` / `Socio`), `User`, `File`, `Family`
-(vincula menores a un tutor responsable).
+`Role` (enum `SuperAdmin` / `Administrador` / `Profesor` / `Socio`), `User`, `UserRole` (los
+roles de cada usuario, ver "Varios roles"), `File`, `Family` (vincula menores a un tutor
+responsable).
 
 Reservas: `Place` (espacio), `Schedule` (turno recurrente: `day_of_week` + TIME, sin fecha),
 `Fee` (tarifa, inmutable, con `kind`) y `Booking` (la reserva: `Schedule` + una fecha concreta).
@@ -180,6 +182,31 @@ Falta el modelo de cuotas, pagos, locales adheridos y publicaciones.
   propia. **La cuenta no se crea hasta tenerlos** → nunca queda una cuenta a medias.
 - Usuarios de Google reciben `password = hash(crypto.randomUUID())`: solo para cumplir el
   `NOT NULL`. Nadie la conoce, no pueden entrar por dni+password.
+
+---
+
+## Varios roles por usuario
+
+Una persona puede tener varios roles (Carolina es Profesor + Socio) y **los permisos se suman**.
+La fuente de verdad es la tabla `UserRole`. Reglas:
+
+- **Chequeá contra la lista, nunca contra un rol suelto.** `requireRole` / `requireAdmin` /
+  `isAdmin(req)` / `hasRole(req, "Profesor")` ya miran `req.user.roles`. Un
+  `req.user.role === "Profesor"` o un `else if` por rol asume que tenés uno solo y se rompe.
+- **Socio es un rol:** paga cuota, tiene tarjeta, puede inscribirse. Un profe que no es socio no
+  se inscribe (`POST /api/enrollments` exige el rol Socio).
+- **`?propias=true`** en `GET /api/bookings`, `/api/payments` y `/api/enrollments` devuelve sólo
+  lo del usuario del token, tenga el rol que tenga. Sin eso, un Admin + Socio vería en "Mis
+  reservas" las de todo el club, y una profe + socia vería sus alumnos en vez de sus
+  inscripciones. La app de socio lo manda; el panel de gestión no. Ver `veComoGestion()`.
+- **Combinaciones:** cualquiera menos SuperAdmin + Administrador. Mínimo un rol. Nadie se saca a
+  sí mismo el rol de gestión. Una cuenta que es o pasa a ser SuperAdmin sólo la toca un
+  SuperAdmin. Todo en `lib/roles.ts`, con tests.
+- **Transición (se borra en el PR de limpieza):** `User.role_id` y el `role` del token quedan
+  DEPRECADOS como espejo del rol principal (el de más acceso), para que las ramas que todavía
+  leen uno solo no se rompan. `/api/admin/users` acepta `roles: [...]` o el `role` suelto y
+  devuelve los dos. Los tokens viejos (sin `roles`) se completan en `readToken`. El seed hace
+  backfill a `UserRole` para las bases de dev armadas con `db push`; en prod lo hace la migración.
 
 ---
 

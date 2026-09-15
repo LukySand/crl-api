@@ -1,9 +1,9 @@
-import { Router, type Response } from "express";
+import { Router, type Request as ExpressRequest, type Response } from "express";
 import { Readable } from "node:stream";
 import { z } from "zod";
 import prisma from "../lib/prisma";
 import { Storage } from "../lib/storage";
-import { authenticate, type AuthedRequest } from "../middleware/auth";
+import { requireAuth } from "../lib/auth";
 import { changePasswordSchema } from "../lib/validation";
 
 const uploadSchema = z.object({
@@ -19,7 +19,7 @@ function formatValidationErrors(issues: z.ZodIssue[]) {
     return errors;
 }
 
-async function readFormData(req: AuthedRequest) {
+async function readFormData(req: ExpressRequest) {
     const request = new Request(`http://localhost${req.originalUrl}`, {
         method: req.method,
         headers: {
@@ -44,12 +44,12 @@ function isUsableFileId(id: unknown): id is string {
 export const socioRouter = Router();
 
 // Todo /api/socio requiere sesión.
-socioRouter.use(authenticate);
+socioRouter.use(requireAuth);
 
 /**
  * GET /api/socio/files?id=... — sirve un archivo almacenado (ej: foto de perfil).
  */
-socioRouter.get("/files", async (req: AuthedRequest, res: Response) => {
+socioRouter.get("/files", async (req: ExpressRequest, res: Response) => {
     try {
         const userId = req.user?.id;
         if (!userId) {
@@ -103,7 +103,7 @@ socioRouter.get("/files", async (req: AuthedRequest, res: Response) => {
 /**
  * PATCH /api/socio/profile-image — reemplaza la foto de perfil del socio logueado.
  */
-socioRouter.patch("/profile-image", async (req: AuthedRequest, res: Response) => {
+socioRouter.patch("/profile-image", async (req: ExpressRequest, res: Response) => {
     try {
         const userId = req.user?.id;
         if (!userId) {
@@ -185,7 +185,7 @@ socioRouter.patch("/profile-image", async (req: AuthedRequest, res: Response) =>
  * Pensado sobre todo para un hijo al que el padre le cargó una contraseña
  * (POST /api/families/:id/credentials) y quiere ponerse una propia.
  */
-socioRouter.patch("/password", async (req: AuthedRequest, res: Response) => {
+socioRouter.patch("/password", async (req: ExpressRequest, res: Response) => {
     try {
         const userId = req.user?.id;
         if (!userId) {

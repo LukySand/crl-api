@@ -111,6 +111,7 @@ familiesRouter.post("/children", async (req: Request, res: Response) => {
           password,
           birth_date: new Date(birth_date),
           role_id: socioRole.id,
+          roles: { create: { role_id: socioRole.id } },
           has_credentials: false,
           file_id: file_id ?? null,
         },

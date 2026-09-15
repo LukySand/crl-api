@@ -2,7 +2,8 @@ import { Router, type Request, type Response } from "express";
 import { OAuth2Client } from "google-auth-library";
 import prisma from "../lib/prisma";
 import { registerSchema } from "../lib/validation";
-import { readToken, signToken, type JWTPayload } from "../lib/auth";
+import { readToken, sessionPayload, signToken } from "../lib/auth";
+import { rolesInclude } from "../lib/roles";
 
 const GOOGLE_CLIENT_ID = process.env.OAUTH_ID || "";
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
@@ -28,7 +29,7 @@ authRouter.post("/login", async (req: Request, res: Response) => {
 
     const user = await prisma.user.findFirst({
       where: { dni },
-      include: { role: true },
+      include: rolesInclude,
     });
 
     if (!user) {
@@ -51,15 +52,7 @@ authRouter.post("/login", async (req: Request, res: Response) => {
       });
     }
 
-    const jwtPayload: JWTPayload = {
-      id: user.id,
-      dni: user.dni,
-      email: user.email,
-      role: user.role.name,
-      name: user.name,
-      last_name: user.last_name,
-      file_id: user.file_id ?? null,
-    };
+    const jwtPayload = sessionPayload(user);
     const token = signToken(jwtPayload);
 
     return res.status(200).json({ success: true, token, user: jwtPayload });
@@ -84,13 +77,13 @@ authRouter.get("/verify", async (req: Request, res: Response) => {
         .json({ success: false, error: "Invalid or expired token" });
     }
 
-    // Rol fresco desde la DB, no del token: así un cambio de rol (o una baja)
-    // hecho en la DB — p. ej. desde Prisma Studio — se refleja sin re-login. Se
-    // re-emite el token con el rol actual para que requireRole (que lee del
-    // token) autorice con ese rol, y front y back queden consistentes.
+    // Roles frescos desde la DB, no del token: así un cambio de roles (o una baja)
+    // hecho desde el panel o desde Prisma Studio se refleja sin re-login. Se
+    // re-emite el token con los roles actuales para que requireRole (que lee del
+    // token) autorice con esos, y front y back queden consistentes.
     const user = await prisma.user.findUnique({
       where: { id: payload.id },
-      include: { role: true },
+      include: rolesInclude,
     });
     if (!user) {
       return res
@@ -104,15 +97,7 @@ authRouter.get("/verify", async (req: Request, res: Response) => {
       });
     }
 
-    const fresh: JWTPayload = {
-      id: user.id,
-      dni: user.dni,
-      email: user.email,
-      role: user.role.name,
-      name: user.name,
-      last_name: user.last_name,
-      file_id: user.file_id ?? null,
-    };
+    const fresh = sessionPayload(user);
     const token = signToken(fresh);
 
     return res.status(200).json({ success: true, token, user: fresh });
@@ -177,20 +162,13 @@ authRouter.post("/register", async (req: Request, res: Response) => {
         password: hashedPassword,
         birth_date: new Date(birth_date),
         role_id: socioRole.id,
+        roles: { create: { role_id: socioRole.id } },
         // Sin foto: se sube después, ya logueado, desde PATCH /api/socio/profile-image.
       },
-      include: { role: true },
+      include: rolesInclude,
     });
 
-    const jwtPayload: JWTPayload = {
-      id: newUser.id,
-      dni: newUser.dni,
-      email: newUser.email,
-      role: newUser.role.name,
-      name: newUser.name,
-      last_name: newUser.last_name,
-      file_id: newUser.file_id ?? null,
-    };
+    const jwtPayload = sessionPayload(newUser);
     const token = signToken(jwtPayload);
 
     return res.status(201).json({ success: true, token, user: jwtPayload });
@@ -269,7 +247,7 @@ authRouter.post("/google", async (req: Request, res: Response) => {
 
     let user = await prisma.user.findFirst({
       where: { email },
-      include: { role: true },
+      include: rolesInclude,
     });
     let created = false;
 
@@ -326,21 +304,14 @@ authRouter.post("/google", async (req: Request, res: Response) => {
           password,
           birth_date: new Date(parsed.data.birth_date),
           role_id: socioRole.id,
+          roles: { create: { role_id: socioRole.id } },
         },
-        include: { role: true },
+        include: rolesInclude,
       });
       created = true;
     }
 
-    const jwtPayload: JWTPayload = {
-      id: user.id,
-      dni: user.dni,
-      email: user.email,
-      role: user.role.name,
-      name: user.name,
-      last_name: user.last_name,
-      file_id: user.file_id ?? null,
-    };
+    const jwtPayload = sessionPayload(user);
     const token = signToken(jwtPayload);
 
     return res

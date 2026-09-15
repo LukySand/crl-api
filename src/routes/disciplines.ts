@@ -1,7 +1,8 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
-import { requireAuth, requireAdmin } from "../lib/auth";
+import { requireAuth, requireAdmin, isAdmin, hasRole } from "../lib/auth";
+import { nombresDeRoles, rolesInclude } from "../lib/roles";
 import { TIME, toTime } from "../lib/time";
 import { periodoDe } from "../lib/payment-period";
 
@@ -124,18 +125,18 @@ async function invalidFee(feeId: number | null | undefined): Promise<string | nu
   return null;
 }
 
-// Los profesores asignados tienen que ser Users con rol Profesor (no Socios/Admins).
+// Los profesores asignados tienen que tener el rol Profesor (además pueden tener otros).
 // Devuelve un mensaje de error si alguno no sirve, o null si están todos bien.
 async function invalidProfessors(ids: string[] | undefined): Promise<string | null> {
   if (!ids?.length) return null;
   const encontrados = await prisma.user.findMany({
     where: { id: { in: ids } },
-    include: { role: true },
+    include: rolesInclude,
   });
   if (encontrados.length !== ids.length) {
     return ids.length === 1 ? "El profesor asignado no existe" : "Alguno de los profesores no existe";
   }
-  const noProfe = encontrados.find((u) => u.role.name !== "Profesor");
+  const noProfe = encontrados.find((u) => !nombresDeRoles(u).includes("Profesor"));
   if (noProfe) {
     return `${noProfe.name} ${noProfe.last_name} no es un profesor`;
   }
@@ -359,10 +360,11 @@ disciplinesRouter.patch(
       if (!disc) {
         return res.status(404).json({ success: false, error: "Disciplina no encontrada" });
       }
-      const esAdmin = req.user!.role === "Administrador";
+      // Gestión incluye a SuperAdmin: antes comparaba sólo con "Administrador".
+      const esAdmin = isAdmin(req);
       // Cualquiera de los profes que la dicta puede marcar el cupo (#6).
       const esProfeAsignado =
-        req.user!.role === "Profesor" && disc.professors.some((p) => p.professor_id === req.user!.id);
+        hasRole(req, "Profesor") && disc.professors.some((p) => p.professor_id === req.user!.id);
       if (!esAdmin && !esProfeAsignado) {
         return res.status(403).json({ success: false, error: "No tenés permisos para esta acción" });
       }
@@ -430,10 +432,10 @@ async function denyScheduleEdit(
     select: { professors: { select: { professor_id: true } } },
   });
   if (!discipline) return { status: 404, error: "Disciplina no encontrada" };
-  if (req.user?.role === "Administrador") return null;
+  if (isAdmin(req)) return null; // incluye a SuperAdmin
   // Cualquiera de los profes que la dicta (#6), no solo el primero.
   if (
-    req.user?.role === "Profesor" &&
+    hasRole(req, "Profesor") &&
     discipline.professors.some((p) => p.professor_id === req.user!.id)
   ) {
     return null;
