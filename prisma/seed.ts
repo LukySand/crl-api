@@ -976,8 +976,85 @@ async function seedBookingEnVentana(
   }
 }
 
+/**
+ * Reservas históricas de ejemplo (una por cancha y por semana, mirando atrás).
+ *
+ * Sin esto, `/reports/series?by=espacio` resuelve el espacio vía
+ * `booking.schedule.place` (ver reports.ts) y sólo tiene las reservas de la
+ * semana actual: el gráfico de facturación por cancha queda con una sola
+ * columna en vez de una serie. Van directo a Confirmada (con alguna Cancelada
+ * suelta) porque son turnos ya jugados — nadie tiene una reserva "pendiente"
+ * de hace tres meses.
+ *
+ * Arranca en la semana 3 (no en la 1) para no pisar el turno de `pasada` /
+ * `pasadaMartin`, que ya usan las semanas -1 y -2.
+ */
+const SEMANAS_HISTORIAL_RESERVAS = 20; // ~5 meses
+
+/** UUID determinístico por índice, para que re-sembrar actualice en vez de duplicar. */
+function idReservaHistorica(indice: number): string {
+  return `d0000000-0000-4000-8000-${String(indice).padStart(12, "0")}`;
+}
+
+async function seedHistoricalBookings(
+  schedules: Map<string, { id: number; fee_id: number; day_of_week: number }>,
+) {
+  const socios = [
+    USER.socioMartin,
+    USER.socioLucia,
+    USER.socioRodrigo,
+    USER.socioValentina,
+  ];
+
+  let indice = 0;
+  let creadas = 0;
+
+  for (
+    let semanasAtras = 3;
+    semanasAtras <= SEMANAS_HISTORIAL_RESERVAS;
+    semanasAtras++
+  ) {
+    for (const c of CANCHAS) {
+      const dia = c.dias[semanasAtras % c.dias.length]!;
+      const hora = c.horas[semanasAtras % c.horas.length]!;
+      const feeName = esNoche(hora) ? feeNoche(c.fee) : c.fee;
+      const schedule = schedules.get(`${c.place}|${dia}|${hora}`);
+      if (!schedule) continue;
+
+      // Un cliente que canceló cada tanto, para que el reporte de ingresos no
+      // muestre una cancha con el 100% de sus turnos cobrados.
+      const status =
+        semanasAtras % 9 === 0 ? ("Cancelada" as const) : ("Confirmada" as const);
+
+      const data = {
+        schedule_id: schedule.id,
+        fee_id: schedule.fee_id,
+        user_id: socios[indice % socios.length]!,
+        date: dateForDayOfWeek(dia, -semanasAtras),
+        status,
+        notes: null,
+        active: status === "Cancelada" ? null : true,
+      };
+
+      try {
+        await prisma.booking.upsert({
+          where: { id: idReservaHistorica(indice) },
+          update: data,
+          create: { id: idReservaHistorica(indice), ...data },
+        });
+        creadas++;
+      } catch (error: any) {
+        if (error?.code !== "P2002") throw error;
+      }
+      indice++;
+      void feeName; // solo para elegir bien la tarifa nocturna vía `schedule`, ya resuelta arriba
+    }
+  }
+  console.log(`Reservas históricas listas (${creadas}).`);
+}
+
 /** Cuántos meses hacia atrás se siembran cuotas de disciplina. */
-const MESES_DE_HISTORIAL = 3;
+const MESES_DE_HISTORIAL = 5;
 
 /** "YYYY-MM" de N meses atrás, contando desde el mes corriente. */
 function periodoAtras(meses: number): string {
@@ -1148,6 +1225,7 @@ async function main() {
   const placeIds = await seedPlaces();
   const schedules = await seedSchedules(placeIds, feeIds);
   await seedBookings(schedules);
+  await seedHistoricalBookings(schedules);
   await seedBookingEnVentana(placeIds, feeIds);
 
   const disciplineIds = await seedDisciplines(placeIds, feeIds);
