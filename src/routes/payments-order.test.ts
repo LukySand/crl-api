@@ -52,3 +52,10 @@ test("/resumen: no falla con vencimientos nulos y el próximo es el primero no n
   expect(res.status).toBe(200);
   expect(String(res.body.resumen.proximo_vencimiento).slice(0, 10)).toBe("2031-01-01");
 });
+
+test("listado admin: vencimiento nulo al final (orden descendente)", async () => {
+  const { admin, socio } = await escenario();
+  const res = await api("GET", `/api/payments?user_id=${socio.id}`, { token: admin.token });
+  expect(res.status).toBe(200);
+  expect(res.body.payments.map((p: any) => p.name)).toEqual(["lejano", "cercano", "sin-vencimiento"]);
+});
