@@ -27,6 +27,7 @@ import { auditar } from "../lib/audit";
 import { accionesPermitidas, CONCEPTO_CUOTA_SOCIAL, estadoCuota, type Accion } from "../lib/payment-rules";
 import {
   crearLiquidacionMP,
+  esConflictoDeEscritura,
   liquidacionViva,
   PagoEnCurso,
   puedePagarPor,
@@ -889,23 +890,30 @@ paymentsRouter.post("/:id/revertir", requireAdmin, async (req: Request<{ id: str
     }
 
     const filas = liq.items.map((i) => i.payment.id);
-    const ok = await prisma.$transaction(async (tx) => {
-      const { count } = await tx.paymentTransaction.updateMany({
-        where: { id: liq.id, status: "Aprobado" },
-        data: {
-          status: "Anulado",
-          voided_by: req.user!.id,
-          voided_reason: parsed.data.reason,
-          voided_at: new Date(),
-        },
+    let ok: boolean;
+    try {
+      ok = await prisma.$transaction(async (tx) => {
+        const { count } = await tx.paymentTransaction.updateMany({
+          where: { id: liq.id, status: "Aprobado" },
+          data: {
+            status: "Anulado",
+            voided_by: req.user!.id,
+            voided_reason: parsed.data.reason,
+            voided_at: new Date(),
+          },
+        });
+        if (count === 0) return false;
+        await tx.payment.updateMany({
+          where: { id: { in: filas }, status: "Pagado" },
+          data: { status: "Pendiente", method: null, paid_at: null, registered_by: null },
+        });
+        return true;
       });
-      if (count === 0) return false;
-      await tx.payment.updateMany({
-        where: { id: { in: filas }, status: "Pagado" },
-        data: { status: "Pendiente", method: null, paid_at: null, registered_by: null },
-      });
-      return true;
-    });
+    } catch (e) {
+      // Perdió la carrera contra otro revertir: mismo resultado que ver la liquidación ya anulada.
+      if (!esConflictoDeEscritura(e)) throw e;
+      ok = false;
+    }
     if (!ok) {
       return res.status(409).json({ success: false, error: "Ese cobro ya fue revertido" });
     }

@@ -138,6 +138,21 @@ test("revertir: motivo obligatorio, deja la liquidacion Anulado visible y las fi
   expect((await api("POST", `/api/payments/${a.id}/revertir`, { token: admin.token, body: { reason: "otra vez" } })).status).toBe(409);
 });
 
+test("revertir concurrente: uno 200 y el otro 409 (nunca 500)", async () => {
+  const admin = await makeUser({ roles: ["Administrador"] });
+  const socio = await makeUser({ roles: ["Socio"] });
+  const a = await cuota(socio.id, "Otro");
+  const b = await cuota(socio.id, "Otro");
+  const c = await api("POST", "/api/payments/cobro", { token: admin.token, body: { payment_ids: [a.id, b.id] } });
+  const body = { reason: "error de carga" };
+  const rs = await Promise.all([
+    api("POST", `/api/payments/${a.id}/revertir`, { token: admin.token, body }),
+    api("POST", `/api/payments/${b.id}/revertir`, { token: admin.token, body }),
+  ]);
+  expect(rs.map((r) => r.status).sort()).toEqual([200, 409]);
+  expect((await prisma.paymentTransaction.findUniqueOrThrow({ where: { id: c.body.liquidacion.id } })).status).toBe("Anulado");
+});
+
 test("revertir: cobro de MP y cobro con reserva son 409", async () => {
   const admin = await makeUser({ roles: ["Administrador"] });
   const socio = await makeUser({ roles: ["Socio"] });
