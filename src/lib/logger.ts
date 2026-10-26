@@ -115,6 +115,15 @@ export class Logger {
         }
     }
 
+    /**
+     * Vacía el buffer ahora y espera a que termine (tests y cierres ordenados).
+     * Si ya hay un flush en curso espera a ese y después vacía lo que quedó.
+     */
+    public async flush(): Promise<void> {
+        while (this.flushing) await new Promise((r) => setTimeout(r, 5));
+        await this.flushBuffer();
+    }
+
     private async flushBuffer(): Promise<void> {
         if(this.flushing || this.buffer.length === 0) {
             return;
