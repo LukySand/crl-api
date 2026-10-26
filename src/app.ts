@@ -16,6 +16,7 @@ import { partnerStoresRouter } from "./routes/partner-stores";
 import { novedadesRouter } from "./routes/novedades";
 import { blocksRouter } from "./routes/blocks";
 import { settingsRouter } from "./routes/settings";
+import { transactionsRouter } from "./routes/transactions";
 import { webhooksRouter } from "./routes/webhooks";
 import { chargeTypesRouter, recurringTemplatesRouter } from "./routes/charge-catalog";
 
@@ -47,6 +48,7 @@ export function createApp() {
   app.use("/api/settings", settingsRouter);
   app.use("/api/charge-types", chargeTypesRouter);
   app.use("/api/recurring-templates", recurringTemplatesRouter);
+  app.use("/api/transactions", transactionsRouter);
   app.use("/api/webhooks", webhooksRouter);
   return app;
 }

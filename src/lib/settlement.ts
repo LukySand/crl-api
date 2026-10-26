@@ -3,7 +3,7 @@
  * `PaymentTransaction` + sus items y actualiza, en la MISMA transacción de base,
  * los campos desnormalizados de cada fila (`status/method/paid_at/registered_by`).
  */
-import type { Prisma, PaymentMethod } from "../../prisma/generated/client";
+import { Prisma, type PaymentMethod } from "../../prisma/generated/client";
 import prisma from "./prisma";
 import { bloqueantesDeOrden } from "./payment-rules";
 
@@ -148,4 +148,42 @@ export async function puedePagarPor(
     select: { id: true },
   });
   return vinculo !== null;
+}
+
+/** Otro checkout se adelantó con alguna de las filas (la carrera, D8). */
+export class PagoEnCurso extends Error {
+  constructor(readonly viva: { id: string; expires_at: Date | null; checkout_url: string | null }) {
+    super("Hay un pago en curso para esta cuota");
+  }
+}
+
+/**
+ * Liquidación de MP `Pendiente` con sus items, en una transacción. Bloquea las filas
+ * (`FOR UPDATE`) y vuelve a mirar `liquidacionViva` adentro: dos checkouts simultáneos
+ * se serializan y el segundo recibe `PagoEnCurso`.
+ */
+export async function crearLiquidacionMP(args: {
+  userId: string;
+  filas: FilaASaldar[];
+  expiresAt: Date;
+}): Promise<{ id: string; total: number }> {
+  const total = args.filas.reduce((acc, f) => acc + Math.round(Number(f.amount) * 100), 0) / 100;
+  return prisma.$transaction(async (tx) => {
+    const ids = args.filas.map((f) => f.id);
+    await tx.$queryRaw`SELECT id FROM \`payments\` WHERE id IN (${Prisma.join(ids)}) FOR UPDATE`;
+    const viva = await liquidacionViva(ids, tx);
+    if (viva) throw new PagoEnCurso(viva);
+    const liq = await tx.paymentTransaction.create({
+      data: {
+        user_id: args.userId,
+        method: "MercadoPago",
+        status: "Pendiente",
+        amount: total,
+        expires_at: args.expiresAt,
+        items: { create: args.filas.map((f) => ({ payment_id: f.id, amount: f.amount as never })) },
+      },
+      select: { id: true },
+    });
+    return { id: liq.id, total };
+  });
 }

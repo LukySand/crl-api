@@ -26,10 +26,14 @@ import {
 import { auditar } from "../lib/audit";
 import { accionesPermitidas, CONCEPTO_CUOTA_SOCIAL, estadoCuota, type Accion } from "../lib/payment-rules";
 import {
+  crearLiquidacionMP,
   liquidacionViva,
+  PagoEnCurso,
+  puedePagarPor,
   registrarCobroManual,
   verificarOrdenDePago,
 } from "../lib/settlement";
+import { accessToken, createPreference } from "../lib/mercadopago";
 import type { PaymentMethod, PaymentStatus, Prisma, TransactionStatus } from "../../prisma/generated/client";
 import { emitirCargos } from "../lib/emission";
 import { refUnico, serializePayment, serializePayments, toNumber } from "../lib/payment";
@@ -709,6 +713,106 @@ async function cobrarFilas(req: Request, res: Response, ids: string[], body: unk
     payment: payments[0] && serializePayment(payments[0]),
   });
 }
+
+const HORAS_PARA_PAGAR = 24;
+
+const pagoEnCursoBody = (v: { id: string; expires_at: Date | null; checkout_url: string | null }) => ({
+  id: v.id,
+  vence: v.expires_at?.toISOString() ?? null,
+  checkout_url: v.checkout_url,
+});
+
+/**
+ * POST /api/payments/checkout { payment_ids } — el socio (o su tutor) paga cuotas con MP (D13).
+ * Orden: 400 → 404 → 400 socios distintos → 403 → 400 Reserva → 409 cuotas → 409 orden_de_pago
+ * → 409 pago_en_curso → 400 total 0 → 502. Va antes de "/:id".
+ */
+paymentsRouter.post("/checkout", async (req: Request, res: Response) => {
+  try {
+    const ids = z.array(z.string().min(1)).min(1).max(50).safeParse(req.body?.payment_ids);
+    if (!ids.success) {
+      return res.status(400).json({ success: false, error: "payment_ids es obligatorio" });
+    }
+    const unicos = [...new Set(ids.data)];
+    const filas = await prisma.payment.findMany({
+      where: { id: { in: unicos } },
+      select: { id: true, user_id: true, concept: true, status: true, amount: true, name: true, due_date: true, deleted_at: true },
+    });
+    if (filas.length !== unicos.length) {
+      return res.status(404).json({ success: false, error: "Cuota no encontrada" });
+    }
+    const deudorId = filas[0]!.user_id;
+    if (filas.some((f) => f.user_id !== deudorId)) {
+      return res.status(400).json({ success: false, error: "Las cuotas tienen que ser del mismo socio" });
+    }
+    if (!(await puedePagarPor({ id: req.user!.id, esGestion: isAdmin(req) }, deudorId))) {
+      return res.status(403).json({ success: false, error: "No podés pagar estas cuotas" });
+    }
+    if (filas.some((f) => f.concept === "Reserva")) {
+      return res.status(400).json({ success: false, error: "Una reserva se paga desde Mis reservas" });
+    }
+    const noPagables = filas.filter((f) => f.status !== "Pendiente" || f.deleted_at);
+    if (noPagables.length > 0) {
+      return res.status(409).json({
+        success: false,
+        error: "Hay cuotas que ya no se pueden pagar",
+        cuotas: noPagables.map((f) => ({
+          id: f.id,
+          estado: estadoCuota({ status: f.deleted_at ? "Anulado" : f.status, due_date: f.due_date ? f.due_date.toISOString().slice(0, 10) : null }),
+        })),
+      });
+    }
+    const orden = await verificarOrdenDePago(deudorId, unicos);
+    if (orden) {
+      return res.status(409).json({ success: false, error: "Hay cuotas anteriores sin pagar", orden_de_pago: orden });
+    }
+    const viva = await liquidacionViva(unicos);
+    if (viva) {
+      return res.status(409).json({ success: false, error: "Hay un pago en curso para esta cuota", pago_en_curso: pagoEnCursoBody(viva) });
+    }
+    const centavos = filas.reduce((acc, f) => acc + Math.round(Number(f.amount) * 100), 0);
+    if (centavos <= 0) {
+      return res.status(400).json({ success: false, error: "No hay nada para pagar" });
+    }
+    if (!accessToken()) {
+      return res.status(502).json({ success: false, error: "El pago con Mercado Pago no está disponible" });
+    }
+
+    const vence = new Date(Date.now() + HORAS_PARA_PAGAR * 3600_000);
+    const liq = await crearLiquidacionMP({ userId: req.user!.id, filas, expiresAt: vence });
+    try {
+      const pagador = await prisma.user.findUnique({ where: { id: req.user!.id }, select: { email: true } });
+      const pref = await createPreference({
+        externalReference: liq.id,
+        items: filas.map((f) => ({ title: f.name, quantity: 1, unit_price: Number(f.amount) })),
+        payerEmail: pagador?.email,
+        backUrlBase: process.env.MP_BACK_URL_BASE || "http://localhost:3000",
+        notificationUrl: process.env.MP_NOTIFICATION_URL || undefined,
+        expiresAt: vence,
+      });
+      await prisma.paymentTransaction.update({
+        where: { id: liq.id },
+        data: { mp_preference_id: pref.id, checkout_url: pref.init_point },
+      });
+      return res.status(201).json({
+        success: true,
+        pago: { id: liq.id, monto: liq.total.toFixed(2), vence: vence.toISOString() },
+        checkout_url: pref.init_point,
+      });
+    } catch (error) {
+      // MP falló: la liquidación no puede quedar viva bloqueando las filas.
+      await prisma.paymentTransaction.update({ where: { id: liq.id }, data: { status: "Cancelado" } });
+      console.error("Checkout Mercado Pago error:", error);
+      return res.status(502).json({ success: false, error: "No pudimos iniciar el pago con Mercado Pago" });
+    }
+  } catch (error) {
+    if (error instanceof PagoEnCurso) {
+      return res.status(409).json({ success: false, error: error.message, pago_en_curso: pagoEnCursoBody(error.viva) });
+    }
+    console.error("Checkout error:", error);
+    return res.status(500).json({ success: false, error: "Error al iniciar el pago" });
+  }
+});
 
 /**
  * POST /api/payments/cobro — cobro manual de varias cuotas del mismo socio en una
