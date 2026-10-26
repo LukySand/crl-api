@@ -1,8 +1,9 @@
 /**
  * Tareas programadas del proceso. Se arma de a poco: B3 registra la emisión
- * diaria; la conciliación de Mercado Pago (cada 15 min) y el vencimiento de holds se suman en
- * sus slices. `DISABLE_CRON=true` lo apaga (tests, segundas instancias).
+ * diaria; la conciliación de Mercado Pago y el barrido de reembolsos (cada 15 min) y el vencimiento
+ * de holds de reservas (cada minuto). `DISABLE_CRON=true` lo apaga (tests, segundas instancias).
  */
+import { liberarReservasVencidas } from "./booking-hold";
 import { emitirCargos } from "./emission";
 import { logger } from "./logger";
 import { todayInClub } from "./payment-period";
@@ -40,5 +41,11 @@ export function startScheduler(): void {
     } catch (error) {
       logger.error(error, "Reintento de reembolsos falló");
     }
+  });
+
+  // Hold de 5 minutos de las reservas pagadas con MP desde la app de socio (D14).
+  Bun.cron("* * * * *", async () => {
+    const n = await liberarReservasVencidas(); // nunca lanza
+    if (n > 0) logger.info(`Reservas liberadas por vencer el plazo de pago: ${n}`);
   });
 }

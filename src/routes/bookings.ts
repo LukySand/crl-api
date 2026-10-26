@@ -5,7 +5,9 @@ import { requireAuth, isAdmin, veComoGestion } from "../lib/auth";
 import { findOrCreateFeeForPlace } from "../lib/fee";
 import { METODOS_MANUALES } from "../lib/cobro";
 import { refReserva } from "../lib/payment";
-import { saldarItems } from "../lib/settlement";
+import { liquidacionViva, saldarItems } from "../lib/settlement";
+import { accessToken, createPreference } from "../lib/mercadopago";
+import { liberarReservasVencidas } from "../lib/booking-hold";
 import { bloqueaTurno } from "../lib/schedule-block";
 import { getAjustes } from "../lib/settings-db";
 import { bloqueoQueCierra, bloqueosDelDia } from "../lib/schedule-block-db";
@@ -17,6 +19,8 @@ import {
   timeToHHMM,
   ultimaFechaReservable,
   dentroDeVentanaCancelacion,
+  hayTiempoParaPagar,
+  MINUTOS_PARA_PAGAR_RESERVA,
 } from "../lib/booking-date";
 
 export const bookingsRouter = Router();
@@ -142,6 +146,9 @@ bookingsRouter.get("/availability", async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: "Fecha inválida" });
     }
 
+    // Si el cron estuvo caído, el primero que mira la grilla suelta los holds vencidos.
+    await liberarReservasVencidas();
+
     const [rows, turnos, bloqueos] = await Promise.all([
       prisma.booking.findMany({
         // active: true deja afuera las canceladas (que quedan en null y liberan el turno)
@@ -200,6 +207,49 @@ bookingsRouter.get("/:id", async (req: Request<{ id: string }>, res: Response) =
   } catch (error) {
     console.error("Get booking error:", error);
     return res.status(500).json({ success: false, error: "Error al obtener la reserva" });
+  }
+});
+
+/**
+ * POST /api/bookings/:id/checkout — retoma el pago de una reserva en hold.
+ *
+ * Sólo el dueño (la gestión no paga por otro). Devuelve el `checkout_url` de la liquidación
+ * viva: nunca crea otra preferencia, así que nunca hay dos pagos vivos para la misma reserva.
+ */
+bookingsRouter.post("/:id/checkout", async (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const booking = await prisma.booking.findUnique({
+      where: { id: req.params.id },
+      select: { user_id: true, status: true, active: true, payment: { select: { id: true } } },
+    });
+    if (!booking) {
+      return res.status(404).json({ success: false, error: "Reserva no encontrada" });
+    }
+    if (booking.user_id !== req.user!.id) {
+      return res.status(403).json({ success: false, error: "No tenés permisos para esta acción" });
+    }
+    if (booking.status !== "Pendiente" || !booking.active || !booking.payment) {
+      return res.status(409).json({ success: false, error: "Esta reserva no tiene un pago pendiente" });
+    }
+
+    const viva = await liquidacionViva([booking.payment.id]);
+    if (!viva) {
+      return res.status(409).json({ success: false, error: "El plazo para pagar esta reserva ya venció" });
+    }
+    if (!viva.checkout_url) {
+      return res.status(409).json({
+        success: false,
+        error: "No se pudo recuperar el link de pago. Cancelá la reserva e intentá de nuevo.",
+      });
+    }
+    return res.json({
+      success: true,
+      checkout_url: viva.checkout_url,
+      vence: viva.expires_at?.toISOString() ?? null,
+    });
+  } catch (error) {
+    console.error("Resume booking checkout error:", error);
+    return res.status(500).json({ success: false, error: "Error al retomar el pago" });
   }
 });
 
@@ -292,7 +342,7 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
     const schedule = await prisma.schedule.findUnique({
       where: { id: schedule_id },
       include: {
-        place: { select: { active: true } },
+        place: { select: { active: true, name: true } },
         // El monto se congela en el pago, así que hace falta acá y no sólo el fee_id.
         fee: { select: { amount: true } },
       },
@@ -356,11 +406,34 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
     // La gestión puede darla por paga en el acto (cobró en el club).
     const cobrada = admin && parsed.data.status === "Confirmada";
 
+    // Pago en el acto (D14): la reserva de la app de socio (o de la gestión con `?propias=true`),
+    // para sí mismo y sin `status`. Con monto > 0 retiene el turno MINUTOS_PARA_PAGAR_RESERVA
+    // mientras paga por MP; con monto 0 nace confirmada y paga. El mostrador no pasa por acá.
+    const propia = !veComoGestion(req) && userId === req.user!.id && parsed.data.status === undefined;
+    const gratis = propia && Number(monto) === 0;
+    const pagaEnElActo = propia && Number(monto) > 0;
+
+    if (pagaEnElActo) {
+      if (!hayTiempoParaPagar(when, schedule.start_time)) {
+        return res.status(400).json({
+          success: false,
+          error: `Faltan menos de ${MINUTOS_PARA_PAGAR_RESERVA} minutos para el turno: ya no alcanza el tiempo para pagarlo`,
+        });
+      }
+      if (!accessToken()) {
+        return res.status(502).json({ success: false, error: "El pago con Mercado Pago no está disponible" });
+      }
+    }
+
+    // Un hold vencido que el cron todavía no soltó no puede frenar esta reserva.
+    await liberarReservasVencidas();
+
     // La reserva y su cobro nacen juntos o no nace ninguno: si el INSERT del
     // pago fallara aparte, quedaría una cancha ocupada que no le figura a nadie
     // como deuda. El P2002 del turno duplicado sigue saliendo del create de
     // abajo y se maneja en el catch igual que antes.
-    const booking = await prisma.$transaction(async (tx) => {
+    const vence = new Date(Date.now() + MINUTOS_PARA_PAGAR_RESERVA * 60_000);
+    const { booking, pago, liquidacionId } = await prisma.$transaction(async (tx) => {
       const creada = await tx.booking.create({
         data: {
           schedule_id,
@@ -369,6 +442,7 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
           date: when,
           notes,
           ...(admin && parsed.data.status ? { status: parsed.data.status } : {}),
+          ...(gratis ? { status: "Confirmada" as const } : {}),
           active: true,
         },
         include: bookingInclude,
@@ -387,6 +461,7 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
           // Vence el día del turno: se juega pagando.
           due_date: when,
           ref: refReserva(creada.id),
+          ...(gratis ? { status: "Pagado" as const, paid_at: new Date() } : {}),
         },
       });
 
@@ -400,8 +475,75 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
         });
       }
 
-      return creada;
+      // El hold: liquidación de MP `Pendiente` que vence a los 5 minutos. La fila es nueva, así
+      // que no hay otra liquidación viva con la que competir (no hace falta `crearLiquidacionMP`).
+      const liq = pagaEnElActo
+        ? await tx.paymentTransaction.create({
+            data: {
+              user_id: userId,
+              method: "MercadoPago",
+              status: "Pendiente",
+              amount: monto,
+              expires_at: vence,
+              items: { create: [{ payment_id: pagoCreado.id, amount: monto as never }] },
+            },
+            select: { id: true },
+          })
+        : null;
+
+      return { booking: creada, pago: pagoCreado, liquidacionId: liq?.id ?? null };
     });
+
+    if (liquidacionId) {
+      try {
+        const socio = await prisma.user.findUnique({ where: { id: userId }, select: { email: true } });
+        // ponytail: sin `expiresAt`. MP exige 1-30 días de vigencia, así que una preferencia de
+        // 5 minutos se rechazaría entera; el hold es nuestro y lo vigila `liberarReservasVencidas`.
+        const pref = await createPreference({
+          externalReference: liquidacionId,
+          items: [
+            {
+              title: `Reserva ${schedule.place.name ?? "espacio"} — ${date} ${timeToHHMM(schedule.start_time)}`,
+              quantity: 1,
+              unit_price: Number(monto),
+            },
+          ],
+          payerEmail: socio?.email,
+          backUrlBase: process.env.MP_BACK_URL_BASE || "http://localhost:3000",
+          notificationUrl: process.env.MP_NOTIFICATION_URL || undefined,
+        });
+        await prisma.paymentTransaction.update({
+          where: { id: liquidacionId },
+          data: { mp_preference_id: pref.id, checkout_url: pref.init_point },
+        });
+        return res.status(201).json({
+          success: true,
+          booking,
+          pago: { id: liquidacionId, monto: Number(monto).toFixed(2), vence: vence.toISOString() },
+          checkout_url: pref.init_point,
+        });
+      } catch (error) {
+        // Sin MP no hay cómo cobrar, y una reserva que no se puede cobrar no retiene el turno.
+        console.error("Create booking payment error:", error);
+        try {
+          await prisma.$transaction([
+            prisma.paymentTransaction.update({ where: { id: liquidacionId }, data: { status: "Cancelado" } }),
+            prisma.payment.updateMany({
+              where: { id: pago.id, status: "Pendiente" },
+              data: { status: "Anulado", resolved_by: "sistema", resolved_reason: "No se pudo iniciar el pago", resolved_at: new Date() },
+            }),
+            prisma.booking.updateMany({ where: { id: booking.id }, data: { status: "Cancelada", active: null } }),
+          ]);
+        } catch (e) {
+          // El barrido del hold la suelta igual al vencer el plazo.
+          console.error("Release booking after MP failure error:", e);
+        }
+        return res.status(502).json({
+          success: false,
+          error: "No se pudo iniciar el pago. La reserva no se tomó, probá de nuevo.",
+        });
+      }
+    }
 
     return res.status(201).json({ success: true, booking });
   } catch (error: any) {
@@ -473,6 +615,20 @@ bookingsRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response)
       return res
         .status(403)
         .json({ success: false, error: "Solo un administrador puede registrar el cobro" });
+    }
+
+    // Con un pago de MP en curso, confirmar o repuntear la reserva lo desalinearía con lo que el
+    // socio está pagando (D14): se espera a que pague o venza.
+    if (status === "Confirmada" || amount !== undefined) {
+      const fila = await prisma.payment.findUnique({ where: { booking_id: req.params.id }, select: { id: true } });
+      const viva = fila ? await liquidacionViva([fila.id]) : null;
+      if (viva) {
+        return res.status(409).json({
+          success: false,
+          error: "Hay un pago en curso para esta reserva",
+          pago_en_curso: { id: viva.id, vence: viva.expires_at?.toISOString() ?? null },
+        });
+      }
     }
 
     // No toca Schedule.fee_id: el resto de las reservas de ese turno sigue

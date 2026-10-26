@@ -8,6 +8,7 @@ import type { Prisma, TransactionStatus } from "../../prisma/generated/client";
 import prisma from "./prisma";
 import { logger } from "./logger";
 import { getPayment, listRefunds, mapEstadoMP, searchPaymentsByExternalReference } from "./mercadopago";
+import { resolverReserva } from "./booking-hold";
 import { aprobarReembolso, efectosDeReembolso, reembolsarItem } from "./refunds";
 
 type Mp = Record<string, any>;
@@ -24,10 +25,10 @@ export const LIQ_SELECT = {
 
 export type LiquidacionMP = Prisma.PaymentTransactionGetPayload<{ select: typeof LIQ_SELECT }>;
 
-/** Un item que no pudo saldar su fila: la plata tiene que volver (B6) o retomar la reserva (B7). */
+/** Un item que no pudo saldar su fila: la plata tiene que volver (D12) salvo que la reserva se retome (D14). */
 export interface ItemNoSaldado {
   payment_id: string | null;
-  motivo: "monto-inconsistente" | "cancelada" | "fila-no-saldable";
+  motivo: "monto-inconsistente" | "cancelada" | "fila-no-saldable" | "reserva-perdida";
 }
 
 export interface ResultadoMP {
@@ -111,7 +112,10 @@ export async function aplicarPagoMP(mp: Mp, liq: LiquidacionMP): Promise<Resulta
             },
           });
           if (saldada === 0) {
-            noSaldados.push({ payment_id: f.id, motivo: "fila-no-saldable" });
+            // Aprobación tardía de una reserva que el hold soltó: se retoma si el turno sigue libre.
+            const esReserva = f.concept === "Reserva" && f.booking_id;
+            if (esReserva && (await resolverReserva(tx, f.id, aprobadoEn ?? new Date()))) continue;
+            noSaldados.push({ payment_id: f.id, motivo: esReserva ? "reserva-perdida" : "fila-no-saldable" });
           } else if (f.concept === "Reserva" && f.booking_id) {
             await tx.booking.updateMany({
               where: { id: f.booking_id, status: "Pendiente" },
@@ -164,7 +168,7 @@ export async function aplicarPagoMP(mp: Mp, liq: LiquidacionMP): Promise<Resulta
   });
   if (!aplicado) return null;
 
-  // La plata que no pudo saldar una fila vuelve sola (D12); la reserva la retoma B7.
+  // La plata que no pudo saldar una fila vuelve sola (D12); la reserva ya tuvo su retome en la transacción.
   for (const n of noSaldados) {
     try {
       await reembolsarItem({
