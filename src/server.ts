@@ -15,6 +15,7 @@ import { paymentsRouter } from "./routes/payments";
 import { reportsRouter } from "./routes/reports";
 import { partnerStoresRouter } from "./routes/partner-stores";
 import { novedadesRouter } from "./routes/novedades";
+import { blocksRouter } from "./routes/blocks";
 
 const app = express();
 app.use(express.json());
@@ -38,6 +39,7 @@ app.use("/api/payments", paymentsRouter);
 app.use("/api/reports", reportsRouter);
 app.use("/api/partner-stores", partnerStoresRouter);
 app.use("/api/novedades", novedadesRouter);
+app.use("/api/blocks", blocksRouter);
 
 const port = Number(process.env.PORT ?? 3001);
 app.listen(port, () => {

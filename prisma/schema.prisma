@@ -194,6 +194,7 @@ model Place {
   file        File?        @relation(fields: [file_id], references: [id])
   schedules   Schedule[]
   disciplines Discipline[]
+  blocks      ScheduleBlock[]
 
   @@map("places")
 }
@@ -430,4 +431,27 @@ model NovedadLink {
   created_at DateTime @default(now())
 
   @@map("novedad_links")
+}
+
+// Bloqueo temporal de un espacio: no se puede reservar en ese rango de fechas (y,
+// si trae franja horaria, sólo en esa franja). Es lo que permite cerrar la cancha
+// "el lunes 21 por mantenimiento" sin borrar el turno de los lunes, que valdría
+// para todos los lunes. Se levanta borrando la fila: es configuración vigente, no
+// historial. `created_by` es un id de usuario sin relación a propósito: alcanza
+// para saber quién lo puso y no ata el borrado de un usuario a sus bloqueos.
+model ScheduleBlock {
+  id         Int       @id @default(autoincrement())
+  place_id   Int
+  date_from  DateTime  @db.Date
+  date_to    DateTime  @db.Date // inclusive; igual a date_from si es un solo día
+  start_time DateTime? @db.Time() // null = todo el día
+  end_time   DateTime? @db.Time()
+  reason     String    @db.VarChar(255)
+  created_by String    @db.Char(128)
+  created_at DateTime  @default(now())
+
+  place Place @relation(fields: [place_id], references: [id])
+
+  @@index([place_id, date_from, date_to])
+  @@map("schedule_blocks")
 }
