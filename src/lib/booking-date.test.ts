@@ -136,3 +136,20 @@ test("el server en UTC no adelanta la ventana", () => {
 test("la ventana son 10 horas", () => {
   expect(HORAS_ANTES_CANCELAR).toBe(10);
 });
+
+test("las horas para cancelar son un parámetro: con 24 se cierra antes que con 10", () => {
+  // Lunes 10/8 a las 19:00. Con 10 horas de margen el límite es el lunes a las 09:00.
+  const lunes8am = enClub("2026-08-10T08:00");
+  expect(dentroDeVentanaCancelacion(LUNES, T19, lunes8am, 10)).toBe(true);
+  expect(dentroDeVentanaCancelacion(LUNES, T19, lunes8am, 12)).toBe(false);
+  // Sin margen se puede cancelar hasta el último minuto antes del inicio.
+  expect(dentroDeVentanaCancelacion(LUNES, T19, enClub("2026-08-10T18:59"), 0)).toBe(true);
+  expect(dentroDeVentanaCancelacion(LUNES, T19, enClub("2026-08-10T19:01"), 0)).toBe(false);
+});
+
+test("sin el parámetro usa la constante de siempre", () => {
+  const ahora = enClub("2026-08-10T10:00");
+  expect(dentroDeVentanaCancelacion(LUNES, T19, ahora)).toBe(
+    dentroDeVentanaCancelacion(LUNES, T19, ahora, HORAS_ANTES_CANCELAR),
+  );
+});

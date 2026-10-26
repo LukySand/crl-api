@@ -122,6 +122,25 @@ Todos en `src/routes/auth.ts`, montados bajo `/api/auth` (salvo health).
 | GET | `/api/reports/export` | gestión | Descarga Excel o PDF de lo que muestra la pantalla de reportes. `?format=xlsx\|pdf &bucket= &from= &to= &canchas= &disciplinas=` (los dos últimos se repiten una vez por nombre; ausente = todas, vacío = ninguna) |
 | GET | `/api/enrollments/export` | gestión o profe de esa disciplina | Lista de inscriptos para bajar o imprimir. `?discipline_id= &format=xlsx\|pdf`. Sin celular ni email a propósito (ver `lib/enrollment-export.ts`) |
 
+### Ajustes del club
+
+Lo que antes eran constantes en el código ahora lo fija la gestión (pestaña Ajustes del admin):
+horas para cancelar una reserva (`cancel_hours_before`, 10), días de anticipación del socio
+(`days_ahead_member`, 21) y de la gestión (`days_ahead_admin`, 183), día de vencimiento de la cuota
+(`payment_due_day`, 10). Una sola fila (`ClubSettings`, id 1); sin fila rige lo de siempre
+(`AJUSTES_POR_DEFECTO` en `lib/settings.ts`, que es lo único que no cambió de valor).
+
+| Método | Ruta | Guard | Qué hace |
+| --- | --- | --- | --- |
+| GET | `/api/settings` | sesión | Los ajustes vigentes. Los lee el socio (horas para cancelar, anticipación) |
+| PATCH | `/api/settings` | gestión | Cambio parcial: se manda sólo lo que cambia |
+
+Las constantes `HORAS_ANTES_CANCELAR`, `DIAS_ADELANTE_*` y `DIA_VENCIMIENTO` siguen existiendo pero
+sólo como default de los parámetros (`dentroDeVentanaCancelacion(..., horas)`,
+`vencimientoDe(periodo, dia)`): los handlers leen `getAjustes()` (`lib/settings-db.ts`, con 30 s de
+cache que se descarta al guardar). Un cambio rige para lo que viene: las reservas ya hechas y las
+cuotas ya generadas conservan su fecha.
+
 ### Bloqueo de espacios
 
 Cierra un espacio durante un rango de fechas (y, si trae franja horaria, sólo en esa franja) sin

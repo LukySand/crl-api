@@ -14,6 +14,7 @@ import { Readable } from "node:stream";
 import { z } from "zod";
 import prisma from "../lib/prisma";
 import { Storage } from "../lib/storage";
+import { getAjustes } from "../lib/settings-db";
 import { requireAuth, requireAdmin, isAdmin, veComoGestion } from "../lib/auth";
 import { refDisciplina, serializePayment, serializePayments } from "../lib/payment";
 import {
@@ -224,7 +225,10 @@ paymentsRouter.post("/generate", requireAdmin, async (req: Request, res: Respons
       });
     }
     const { period } = parsed.data;
-    const due = vencimientoDe(period);
+    // El día de vencimiento es un ajuste del club. Rige para las cuotas que se
+    // generan ahora: las ya generadas conservan su fecha.
+    const { payment_due_day } = await getAjustes();
+    const due = vencimientoDe(period, payment_due_day);
 
     // Todas las inscripciones que tocaron el período, activas o ya dadas de baja:
     // si el socio cursó marzo y se fue en abril, la cuota de marzo se le cobra

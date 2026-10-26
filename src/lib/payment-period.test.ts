@@ -253,3 +253,12 @@ test("la ventana por defecto tapa el rango completo y no más", () => {
 test("la ventana de meses arranca el día 1, no a mitad de mes", () => {
   expect(ventanaPorDefecto("mes", "2026-09-14").from).toBe("2025-10-01");
 });
+
+test("el día de vencimiento es un parámetro y cae en el último día si el mes no llega", () => {
+  expect(vencimientoDe("2026-09", 5).toISOString().slice(0, 10)).toBe("2026-09-05");
+  expect(vencimientoDe("2026-09").toISOString().slice(0, 10)).toBe("2026-09-10");
+  // Con el máximo permitido (28) siempre existe, también en febrero.
+  expect(vencimientoDe("2026-02", 28).toISOString().slice(0, 10)).toBe("2026-02-28");
+  // Un valor mayor que el mes cae en su último día en vez de pasarse al siguiente.
+  expect(vencimientoDe("2026-02", 31).toISOString().slice(0, 10)).toBe("2026-02-28");
+});

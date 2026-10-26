@@ -63,9 +63,9 @@ function diasDelMes(year: number, month: number): number {
  * con día 31 configurado, febrero vencería el 3 de marzo si se dejara desbordar
  * — y una cuota no puede vencer en el período siguiente.
  */
-export function vencimientoDe(periodo: string): Date {
+export function vencimientoDe(periodo: string, diaDeVencimiento: number = DIA_VENCIMIENTO): Date {
   const { year, month } = parsePeriodo(periodo);
-  const dia = Math.min(DIA_VENCIMIENTO, diasDelMes(year, month));
+  const dia = Math.min(diaDeVencimiento, diasDelMes(year, month));
   return new Date(Date.UTC(year, month - 1, dia));
 }
 

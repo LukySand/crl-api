@@ -455,3 +455,20 @@ model ScheduleBlock {
   @@index([place_id, date_from, date_to])
   @@map("schedule_blocks")
 }
+
+// Ajustes del club: una sola fila (id = 1). Lo que antes eran constantes en el código
+// —cuánto antes se cancela una reserva, con cuánta anticipación se reserva, el día de
+// vencimiento de la cuota—. Sin fila la API usa los valores por defecto de
+// `lib/settings.ts`.
+// `updated_by` es un id de usuario sin relación, igual que `ScheduleBlock.created_by`.
+model ClubSettings {
+  id                  Int      @id
+  cancel_hours_before Int      @default(10)
+  days_ahead_member   Int      @default(21)
+  days_ahead_admin    Int      @default(183)
+  payment_due_day     Int      @default(10)
+  updated_by          String?  @db.Char(128)
+  updated_at          DateTime @default(now()) @updatedAt
+
+  @@map("club_settings")
+}
