@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS `charge_types` (
   UNIQUE INDEX `charge_types_key_key`(`key`),
   PRIMARY KEY (`id`)
 ) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-INSERT IGNORE INTO charge_types (`key`, name, system, due_rule, updated_at) VALUES
+INSERT IGNORE INTO charge_types (`key`, name, `system`, due_rule, updated_at) VALUES
   ('Reserva','Reserva',1,'Ninguna',NOW(3)), ('Disciplina','Cuota de disciplina',1,'DiaDelMes',NOW(3)),
   ('Socio','Cuota social',1,'DiaDelMes',NOW(3));
 -- 2. payments en el lugar
