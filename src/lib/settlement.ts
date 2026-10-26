@@ -16,6 +16,13 @@ export class CuotaYaSaldada extends Error {
   }
 }
 
+/**
+ * P2034: MySQL abortó la transacción por conflicto de escritura o deadlock. Pasa cuando dos
+ * pedidos simultáneos pelean las mismas filas: el perdedor tiene que ver lo mismo que vería
+ * con el `updateMany` guardado (409), no un 500.
+ */
+export const esConflictoDeEscritura = (e: unknown) => (e as { code?: string } | null)?.code === "P2034";
+
 export interface FilaASaldar {
   id: string;
   amount: Prisma.Decimal | number | string;
@@ -95,7 +102,7 @@ export async function registrarCobroManual(args: {
       return r;
     });
   } catch (e) {
-    if (e instanceof CuotaYaSaldada) return null;
+    if (e instanceof CuotaYaSaldada || esConflictoDeEscritura(e)) return null;
     throw e;
   }
 }
@@ -168,22 +175,29 @@ export async function crearLiquidacionMP(args: {
   expiresAt: Date;
 }): Promise<{ id: string; total: number }> {
   const total = args.filas.reduce((acc, f) => acc + Math.round(Number(f.amount) * 100), 0) / 100;
-  return prisma.$transaction(async (tx) => {
-    const ids = args.filas.map((f) => f.id);
-    await tx.$queryRaw`SELECT id FROM \`payments\` WHERE id IN (${Prisma.join(ids)}) FOR UPDATE`;
-    const viva = await liquidacionViva(ids, tx);
-    if (viva) throw new PagoEnCurso(viva);
-    const liq = await tx.paymentTransaction.create({
-      data: {
-        user_id: args.userId,
-        method: "MercadoPago",
-        status: "Pendiente",
-        amount: total,
-        expires_at: args.expiresAt,
-        items: { create: args.filas.map((f) => ({ payment_id: f.id, amount: f.amount as never })) },
-      },
-      select: { id: true },
+  const ids = args.filas.map((f) => f.id);
+  try {
+    return await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM \`payments\` WHERE id IN (${Prisma.join(ids)}) FOR UPDATE`;
+      const viva = await liquidacionViva(ids, tx);
+      if (viva) throw new PagoEnCurso(viva);
+      const liq = await tx.paymentTransaction.create({
+        data: {
+          user_id: args.userId,
+          method: "MercadoPago",
+          status: "Pendiente",
+          amount: total,
+          expires_at: args.expiresAt,
+          items: { create: args.filas.map((f) => ({ payment_id: f.id, amount: f.amount as never })) },
+        },
+        select: { id: true },
+      });
+      return { id: liq.id, total };
     });
-    return { id: liq.id, total };
-  });
+  } catch (e) {
+    // Perdió la carrera contra otro checkout: mismo resultado que ver la liquidación viva.
+    const viva = esConflictoDeEscritura(e) ? await liquidacionViva(ids) : null;
+    if (viva) throw new PagoEnCurso(viva);
+    throw e;
+  }
 }
