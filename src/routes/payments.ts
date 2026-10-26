@@ -15,7 +15,14 @@ import { z } from "zod";
 import prisma from "../lib/prisma";
 import { Storage } from "../lib/storage";
 import { getAjustes } from "../lib/settings-db";
-import { requireAuth, requireAdmin, isAdmin, veComoGestion } from "../lib/auth";
+import { requireAuth, requireAdmin, isAdmin, hasRole, veComoGestion } from "../lib/auth";
+import {
+  decidirCobro,
+  LIMITE_POR_COBRAR,
+  METODOS_MANUALES,
+  palabrasDeBusqueda,
+  type QuienCobra,
+} from "../lib/cobro";
 import { refDisciplina, serializePayment, serializePayments } from "../lib/payment";
 import {
   cursoEnPeriodo,
@@ -62,6 +69,22 @@ const paymentInclude = {
   },
 } as const;
 
+/**
+ * Lo mismo que `paymentInclude` pero sin el email del socio: quien cobra necesita
+ * saber a quién (nombre y DNI), no cómo contactarlo. Un profesor ve esto de sus
+ * alumnos, y no tiene por qué ver más.
+ */
+const cobroInclude = {
+  ...paymentInclude,
+  user: { select: { id: true, name: true, last_name: true, dni: true } },
+} as const;
+
+/** Quién es el que cobra, según su sesión: la gestión o un profesor. */
+const quienCobra = (req: Request): QuienCobra => ({
+  esGestion: isAdmin(req),
+  esProfesor: hasRole(req, "Profesor"),
+});
+
 function formatErrors(issues: z.ZodIssue[]) {
   const errors: Record<string, string> = {};
   issues.forEach((issue) => {
@@ -85,6 +108,13 @@ const updateSchema = z.object({
   method: z.enum(["Efectivo", "Transferencia", "MercadoPago"]).optional(),
   notes: z.string().max(1000).optional(),
 });
+
+const cobroSchema = z
+  .object({
+    method: z.enum(METODOS_MANUALES).optional(),
+    notes: z.string().trim().max(1000).optional(),
+  })
+  .strict();
 
 const uploadSchema = z.object({
   file: z.instanceof(File, { message: "Falta el archivo" }),
@@ -281,6 +311,166 @@ paymentsRouter.post("/generate", requireAdmin, async (req: Request, res: Respons
   } catch (error) {
     console.error("Generate payments error:", error);
     return res.status(500).json({ success: false, error: "Error al generar las cuotas" });
+  }
+});
+
+/**
+ * GET /api/payments/por-cobrar?search= — las cuotas pendientes que quien está en
+ * el mostrador puede cobrar. Va antes de "/:id".
+ *
+ * La gestión ve todas; un profesor, sólo las cuotas de disciplina de sus propias
+ * disciplinas. `search` filtra por nombre, apellido o DNI del socio. Vienen
+ * primero las que vencen antes, que son las que hay que ir a buscar.
+ */
+paymentsRouter.get("/por-cobrar", async (req: Request, res: Response) => {
+  try {
+    const quien = quienCobra(req);
+    if (!quien.esGestion && !quien.esProfesor) {
+      return res
+        .status(403)
+        .json({ success: false, error: "No tenés permisos para registrar cobros" });
+    }
+
+    // El alcance sale del token, nunca de un id que mande el cliente.
+    const alcance = quien.esGestion
+      ? {}
+      : {
+          concept: "Disciplina" as const,
+          enrollment: {
+            discipline: { professors: { some: { professor_id: req.user!.id } } },
+          },
+        };
+
+    const palabras = palabrasDeBusqueda(req.query.search);
+
+    const pagos = await prisma.payment.findMany({
+      where: {
+        status: { in: ["Pendiente", "EnRevision"] },
+        ...alcance,
+        // Cada palabra tiene que aparecer en alguno de los tres campos del socio.
+        ...(palabras.length > 0 && {
+          AND: palabras.map((palabra) => ({
+            user: {
+              OR: [
+                { name: { contains: palabra } },
+                { last_name: { contains: palabra } },
+                { dni: { contains: palabra } },
+              ],
+            },
+          })),
+        }),
+      },
+      include: cobroInclude,
+      orderBy: [{ due_date: "asc" }, { created_at: "asc" }],
+      take: LIMITE_POR_COBRAR,
+    });
+
+    return res.json({
+      success: true,
+      payments: serializePayments(pagos),
+      limite: LIMITE_POR_COBRAR,
+    });
+  } catch (error) {
+    console.error("List payments to collect error:", error);
+    return res.status(500).json({ success: false, error: "Error al listar las cuotas" });
+  }
+});
+
+/**
+ * POST /api/payments/:id/cobro — registra que el socio pagó en mano y deja la
+ * cuota Pagada. Lo hace la gestión (efectivo o transferencia) o un profesor (sólo
+ * efectivo, y sólo cuotas de disciplinas que dicta): ver `decidirCobro`.
+ *
+ * Queda quién lo registró (`registered_by`). La condición de estado va en el
+ * UPDATE y no en un if previo, igual que en PATCH: dos cobros a la vez dejan uno.
+ */
+paymentsRouter.post("/:id/cobro", async (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const quien = quienCobra(req);
+    if (!quien.esGestion && !quien.esProfesor) {
+      return res
+        .status(403)
+        .json({ success: false, error: "No tenés permisos para registrar cobros" });
+    }
+
+    const parsed = cobroSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: "Validación fallida",
+        errors: formatErrors(parsed.error.issues),
+      });
+    }
+
+    const pago = await prisma.payment.findUnique({
+      where: { id: req.params.id },
+      select: {
+        id: true,
+        concept: true,
+        status: true,
+        booking_id: true,
+        enrollment: {
+          select: {
+            discipline: { select: { professors: { select: { professor_id: true } } } },
+          },
+        },
+      },
+    });
+    if (!pago) {
+      return res.status(404).json({ success: false, error: "Cuota no encontrada" });
+    }
+
+    const decision = decidirCobro(
+      quien,
+      {
+        concept: pago.concept,
+        status: pago.status,
+        esDeSuDisciplina:
+          pago.enrollment?.discipline.professors.some((p) => p.professor_id === req.user!.id) ?? false,
+      },
+      parsed.data.method,
+    );
+    if (!decision.ok) {
+      return res.status(decision.status).json({ success: false, error: decision.error });
+    }
+
+    const cobrada = await prisma.$transaction(async (tx) => {
+      const { count } = await tx.payment.updateMany({
+        where: { id: pago.id, status: { in: ["Pendiente", "EnRevision"] } },
+        data: {
+          status: "Pagado",
+          paid_at: new Date(),
+          method: decision.method,
+          registered_by: req.user!.id,
+          ...(parsed.data.notes !== undefined && { notes: parsed.data.notes }),
+        },
+      });
+      if (count === 0) return false;
+
+      // Una reserva Confirmada es una reserva paga: el cobro y el estado viajan
+      // juntos, como al confirmar la reserva en el otro sentido (bookings.ts).
+      if (pago.concept === "Reserva" && pago.booking_id) {
+        await tx.booking.updateMany({
+          where: { id: pago.booking_id, status: "Pendiente" },
+          data: { status: "Confirmada" },
+        });
+      }
+      return true;
+    });
+    if (!cobrada) {
+      return res
+        .status(409)
+        .json({ success: false, error: "Esa cuota ya fue cobrada o anulada" });
+    }
+
+    const payment = await prisma.payment.findUnique({
+      where: { id: pago.id },
+      include: cobroInclude,
+    });
+    return res.json({ success: true, payment: payment && serializePayment(payment) });
+  } catch (error) {
+    console.error("Register cash payment error:", error);
+    return res.status(500).json({ success: false, error: "Error al registrar el cobro" });
   }
 });
 
