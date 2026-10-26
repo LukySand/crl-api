@@ -116,6 +116,8 @@ Todos en `src/routes/auth.ts`, montados bajo `/api/auth` (salvo health).
 | GET | `/api/payments/:id` | dueño o gestión | Una cuota |
 | POST | `/api/payments/:id/comprobante` | dueño | Sube el comprobante (multipart) → `EnRevision` |
 | PATCH | `/api/payments/:id` | gestión | `{action: confirmar\|rechazar\|anular}` |
+| GET | `/api/payments/por-cobrar` | gestión o profesor | Cuotas pendientes que se pueden cobrar en mano. `?search=` por nombre, apellido o DNI. Gestión ve todas; un profesor sólo las de **disciplinas que dicta** |
+| POST | `/api/payments/:id/cobro` | gestión o profesor | Registra el cobro en mano y deja la cuota Pagada (`registered_by`). Gestión: efectivo o transferencia, cualquier concepto. Profesor: sólo efectivo y sólo cuotas de disciplina de sus alumnos. Reglas en `lib/cobro.ts` |
 | GET | `/api/reports/ingresos` | gestión | Totales + un corte. `?from= &to= &concept= &group=mes\|concepto\|metodo\|disciplina\|espacio` |
 | GET | `/api/reports/series` | gestión | Serie temporal. `?bucket=dia\|semana\|mes &by=espacio\|disciplina\|concepto\|metodo &from= &to=` |
 | GET | `/api/reports/morosos` | gestión | Quién debe y desde cuándo |
