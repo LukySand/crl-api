@@ -80,11 +80,11 @@ test("validaciones: 403 socio, 400 sin motivo, 400 no MP, 409 no Pagado", async 
   expect((await reembolsar(socio.token, filas[0]!.id)).status).toBe(403);
   expect((await api("POST", `/api/payments/${filas[0]!.id}/reembolso`, { token: admin.token, body: {} })).status).toBe(400);
   const efectivo = await prisma.payment.create({
-    data: { user_id: socio.id, concept: "Otro", name: "ef", amount: 5, status: "Pagado", method: "Efectivo", paid_at: new Date(), ref: `test:refunds:ef::` },
+    data: { user_id: socio.id, concept: "Otro", name: "ef", amount: 5, status: "Pagado", method: "Efectivo", paid_at: new Date(), ref: `test:refunds:ef:${Date.now()}:${++n}` },
   });
   expect((await reembolsar(admin.token, efectivo.id)).status).toBe(400);
   const pendiente = await prisma.payment.create({
-    data: { user_id: socio.id, concept: "Otro", name: "pe", amount: 5, ref: `test:refunds:pe::` },
+    data: { user_id: socio.id, concept: "Otro", name: "pe", amount: 5, ref: `test:refunds:pe:${Date.now()}:${++n}` },
   });
   expect((await reembolsar(admin.token, pendiente.id)).status).toBe(400); // sin metodo: no es MP
 });
@@ -146,7 +146,7 @@ test("un pending viejo (>2 min) se reclama con la misma clave; uno reciente da 4
 test("plata que no salda una fila (monto inconsistente): vuelve sola, income_reversal=false y la fila no se toca", async () => {
   const socio = await makeUser({ roles: ["Socio"] });
   const fila = await prisma.payment.create({
-    data: { user_id: socio.id, concept: "Otro", name: "inc", amount: 100, ref: `test:refunds:inc::` },
+    data: { user_id: socio.id, concept: "Otro", name: "inc", amount: 100, ref: `test:refunds:inc:${Date.now()}:${++n}` },
   });
   const liq = await prisma.paymentTransaction.create({
     data: { user_id: socio.id, method: "MercadoPago", amount: 100, mp_preference_id: "pref-x", items: { create: [{ payment_id: fila.id, amount: 100 }] } },
@@ -197,7 +197,7 @@ test("reembolsar una fila Reserva cancela la reserva", async () => {
     data: { schedule_id: schedule.id, fee_id: fee.id, user_id: socio.id, date: new Date("2033-03-03T00:00:00Z"), status: "Confirmada", active: true },
   });
   const fila = await prisma.payment.create({
-    data: { user_id: socio.id, concept: "Reserva", booking_id: booking.id, name: "res", amount: 20, status: "Pagado", method: "MercadoPago", paid_at: new Date(), ref: `test:refunds:res::` },
+    data: { user_id: socio.id, concept: "Reserva", booking_id: booking.id, name: "res", amount: 20, status: "Pagado", method: "MercadoPago", paid_at: new Date(), ref: `test:refunds:res:${Date.now()}:${++n}` },
   });
   await prisma.paymentTransactionItem.create({ data: { transaction_id: liq.id, payment_id: fila.id, amount: 20 } });
   await prisma.paymentTransaction.update({ where: { id: liq.id }, data: { amount: 40 } });
