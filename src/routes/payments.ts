@@ -131,7 +131,13 @@ const updateSchema = z.discriminatedUnion("action", [
       due_date: fechaIso.nullable().optional(),
       amount: z.number().min(0.01).max(99_999_999.99).optional(),
       name: z.string().trim().min(1).max(120).optional(),
-      description: z.string().max(2000).nullable().optional(),
+      // null o "" borran la descripción.
+      description: z
+        .string()
+        .max(2000)
+        .nullable()
+        .optional()
+        .transform((d) => (d === "" ? null : d)),
     })
     .strict()
     .refine((b) => b.due_date !== undefined || b.amount !== undefined || b.name !== undefined || b.description !== undefined, {

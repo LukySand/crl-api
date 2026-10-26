@@ -124,6 +124,15 @@ test("editar monto, nombre y descripcion: solo Pendiente sin pago en curso, audi
   expect(editada.due_date?.toISOString().slice(0, 10)).toBe("2031-01-01"); // campo ausente no se toca
   await logger.flush();
 
+  // el listado trae description para precargar la hoja; null y "" la borran
+  const l = await api("GET", `/api/payments?user_id=${socio.id}`, { token: admin.token });
+  expect(l.body.payments.find((x: { id: string }) => x.id === p.id).description).toBe("detalle");
+  expect((await patch(p.id, { description: "" })).status).toBe(200);
+  expect((await estadoDe(p.id)).description).toBeNull();
+  expect((await patch(p.id, { description: "otra" })).status).toBe(200);
+  expect((await patch(p.id, { description: null })).status).toBe(200);
+  expect((await estadoDe(p.id)).description).toBeNull();
+
   expect((await patch(p.id, {})).status).toBe(400);
   expect((await patch(p.id, { amount: 0 })).status).toBe(400);
   expect((await patch(p.id, { name: "" })).status).toBe(400);
