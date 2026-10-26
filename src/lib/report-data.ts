@@ -129,7 +129,7 @@ export async function calcularIngresos(opts: {
   });
 
   const hoy = todayInClub();
-  const vencidos = pendientes.filter((p) => p.due_date.toISOString().slice(0, 10) < hoy);
+  const vencidos = pendientes.filter((p) => p.due_date != null && p.due_date.toISOString().slice(0, 10) < hoy);
 
   const serie = (() => {
     switch (group) {
@@ -274,7 +274,7 @@ export async function calcularMorosos() {
         select: { id: true, name: true, last_name: true, dni: true, email: true, celular: true },
       },
     },
-    orderBy: { due_date: "asc" },
+    orderBy: { due_date: { sort: "asc", nulls: "last" } },
   });
 
   const hoy = todayInClub();
@@ -303,7 +303,7 @@ export async function calcularMorosos() {
     const monto = toNumber(p.amount);
     actual.total += monto;
     actual.cuotas += 1;
-    if (p.due_date.toISOString().slice(0, 10) < hoy) {
+    if (p.due_date && p.due_date.toISOString().slice(0, 10) < hoy) {
       actual.vencido += monto;
       actual.cuotas_vencidas += 1;
       // Las filas vienen ordenadas por vencimiento, así que la primera vencida

@@ -203,13 +203,13 @@ paymentsRouter.get("/resumen", async (req: Request, res: Response) => {
     const pendientes = await prisma.payment.findMany({
       where: { user_id: userId, status: { in: ["Pendiente", "EnRevision"] } },
       select: { amount: true, due_date: true, status: true },
-      orderBy: { due_date: "asc" },
+      orderBy: { due_date: { sort: "asc", nulls: "last" } },
     });
 
     const hoy = todayInClub();
     // "Vencido" se deriva acá y no se guarda: ver el comentario del modelo Payment.
     const vencidas = pendientes.filter(
-      (p) => p.due_date.toISOString().slice(0, 10) < hoy,
+      (p) => p.due_date != null && p.due_date.toISOString().slice(0, 10) < hoy,
     );
 
     const sumar = (filas: { amount: unknown }[]) =>
@@ -224,7 +224,7 @@ paymentsRouter.get("/resumen", async (req: Request, res: Response) => {
         cantidad_vencida: vencidas.length,
         // El vencimiento más próximo sin pagar. Reemplaza al "next_due_date" que
         // no se guarda en la fila: como consulta nunca queda desactualizado.
-        proximo_vencimiento: pendientes[0]?.due_date ?? null,
+        proximo_vencimiento: pendientes.find((p) => p.due_date)?.due_date ?? null,
       },
     });
   } catch (error) {
@@ -283,6 +283,7 @@ paymentsRouter.post("/generate", requireAdmin, async (req: Request, res: Respons
     const filas = aCobrar.map((e) => ({
       user_id: e.user_id,
       concept: "Disciplina" as const,
+      name: `Cuota de ${e.discipline.name} ${period}`,
       enrollment_id: e.id,
       fee_id: e.discipline.fee!.id,
       // Monto congelado: si mañana repuntan la tarifa de la disciplina, esta
@@ -361,7 +362,7 @@ paymentsRouter.get("/por-cobrar", async (req: Request, res: Response) => {
         }),
       },
       include: cobroInclude,
-      orderBy: [{ due_date: "asc" }, { created_at: "asc" }],
+      orderBy: [{ due_date: { sort: "asc", nulls: "last" } }, { created_at: "asc" }],
       take: LIMITE_POR_COBRAR,
     });
 

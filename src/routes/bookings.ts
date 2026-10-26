@@ -376,6 +376,7 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
         data: {
           user_id: userId,
           concept: "Reserva",
+          name: `Reserva ${when.toISOString().slice(8, 10)}/${when.toISOString().slice(5, 7)}/${when.getUTCFullYear()}`,
           booking_id: creada.id,
           fee_id: feeId,
           amount: monto,
