@@ -10,6 +10,7 @@ import prisma from "./prisma";
 import { logger } from "./logger";
 import { bloqueoQueCierra } from "./schedule-block-db";
 import { corteHoldReservas, hayTiempoParaPagar, timeToHHMM } from "./booking-date";
+import { reembolsarItem } from "./refunds";
 import { esConflictoDeEscritura } from "./settlement";
 
 const MOTIVO_VENCIDA = "Venció el plazo para pagar la reserva";
@@ -123,4 +124,39 @@ export async function resolverReserva(
     return false;
   }
   return true;
+}
+
+export type EstadoReembolsoReserva = "aprobado" | "pendiente" | "fallido";
+
+/**
+ * Reembolso automático de una reserva ya cancelada cuya fila quedó `Pagado` por Mercado Pago
+ * (D14). Se llama DESPUÉS de commitear la cancelación: si MP falla, la reserva sigue cancelada,
+ * la fila `Pagado` y el barrido de 15 minutos reintenta con la misma clave. Nunca lanza.
+ * @returns `null` si la reserva no se pagó por MP (efectivo u otro medio manual no se reembolsa solo).
+ */
+export async function reembolsarReservaPagada(
+  bookingId: string,
+  actor: string,
+): Promise<{ estado: EstadoReembolsoReserva } | null> {
+  const fila = await prisma.payment.findFirst({
+    where: { booking_id: bookingId, status: "Pagado", method: "MercadoPago" },
+    select: {
+      id: true,
+      items: {
+        where: { transaction: { method: "MercadoPago", status: { in: ["Aprobado", "ReembolsadoParcial"] } } },
+        select: { transaction_id: true },
+        take: 1,
+      },
+    },
+  });
+  const transaccionId = fila?.items[0]?.transaction_id;
+  if (!fila || !transaccionId) return null;
+  try {
+    const r = await reembolsarItem({ transaccionId, filaId: fila.id, motivo: "reserva-cancelada", actor });
+    if (r.estado === "en_curso") return { estado: "pendiente" };
+    return { estado: r.estado === "failed" || r.estado === "rejected" ? "fallido" : "aprobado" };
+  } catch (error) {
+    logger.error(error, "Reembolso de reserva cancelada falló", { metadata: { booking_id: bookingId } });
+    return { estado: "fallido" };
+  }
 }

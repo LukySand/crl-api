@@ -7,7 +7,7 @@ import { METODOS_MANUALES } from "../lib/cobro";
 import { refReserva } from "../lib/payment";
 import { liquidacionViva, saldarItems } from "../lib/settlement";
 import { accessToken, createPreference } from "../lib/mercadopago";
-import { liberarReservasVencidas } from "../lib/booking-hold";
+import { liberarReservasVencidas, reembolsarReservaPagada } from "../lib/booking-hold";
 import { bloqueaTurno } from "../lib/schedule-block";
 import { getAjustes } from "../lib/settings-db";
 import { bloqueoQueCierra, bloqueosDelDia } from "../lib/schedule-block-db";
@@ -720,7 +720,9 @@ bookingsRouter.delete("/:id", async (req: Request<{ id: string }>, res: Response
     // La gestión cancela siempre; el socio, hasta las horas que fije el club en los
     // ajustes antes del turno. Va en el backend y no sólo en el front: escondiendo
     // el botón, un DELETE a mano seguiría liberando la cancha cinco minutos antes.
-    if (!isAdmin(req)) {
+    // La ventana rige sólo para una reserva `Confirmada`: una `Pendiente` (en hold, sin pagar)
+    // el socio la suelta siempre (D14).
+    if (!isAdmin(req) && existing.status === "Confirmada") {
       const { cancel_hours_before } = await getAjustes();
       if (
         !dentroDeVentanaCancelacion(
@@ -751,13 +753,26 @@ bookingsRouter.delete("/:id", async (req: Request<{ id: string }>, res: Response
       // modelo Booking): si se separan, un fallo entre medio deja una reserva
       // cancelada con la deuda todavía viva.
       //
-      // Un pago ya cobrado NO se anula: la plata entró de verdad y borrarla del
+      // Un pago ya cobrado NO se anula acá: la plata entró de verdad y borrarla del
       // ledger falsearía los ingresos del mes. Queda Pagado contra una reserva
-      // cancelada, que es exactamente lo que pasó. La devolución es otro tema y
-      // todavía no existe.
+      // cancelada; si fue por MP, el reembolso (abajo) la deja Anulado cuando sale.
+      //
+      // Una liquidación de MP viva (el socio todavía puede estar pagando) queda `voided_*`: su
+      // status no cambia, la sigue mirando la conciliación, y una aprobación posterior reembolsa
+      // en vez de retomar el turno (D14). Va antes de anular la fila, que es lo que la identifica.
+      const ahora = new Date();
+      await tx.paymentTransaction.updateMany({
+        where: {
+          method: "MercadoPago",
+          status: "Pendiente",
+          voided_at: null,
+          items: { some: { payment: { booking_id: req.params.id, status: { not: "Pagado" } } } },
+        },
+        data: { voided_by: req.user!.id, voided_reason: "Reserva cancelada", voided_at: ahora },
+      });
       await tx.payment.updateMany({
         where: { booking_id: req.params.id, status: { not: "Pagado" } },
-        data: { status: "Anulado" },
+        data: { status: "Anulado", resolved_by: req.user!.id, resolved_reason: "Reserva cancelada", resolved_at: ahora },
       });
       return count;
     });
@@ -765,9 +780,13 @@ bookingsRouter.delete("/:id", async (req: Request<{ id: string }>, res: Response
       return res.status(409).json({ success: false, error: "La reserva ya estaba cancelada" });
     }
 
+    // Pagada por MP (el socio dentro de la ventana, o la gestión siempre): la cancelación ya está
+    // commiteada y recién ahora se pide el reembolso. Si MP no contesta la reserva sigue cancelada,
+    // la fila `Pagado` y el barrido reintenta. Una reserva cobrada en mano no se reembolsa sola.
+    const reembolso = await reembolsarReservaPagada(req.params.id, req.user!.id);
     const booking = await prisma.booking.findUnique({ where: { id: req.params.id } });
 
-    return res.json({ success: true, message: "Reserva cancelada", booking });
+    return res.json({ success: true, message: "Reserva cancelada", booking, ...(reembolso && { reembolso }) });
   } catch (error) {
     console.error("Cancel booking error:", error);
     return res.status(500).json({ success: false, error: "Error al cancelar la reserva" });

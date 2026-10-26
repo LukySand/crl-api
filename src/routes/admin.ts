@@ -11,6 +11,7 @@ import {
   validarRoles,
 } from "../lib/roles";
 import { parseDate, todayInClub } from "../lib/booking-date";
+import { reembolsarReservaPagada } from "../lib/booking-hold";
 import type { ZodError } from "zod";
 
 export const adminRouter = Router();
@@ -264,6 +265,17 @@ adminRouter.delete("/users/:id", async (req: Request, res: Response) => {
     }
 
     const hoy = parseDate(todayInClub());
+    // Las reservas futuras ya pagadas por MP: se reembolsan recién después de commitear la baja
+    // (D14). Se leen antes porque la transacción de abajo las deja `Cancelada`.
+    const pagadasPorMP = await prisma.booking.findMany({
+      where: {
+        user_id: id,
+        date: { gte: hoy },
+        status: { not: "Cancelada" },
+        payment: { is: { status: "Pagado", method: "MercadoPago" } },
+      },
+      select: { id: true },
+    });
     const [user, canceladas, anuladas] = await prisma.$transaction([
       prisma.user.update({
         where: { id },
@@ -292,11 +304,18 @@ adminRouter.delete("/users/:id", async (req: Request, res: Response) => {
         data: { status: "Anulado" },
       }),
     ]);
+    // Si MP no contesta, la baja igual vale: el reembolso queda pendiente y lo reintenta el barrido.
+    const reembolsos = [];
+    for (const b of pagadasPorMP) {
+      const r = await reembolsarReservaPagada(b.id, req.user!.id);
+      if (r) reembolsos.push({ booking_id: b.id, estado: r.estado });
+    }
     res.json({
       success: true,
       user: flatten(user),
       reservasCanceladas: canceladas.count,
       cuotasAnuladas: anuladas.count,
+      reembolsos,
     });
   } catch (error) {
     console.error("Deactivate user error:", error);
