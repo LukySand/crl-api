@@ -16,6 +16,23 @@ services:
       timeout: 5s
       retries: 10
 
+  # Base efímera para los tests de ruta (puerto 3307, sin volumen): se levanta, se usa y se tira.
+  db_test:
+    image: mysql:8
+    container_name: mysql-test
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: crl_test
+    ports:
+      - "3307:3306"
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
   # ponytail: servicio api opcional (prod/full-docker). En dev usás `bun dev` local.
   api:
     build: .
