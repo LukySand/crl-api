@@ -1,11 +1,12 @@
 /**
  * Tareas programadas del proceso. Se arma de a poco: B3 registra la emisión
- * diaria; la conciliación de Mercado Pago y el vencimiento de holds se suman en
+ * diaria; la conciliación de Mercado Pago (cada 15 min) y el vencimiento de holds se suman en
  * sus slices. `DISABLE_CRON=true` lo apaga (tests, segundas instancias).
  */
 import { emitirCargos } from "./emission";
 import { logger } from "./logger";
 import { todayInClub } from "./payment-period";
+import { syncPendingPayments } from "./payment-sync";
 
 export function startScheduler(): void {
   if (process.env.DISABLE_CRON === "true") return;
@@ -17,6 +18,16 @@ export function startScheduler(): void {
       logger.info(`Emisión diaria: ${r.generadas} generadas de ${r.candidatas} candidatas`);
     } catch (error) {
       logger.error(error, "Emisión diaria falló");
+    }
+  });
+
+  // Red de seguridad del webhook: concilia hasta 50 liquidaciones MP pendientes de los últimos 7 días.
+  Bun.cron("*/15 * * * *", async () => {
+    try {
+      const n = await syncPendingPayments({ limite: 50, desde: new Date(Date.now() - 7 * 24 * 3600_000) });
+      if (n > 0) logger.info(`Conciliación MP: ${n} liquidaciones actualizadas`);
+    } catch (error) {
+      logger.error(error, "Conciliación MP falló");
     }
   });
 }
