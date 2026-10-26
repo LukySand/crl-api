@@ -120,8 +120,8 @@ export function accionesPermitidas(f: {
   switch (f.status) {
     case "Pendiente":
       return esReserva ? ["cobrar"] : ["cobrar", "editar", "anular", "condonar", "eliminar"];
-    case "EnRevision": // legado (D23): la gestión lo cobra, anula o condona
-      return esReserva ? [] : ["cobrar", "editar", "anular", "condonar"];
+    case "EnRevision": // legado (D23): la gestión lo cobra, anula o condona (editar: sólo Pendiente)
+      return esReserva ? [] : ["cobrar", "anular", "condonar"];
     case "Pagado": {
       if (!l) return [];
       if (l.method === "MercadoPago") {

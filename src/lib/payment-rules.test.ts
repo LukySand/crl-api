@@ -80,7 +80,7 @@ test("acciones: pendiente, en revisión (sin confirmar/rechazar) y reserva", () 
     "cobrar", "editar", "anular", "condonar", "eliminar",
   ]);
   const rev = accionesPermitidas({ ...base, status: "EnRevision" });
-  expect(rev).toEqual(["cobrar", "editar", "anular", "condonar"]);
+  expect(rev).toEqual(["cobrar", "anular", "condonar"]);
   expect(rev as string[]).not.toContain("confirmar");
   expect(accionesPermitidas({ ...base, concept: "Reserva", status: "Pendiente" })).toEqual(["cobrar"]);
 });

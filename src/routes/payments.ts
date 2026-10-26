@@ -125,7 +125,18 @@ const fechaIso = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Fecha YYYY-MM-DD");
 const updateSchema = z.discriminatedUnion("action", [
   z.object({ action: z.literal("anular"), reason: motivo }).strict(),
   z.object({ action: z.literal("condonar"), reason: motivo }).strict(),
-  z.object({ action: z.literal("editar"), due_date: fechaIso.nullable() }).strict(),
+  z
+    .object({
+      action: z.literal("editar"),
+      due_date: fechaIso.nullable().optional(),
+      amount: z.number().min(0.01).max(99_999_999.99).optional(),
+      name: z.string().trim().min(1).max(120).optional(),
+      description: z.string().max(2000).nullable().optional(),
+    })
+    .strict()
+    .refine((b) => b.due_date !== undefined || b.amount !== undefined || b.name !== undefined || b.description !== undefined, {
+      message: "Indicá qué editar",
+    }),
 ]);
 
 const deleteSchema = z.object({ reason: motivo }).strict();
@@ -1065,7 +1076,7 @@ async function mutarFila(
 ) {
   const fila = await prisma.payment.findUnique({
     where: { id: req.params.id },
-    select: { id: true, concept: true, status: true, deleted_at: true, due_date: true },
+    select: { id: true, concept: true, status: true, deleted_at: true, due_date: true, name: true, description: true, amount: true },
   });
   if (!fila) return res.status(404).json({ success: false, error: "Cuota no encontrada" });
 
@@ -1086,7 +1097,13 @@ async function mutarFila(
   }
   auditar(req, "update", "payment", fila.id, {
     motivo: auditoria.motivo,
-    antes: { status: fila.status, due_date: aDia(fila.due_date) },
+    antes: {
+      status: fila.status,
+      due_date: aDia(fila.due_date),
+      name: fila.name,
+      description: fila.description,
+      amount: toNumber(fila.amount),
+    },
     despues: auditoria.despues,
   });
   const payment = await prisma.payment.findUnique({ where: { id: fila.id }, include: paymentInclude });
@@ -1094,8 +1111,8 @@ async function mutarFila(
 }
 
 /**
- * PATCH /api/payments/:id — la gestión anula, condona o edita el vencimiento
- * (`action: anular | condonar | editar`). Anular y condonar piden `reason` y sólo
+ * PATCH /api/payments/:id — la gestión anula, condona o edita vencimiento, monto, nombre y
+ * descripción (`action: anular | condonar | editar`; editar sólo en `Pendiente`). Anular y condonar piden `reason` y sólo
  * aplican a `Pendiente`/`EnRevision` que no sean `Reserva` (una `Pagado` es 409).
  * El cobro va por /cobro; `confirmar`/`rechazar` ya no existen (D23).
  */
@@ -1114,13 +1131,11 @@ paymentsRouter.patch(
       }
       const b = parsed.data;
       if (b.action === "editar") {
-        return await mutarFila(
-          req,
-          res,
-          "editar",
-          { due_date: b.due_date ? new Date(`${b.due_date}T00:00:00Z`) : null },
-          { despues: { due_date: b.due_date } },
-        );
+        // Sólo los campos presentes: `due_date: null` borra el vencimiento, ausente lo deja.
+        const { action: _accion, due_date, ...resto } = b;
+        const data: Prisma.PaymentUpdateManyMutationInput = resto;
+        if (due_date !== undefined) data.due_date = due_date ? new Date(`${due_date}T00:00:00Z`) : null;
+        return await mutarFila(req, res, "editar", data, { despues: b });
       }
       const status = b.action === "anular" ? "Anulado" : "Condonado";
       return await mutarFila(

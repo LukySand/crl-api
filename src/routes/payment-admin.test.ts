@@ -110,6 +110,42 @@ test("editar vencimiento: a null y a fecha; el nulo no es vencida", async () => 
   expect((await api("PATCH", `/api/payments/${p.id}`, { token: admin.token, body: { action: "editar", due_date: "2031-05-01" } })).status).toBe(200);
 });
 
+test("editar monto, nombre y descripcion: solo Pendiente sin pago en curso, auditado", async () => {
+  const admin = await makeUser({ roles: ["Administrador"] });
+  const socio = await makeUser({ roles: ["Socio"] });
+  const p = await cuota(socio.id, "Otro", { due_date: new Date("2031-01-01T00:00:00Z") });
+  const patch = (id: string, body: object) => api("PATCH", `/api/payments/${id}`, { token: admin.token, body: { action: "editar", ...body } });
+
+  const r = await patch(p.id, { amount: 250.5, name: "Cuota corregida", description: "detalle" });
+  expect(r.status).toBe(200);
+  const editada = await estadoDe(p.id);
+  expect(Number(editada.amount)).toBe(250.5);
+  expect(editada).toMatchObject({ name: "Cuota corregida", description: "detalle" });
+  expect(editada.due_date?.toISOString().slice(0, 10)).toBe("2031-01-01"); // campo ausente no se toca
+  await logger.flush();
+
+  expect((await patch(p.id, {})).status).toBe(400);
+  expect((await patch(p.id, { amount: 0 })).status).toBe(400);
+  expect((await patch(p.id, { name: "" })).status).toBe(400);
+  expect((await patch(p.id, { status: "Pagado" })).status).toBe(400);
+
+  const pagada = await cuota(socio.id, "Otro", { status: "Pagado", method: "Efectivo", paid_at: new Date() });
+  expect((await patch(pagada.id, { amount: 1 })).status).toBe(409);
+  const enRevision = await cuota(socio.id, "Otro", { status: "EnRevision" });
+  expect((await patch(enRevision.id, { name: "x" })).status).toBe(409);
+
+  const viva = await cuota(socio.id, "Otro");
+  await prisma.paymentTransaction.create({
+    data: {
+      user_id: socio.id, method: "MercadoPago", status: "Pendiente", amount: 100,
+      expires_at: new Date(Date.now() + 3_600_000),
+      items: { create: [{ payment_id: viva.id, amount: 100 }] },
+    },
+  });
+  expect((await patch(viva.id, { amount: 5 })).status).toBe(409);
+  expect(Number((await estadoDe(viva.id)).amount)).toBe(100);
+});
+
 test("anular concurrente: uno 200 y uno 409", async () => {
   const admin = await makeUser({ roles: ["Administrador"] });
   const socio = await makeUser({ roles: ["Socio"] });
