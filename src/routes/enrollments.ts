@@ -4,6 +4,9 @@ import prisma from "../lib/prisma";
 import { requireAuth, isAdmin, hasRole, veComoGestion } from "../lib/auth";
 import { nombresDeRoles, rolesInclude } from "../lib/roles";
 import { periodoDe } from "../lib/payment-period";
+import { todayInClub } from "../lib/booking-date";
+import { armarListaInscriptos, slugDe } from "../lib/enrollment-export";
+import { aPdf, aXlsx, fechaHoraClub } from "../lib/report-export";
 
 export const enrollmentsRouter = Router();
 
@@ -110,6 +113,88 @@ enrollmentsRouter.get("/", async (req: Request, res: Response) => {
   } catch (error) {
     console.error("List enrollments error:", error);
     return res.status(500).json({ success: false, error: "Error al listar inscripciones" });
+  }
+});
+
+const FORMATOS_LISTA = {
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  pdf: "application/pdf",
+} as const;
+
+/**
+ * GET /api/enrollments/export?discipline_id=&format=xlsx|pdf — la lista de
+ * inscriptos de una disciplina para bajar o imprimir.
+ *
+ * Gestión la pide de cualquiera; un profesor sólo de las que dicta. Un socio no:
+ * a él `GET /` le muestra únicamente sus propias inscripciones, y una lista de
+ * compañeros no es algo que le corresponda. El permiso sale del token y de la
+ * relación disciplina–profesor, nunca de un id que mande el cliente.
+ */
+enrollmentsRouter.get("/export", async (req: Request, res: Response) => {
+  try {
+    const format = req.query.format as string | undefined;
+    const disciplineId = Number(req.query.discipline_id);
+
+    if (!format || !(format in FORMATOS_LISTA)) {
+      return res.status(400).json({
+        success: false,
+        error: `format tiene que ser uno de: ${Object.keys(FORMATOS_LISTA).join(", ")}`,
+      });
+    }
+    if (!Number.isInteger(disciplineId) || disciplineId <= 0) {
+      return res.status(400).json({ success: false, error: "discipline_id inválido" });
+    }
+
+    const discipline = await prisma.discipline.findUnique({
+      where: { id: disciplineId },
+      select: {
+        name: true,
+        place: { select: { name: true } },
+        professors: {
+          select: { professor: { select: { id: true, name: true, last_name: true } } },
+          orderBy: { created_at: "asc" },
+        },
+      },
+    });
+    if (!discipline) {
+      return res.status(404).json({ success: false, error: "Disciplina no encontrada" });
+    }
+
+    const dictaLaDisciplina = discipline.professors.some((p) => p.professor.id === req.user!.id);
+    if (!isAdmin(req) && !(hasRole(req, "Profesor") && dictaLaDisciplina)) {
+      return res
+        .status(403)
+        .json({ success: false, error: "No podés exportar los inscriptos de esta disciplina" });
+    }
+
+    const inscripciones = await prisma.enrollment.findMany({
+      where: { discipline_id: disciplineId, active: true },
+      select: {
+        created_at: true,
+        user: { select: { name: true, last_name: true, dni: true } },
+      },
+    });
+
+    const lista = armarListaInscriptos({
+      disciplina: {
+        name: discipline.name,
+        place: discipline.place?.name ?? null,
+        professors: discipline.professors.map((p) => `${p.professor.name} ${p.professor.last_name}`),
+      },
+      inscriptos: inscripciones.map((i) => ({ ...i.user, created_at: i.created_at })),
+      generadoEn: fechaHoraClub(),
+    });
+
+    const archivo = format === "xlsx" ? await aXlsx(lista) : await aPdf(lista);
+    res.setHeader("Content-Type", FORMATOS_LISTA[format as keyof typeof FORMATOS_LISTA]);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="inscriptos-${slugDe(discipline.name)}-${todayInClub()}.${format}"`,
+    );
+    return res.send(archivo);
+  } catch (error) {
+    console.error("Export enrollments error:", error);
+    return res.status(500).json({ success: false, error: "Error al exportar los inscriptos" });
   }
 });
 

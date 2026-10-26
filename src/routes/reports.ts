@@ -11,7 +11,7 @@
  */
 import { Router, type Request, type Response } from "express";
 import { requireAuth, requireAdmin } from "../lib/auth";
-import { CLUB_TZ, todayInClub } from "../lib/booking-date";
+import { todayInClub } from "../lib/booking-date";
 import { BUCKETS, esBucketValido, ventanaPorDefecto } from "../lib/payment-period";
 import {
   AGRUPACIONES,
@@ -25,7 +25,7 @@ import {
   type Agrupacion,
   type Dimension,
 } from "../lib/report-data";
-import { aPdf, aXlsx, armarReporte, listaDeQuery } from "../lib/report-export";
+import { aPdf, aXlsx, armarReporte, fechaHoraClub, listaDeQuery } from "../lib/report-export";
 
 export const reportsRouter = Router();
 
@@ -245,11 +245,7 @@ reportsRouter.get("/export", async (req: Request, res: Response) => {
       disciplinasElegidas: listaDeQuery(req.query.disciplinas),
       morosos: morosos.morosos,
       totalVencido: morosos.total_vencido,
-      generadoEn: new Intl.DateTimeFormat("es-AR", {
-        dateStyle: "short",
-        timeStyle: "short",
-        timeZone: CLUB_TZ,
-      }).format(new Date()),
+      generadoEn: fechaHoraClub(),
     });
 
     const archivo =
