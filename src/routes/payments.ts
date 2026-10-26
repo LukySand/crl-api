@@ -34,6 +34,7 @@ import {
   verificarOrdenDePago,
 } from "../lib/settlement";
 import { accessToken, createPreference } from "../lib/mercadopago";
+import { reembolsarItem } from "../lib/refunds";
 import type { PaymentMethod, PaymentStatus, Prisma, TransactionStatus } from "../../prisma/generated/client";
 import { emitirCargos } from "../lib/emission";
 import { refUnico, serializePayment, serializePayments, toNumber } from "../lib/payment";
@@ -1159,5 +1160,72 @@ paymentsRouter.delete("/:id", requireAdmin, async (req: Request<{ id: string }>,
   } catch (error) {
     console.error("Delete payment error:", error);
     return res.status(500).json({ success: false, error: "Error al eliminar la cuota" });
+  }
+});
+
+/**
+ * POST /api/payments/:id/reembolso { reason } — la gestión devuelve por Mercado Pago el cobro de
+ * una fila `Pagado` (D12). 400 si no se cobró por MP, 409 si no está `Pagado` / hay un reembolso
+ * en curso o ya hecho, 502 si MP falla (queda `failed` y el barrido reintenta, o `rejected`
+ * y sólo la gestión lo reintenta llamando de nuevo).
+ */
+paymentsRouter.post("/:id/reembolso", requireAdmin, async (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const parsed = revertirSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: "Validación fallida",
+        errors: formatErrors(parsed.error.issues),
+      });
+    }
+    const fila = await prisma.payment.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, status: true, method: true },
+    });
+    if (!fila) return res.status(404).json({ success: false, error: "Cuota no encontrada" });
+    if (fila.method !== "MercadoPago") {
+      return res.status(400).json({ success: false, error: "Esa cuota no se cobró por Mercado Pago" });
+    }
+    if (fila.status !== "Pagado") {
+      return res.status(409).json({ success: false, error: "Sólo se reembolsa una cuota pagada" });
+    }
+    // La liquidación MP que la saldó (la más reciente aprobada).
+    const item = await prisma.paymentTransactionItem.findFirst({
+      where: { payment_id: fila.id, transaction: { method: "MercadoPago", status: { in: ["Aprobado", "ReembolsadoParcial"] } } },
+      orderBy: { transaction: { created_at: "desc" } },
+      select: { transaction_id: true },
+    });
+    if (!item) return res.status(400).json({ success: false, error: "No hay un pago de Mercado Pago para reembolsar" });
+
+    const r = await reembolsarItem({
+      transaccionId: item.transaction_id,
+      filaId: fila.id,
+      motivo: parsed.data.reason,
+      actor: req.user!.id,
+      persona: true,
+    });
+    auditar(req, "update", "payment", fila.id, {
+      motivo: parsed.data.reason,
+      antes: { status: fila.status },
+      despues: { reembolso: r.estado, refund_id: r.refundId },
+    });
+    if (r.estado === "approved") {
+      return res.json({ success: true, reembolso: { id: r.refundId, estado: "aprobado" } });
+    }
+    if (r.estado === "en_curso" || r.estado === "ya_reembolsado") {
+      return res.status(409).json({
+        success: false,
+        error: r.estado === "en_curso" ? "Hay un reembolso en curso" : "Esa cuota ya fue reembolsada",
+      });
+    }
+    return res.status(502).json({
+      success: false,
+      error: "Mercado Pago no pudo procesar el reembolso",
+      reembolso: { id: r.refundId, estado: r.estado },
+    });
+  } catch (error) {
+    console.error("Refund payment error:", error);
+    return res.status(500).json({ success: false, error: "Error al reembolsar la cuota" });
   }
 });

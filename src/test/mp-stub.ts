@@ -9,6 +9,11 @@ export function startMpStub() {
   const preferencias: Json[] = [];
   const reembolsos: { paymentId: string; key: string | null; body: Json }[] = [];
   let fallarPreferencia = false;
+  // Estado HTTP con el que falla el próximo POST de reembolso (y los siguientes) hasta `null`.
+  let fallarReembolso: { status: number; body: Json } | null = null;
+  const externos: { paymentId: string; refund: Json }[] = [];
+  // Ids únicos entre stubs y corridas: `Refund.mp_refund_id` es @unique en la base de test.
+  let seq = Date.now();
 
   const server = Bun.serve({
     port: 0,
@@ -34,9 +39,10 @@ export function startMpStub() {
         if (req.method === "POST") {
           const body = (await req.json().catch(() => ({}))) as Json;
           reembolsos.push({ paymentId, key: req.headers.get("x-idempotency-key"), body });
-          return json({ id: reembolsos.length, status: "approved", amount: body.amount ?? null });
+          if (fallarReembolso) return json(fallarReembolso.body, fallarReembolso.status);
+          return json({ id: ++seq, status: "approved", amount: body.amount ?? null });
         }
-        return json(reembolsos.filter((r) => r.paymentId === paymentId).map((r, i) => ({ id: i + 1, ...r.body })));
+        return json(externos.filter((r) => r.paymentId === paymentId).map((r) => r.refund));
       }
       const pago = ruta.match(/^\/v1\/payments\/([^/]+)$/);
       if (req.method === "GET" && pago) {
@@ -57,6 +63,14 @@ export function startMpStub() {
     /** Registra (o reemplaza) el pago que MP "tiene" con ese id. */
     setPago(id: string | number, datos: Json) {
       pagos.set(String(id), { id, ...datos });
+    },
+    /** Un reembolso hecho fuera de la app, que `GET /refunds` va a listar. */
+    agregarReembolsoExterno(paymentId: string | number, refund: Json) {
+      externos.push({ paymentId: String(paymentId), refund });
+    },
+    /** Hace fallar los POST de reembolso con ese status/cuerpo; `null` los deja pasar. */
+    fallarReembolsos(status: number | null, body: Json = {}) {
+      fallarReembolso = status === null ? null : { status, body };
     },
     fallarPreferencias(v = true) {
       fallarPreferencia = v;
