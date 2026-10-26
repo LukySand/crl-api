@@ -7,6 +7,7 @@ import { emitirCargos } from "./emission";
 import { logger } from "./logger";
 import { todayInClub } from "./payment-period";
 import { syncPendingPayments } from "./payment-sync";
+import { reintentarReembolsos } from "./refunds";
 
 export function startScheduler(): void {
   if (process.env.DISABLE_CRON === "true") return;
@@ -28,6 +29,16 @@ export function startScheduler(): void {
       if (n > 0) logger.info(`Conciliación MP: ${n} liquidaciones actualizadas`);
     } catch (error) {
       logger.error(error, "Conciliación MP falló");
+    }
+  });
+
+  // Reembolsos `failed` o `pending` viejos (últimos 7 días), con la misma clave; nunca los `rejected`.
+  Bun.cron("*/15 * * * *", async () => {
+    try {
+      const n = await reintentarReembolsos(20);
+      if (n > 0) logger.info(`Reembolsos reintentados: ${n} aprobados`);
+    } catch (error) {
+      logger.error(error, "Reintento de reembolsos falló");
     }
   });
 }

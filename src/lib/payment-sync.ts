@@ -7,7 +7,8 @@
 import type { Prisma, TransactionStatus } from "../../prisma/generated/client";
 import prisma from "./prisma";
 import { logger } from "./logger";
-import { getPayment, mapEstadoMP, searchPaymentsByExternalReference } from "./mercadopago";
+import { getPayment, listRefunds, mapEstadoMP, searchPaymentsByExternalReference } from "./mercadopago";
+import { aprobarReembolso, efectosDeReembolso, reembolsarItem } from "./refunds";
 
 type Mp = Record<string, any>;
 
@@ -163,13 +164,112 @@ export async function aplicarPagoMP(mp: Mp, liq: LiquidacionMP): Promise<Resulta
   });
   if (!aplicado) return null;
 
-  // B6 conecta `reembolsarItem` y B7 el retome de reservas; hasta entonces sólo se avisa.
+  // La plata que no pudo saldar una fila vuelve sola (D12); la reserva la retoma B7.
   for (const n of noSaldados) {
-    logger.error(new Error("pago de MP sin fila saldable"), "Reembolso pendiente", {
-      metadata: { liquidacion_id: liq.id, ...n },
-    });
+    try {
+      await reembolsarItem({
+        transaccionId: liq.id,
+        filaId: n.payment_id,
+        motivo: n.motivo,
+        actor: "sistema",
+        propio: true,
+      });
+    } catch (error) {
+      // El `pending` ya está registrado: el barrido de 15 minutos lo reintenta.
+      logger.error(error, "Reembolso automático falló", { metadata: { liquidacion_id: liq.id, ...n } });
+    }
+  }
+  if (Number(mp?.transaction_amount_refunded ?? 0) > 0) {
+    try {
+      await conciliarReembolsosExternos(liq.id, String(mp.id));
+    } catch (error) {
+      logger.error(error, "Conciliación de reembolsos externos falló", { metadata: { liquidacion_id: liq.id } });
+    }
   }
   return { estado, noSaldados };
+}
+
+/**
+ * Reembolsos hechos fuera de la app (D13.5), uno por uno: se adjuntan a un `Refund` local
+ * `pending` del mismo monto; si no, a la fila `Pagado` de monto exacto (menor id si empata);
+ * si nada calza queda un `Refund` sin fila, que sólo se informa. Los que ya conocemos
+ * (propios o ya conciliados) se saltean por `mp_refund_id`.
+ */
+export async function conciliarReembolsosExternos(liquidacionId: string, mpPaymentId: string) {
+  const externos = await listRefunds(mpPaymentId);
+  for (const r of externos) {
+    const mpId = String(r.id);
+    const monto = (centavos(r.amount) / 100).toFixed(2);
+    const fecha = r.date_created ? new Date(r.date_created) : new Date();
+    if (await prisma.refund.findFirst({ where: { OR: [{ mp_refund_id: mpId }, { idempotency_key: `mp:${mpId}` }] }, select: { id: true } })) {
+      continue;
+    }
+    const local = await prisma.refund.findFirst({
+      where: { transaction_id: liquidacionId, status: "pending", amount: monto },
+      orderBy: { id: "asc" },
+      select: { id: true, reason: true, requested_by: true },
+    });
+    if (local && (await aprobarReembolso(local.id, { mpRefundId: mpId, refundedAt: fecha, actor: local.requested_by, motivo: local.reason ?? "Reembolso" }))) {
+      continue;
+    }
+
+    const items = await prisma.paymentTransactionItem.findMany({
+      where: { transaction_id: liquidacionId, amount: monto },
+      select: { payment_id: true },
+      orderBy: { payment_id: "asc" },
+    });
+    const conReembolso = new Set(
+      (
+        await prisma.refund.findMany({
+          where: { transaction_id: liquidacionId, payment_id: { not: null }, status: { in: ["approved", "pending", "resolved_offline"] } },
+          select: { payment_id: true },
+        })
+      ).map((x) => x.payment_id),
+    );
+    // Una fila que MP ya anuló al ver el `refunded` también cuenta: es la plata que volvió.
+    const filas = await prisma.payment.findMany({
+      where: {
+        id: { in: items.map((i) => i.payment_id).filter((id) => !conReembolso.has(id)) },
+        OR: [{ status: "Pagado" }, { status: "Anulado", resolved_by: "mercadopago" }],
+      },
+      select: { id: true },
+      orderBy: { id: "asc" },
+    });
+    const fila = filas[0];
+
+    try {
+      await prisma.$transaction(async (tx) => {
+        const creado = await tx.refund.create({
+          data: {
+            transaction_id: liquidacionId,
+            payment_id: fila?.id ?? null,
+            amount: monto,
+            status: "approved",
+            reason: "Reembolso hecho en Mercado Pago",
+            requested_by: "mercadopago",
+            income_reversal: fila !== undefined,
+            refunded_at: fecha,
+            mp_refund_id: mpId,
+            idempotency_key: `mp:${mpId}`,
+          },
+        });
+        await efectosDeReembolso(tx, creado, "mercadopago", "Reembolsado en Mercado Pago");
+      });
+    } catch (e) {
+      if ((e as { code?: string })?.code === "P2002") continue; // otro proceso lo conciliaba
+      throw e;
+    }
+    if (!fila) {
+      logger.error(new Error("reembolso externo sin fila asignable"), "Reembolso externo sin asignar", {
+        metadata: { liquidacion_id: liquidacionId, mp_refund_id: mpId, monto },
+      });
+      logger.audit(
+        "create",
+        { metadata: { operacion: "create", entidad: "refund", entidad_id: mpId, actor_id: "mercadopago", despues: { liquidacion_id: liquidacionId, monto, sin_asignar: true } } },
+        "refund create",
+      );
+    }
+  }
 }
 
 /**
