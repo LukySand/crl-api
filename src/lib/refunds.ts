@@ -37,7 +37,7 @@ export function errorSeguroMP(err: unknown): string {
   return nombre === "TimeoutError" || nombre === "AbortError" ? "timeout" : "red";
 }
 
-export type EstadoReembolso = "approved" | "failed" | "rejected" | "en_curso" | "ya_reembolsado";
+export type EstadoReembolso = "approved" | "failed" | "rejected" | "en_curso" | "ya_reembolsado" | "resuelto";
 
 export interface ResultadoReembolso {
   estado: EstadoReembolso;
@@ -60,9 +60,32 @@ export interface ReembolsoOpts {
 const esDuplicado = (e: unknown) => (e as { code?: string } | null)?.code === "P2002";
 
 /**
+ * Efecto sobre la fila de un reembolso que devolvió plata: `Pagado → Anulado` (conserva
+ * `paid_at`/`method`, D22; sólo si descontó un ingreso) y, si era una `Reserva`, cancela la reserva.
+ */
+async function anularFilaReembolsada(
+  tx: Prisma.TransactionClient,
+  r: { payment_id: string | null; income_reversal: boolean },
+  actor: string,
+  motivo: string,
+) {
+  if (!r.payment_id || !r.income_reversal) return;
+  const { count } = await tx.payment.updateMany({
+    where: { id: r.payment_id, status: "Pagado" },
+    data: { status: "Anulado", resolved_by: actor, resolved_reason: motivo, resolved_at: new Date() },
+  });
+  if (count > 0) {
+    const f = await tx.payment.findUnique({ where: { id: r.payment_id }, select: { booking_id: true } });
+    if (f?.booking_id) {
+      await tx.booking.updateMany({ where: { id: f.booking_id }, data: { status: "Cancelada", active: null } });
+    }
+  }
+}
+
+/**
  * Efectos de contabilidad de un reembolso aprobado, dentro de la transacción del llamador:
- * fila `Pagado → Anulado` (conserva `paid_at`/`method`, D22; sólo si descontó un ingreso),
- * reserva `Cancelada` y estado de la liquidación (`Reembolsado` si ya salió todo).
+ * la fila y la reserva (`anularFilaReembolsada`) y el estado de la liquidación
+ * (`Reembolsado` si ya salió todo).
  */
 export async function efectosDeReembolso(
   tx: Prisma.TransactionClient,
@@ -70,18 +93,7 @@ export async function efectosDeReembolso(
   actor: string,
   motivo: string,
 ) {
-  if (r.payment_id && r.income_reversal) {
-    const { count } = await tx.payment.updateMany({
-      where: { id: r.payment_id, status: "Pagado" },
-      data: { status: "Anulado", resolved_by: actor, resolved_reason: motivo, resolved_at: new Date() },
-    });
-    if (count > 0) {
-      const f = await tx.payment.findUnique({ where: { id: r.payment_id }, select: { booking_id: true } });
-      if (f?.booking_id) {
-        await tx.booking.updateMany({ where: { id: f.booking_id }, data: { status: "Cancelada", active: null } });
-      }
-    }
-  }
+  await anularFilaReembolsada(tx, r, actor, motivo);
   const liq = await tx.paymentTransaction.findUnique({ where: { id: r.transaction_id }, select: { amount: true } });
   const { _sum } = await tx.refund.aggregate({
     where: { transaction_id: r.transaction_id, status: "approved" },
@@ -166,9 +178,9 @@ export async function reembolsarItem(o: ReembolsoOpts): Promise<ResultadoReembol
       where: { idempotency_key: key },
       select: { id: true, status: true, updated_at: true },
     });
-    if (previo.status === "approved" || previo.status === "resolved_offline") {
-      return { estado: "ya_reembolsado", refundId: previo.id };
-    }
+    if (previo.status === "approved") return { estado: "ya_reembolsado", refundId: previo.id };
+    // D24b: cerrado a mano, terminal; nadie lo reintenta.
+    if (previo.status === "resolved_offline") return { estado: "resuelto", refundId: previo.id };
     const viejo = Date.now() - previo.updated_at.getTime() > PENDING_VIEJO_MS;
     const reclamable =
       previo.status === "failed" ||
@@ -250,4 +262,45 @@ export async function reintentarReembolsos(limite = 20): Promise<number> {
     }
   }
   return aprobados;
+}
+
+export type ResultadoResolver = "resuelto" | "no_existe" | "en_curso" | "no_resoluble";
+
+/**
+ * D24b: cierra a mano un reembolso `failed`/`rejected` ("Resuelta fuera de Mercado Pago").
+ * Terminal: queda `resolved_offline` y nadie lo reintenta. Con `devueltoEnMano` la plata salió de
+ * la caja del club: `refunded_at = now` (egreso del mes de hoy, D22) y, en la misma transacción,
+ * la fila `Pagado → Anulado` y la reserva cancelada. La liquidación no se toca (refleja a MP).
+ * El `updateMany` guardado por estado hace que un resolver concurrente o el barrido, uno solo gane.
+ */
+export async function resolverFueraDeMP(
+  refundId: number,
+  o: { note: string; devueltoEnMano: boolean; actor: string },
+): Promise<ResultadoResolver> {
+  return prisma.$transaction(async (tx) => {
+    const ahora = new Date();
+    const { count } = await tx.refund.updateMany({
+      where: { id: refundId, status: { in: ["failed", "rejected"] } },
+      data: {
+        status: "resolved_offline",
+        resolved_by: o.actor,
+        resolved_note: o.note,
+        resolved_at: ahora,
+        ...(o.devueltoEnMano ? { refunded_at: ahora } : {}),
+      },
+    });
+    if (count === 0) {
+      const r = await tx.refund.findUnique({ where: { id: refundId }, select: { status: true } });
+      if (!r) return "no_existe";
+      return r.status === "pending" ? "en_curso" : "no_resoluble";
+    }
+    if (o.devueltoEnMano) {
+      const r = await tx.refund.findUniqueOrThrow({
+        where: { id: refundId },
+        select: { payment_id: true, income_reversal: true },
+      });
+      await anularFilaReembolsada(tx, r, o.actor, o.note);
+    }
+    return "resuelto";
+  });
 }

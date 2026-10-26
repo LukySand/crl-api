@@ -204,3 +204,175 @@ test("reembolsar una fila Reserva cancela la reserva", async () => {
   expect((await reembolsar(admin.token, fila.id)).status).toBe(200);
   expect(await prisma.booking.findUniqueOrThrow({ where: { id: booking.id } })).toMatchObject({ status: "Cancelada", active: null });
 });
+
+// ---- D24 / D24b: "Con problemas" y resolución fuera de MP ----
+
+const problemas = (token: string) => api("GET", "/api/transactions/problemas", { token });
+const resolver = (token: string, id: number, body: object) =>
+  api("POST", `/api/transactions/refunds/${id}/resolver`, { token, body });
+const keyDe = (liqId: string, filaId: string) => `reembolso:${liqId}:${filaId}`;
+
+test("problemas: MP caido -> failed con intentos y reintento automatico; el barrido sube attempts y al aprobar sale de la lista", async () => {
+  const { admin, filas, liq } = await cobrada([60]);
+  stub.fallarReembolsos(500, { message: "juan@mail.com tarjeta 4509" });
+  await reembolsar(admin.token, filas[0]!.id);
+  stub.fallarReembolsos(null);
+  const refund = await prisma.refund.findUniqueOrThrow({ where: { idempotency_key: keyDe(liq.id, filas[0]!.id) } });
+
+  const r = await problemas(admin.token);
+  expect(r.status).toBe(200);
+  const fila = r.body.reembolsos.find((x: { id: number }) => x.id === refund.id);
+  expect(fila).toMatchObject({ estado: "failed", intentos: 1, ultimo_error: "HTTP 500", reintento_automatico: true, origen: "gestion" });
+  expect(fila.cargo.id).toBe(filas[0]!.id);
+  expect(fila.monto).toBe("60.00");
+  expect(JSON.stringify(r.body)).not.toMatch(/"raw"|mp_status_detail|juan@mail|4509/);
+  expect(JSON.stringify(fila)).not.toContain(admin.id); // sin id de usuario
+
+  await reintentarReembolsos(20);
+  expect((await prisma.refund.findUniqueOrThrow({ where: { id: refund.id } })).attempts).toBe(2);
+  expect((await problemas(admin.token)).body.reembolsos.some((x: { id: number }) => x.id === refund.id)).toBe(false);
+});
+
+test("problemas: rejected sin reintento automatico (el barrido lo saltea, la gestion lo reintenta); pending viejo si, reciente no; sin fila -> cargo null", async () => {
+  const { admin, socio, filas, liq } = await cobrada([70, 71, 72]);
+  stub.fallarReembolsos(400, { error: "bad_request" });
+  await reembolsar(admin.token, filas[0]!.id);
+  stub.fallarReembolsos(null);
+  const rechazado = await prisma.refund.findUniqueOrThrow({ where: { idempotency_key: keyDe(liq.id, filas[0]!.id) } });
+  const base = { transaction_id: liq.id, status: "pending", requested_by: "sistema" };
+  const viejo = await prisma.refund.create({
+    data: { ...base, payment_id: filas[1]!.id, amount: 71, idempotency_key: keyDe(liq.id, filas[1]!.id), updated_at: new Date(Date.now() - 10 * 60_000) },
+  });
+  const reciente = await prisma.refund.create({
+    data: { ...base, payment_id: filas[2]!.id, amount: 72, idempotency_key: keyDe(liq.id, filas[2]!.id) },
+  });
+  const huerfano = await prisma.refund.create({
+    data: { transaction_id: liq.id, payment_id: null, amount: 5, status: "failed", requested_by: "mercadopago", income_reversal: false, idempotency_key: `reembolso:${liq.id}:total` },
+  });
+
+  const r = await problemas(admin.token);
+  const por = (id: number) => r.body.reembolsos.find((x: { id: number }) => x.id === id);
+  expect(por(rechazado.id)).toMatchObject({ estado: "rejected", reintento_automatico: false, ultimo_error: "HTTP 400 bad_request" });
+  expect(por(viejo.id)).toBeDefined();
+  expect(por(reciente.id)).toBeUndefined();
+  expect(por(huerfano.id)).toMatchObject({ cargo: null, origen: "mercadopago" });
+  expect((await problemas(socio.token)).status).toBe(403);
+
+  const antes = stub.reembolsos.length;
+  await reintentarReembolsos(20);
+  expect((await prisma.refund.findUniqueOrThrow({ where: { id: rechazado.id } })).status).toBe("rejected");
+  expect(stub.reembolsos.length).toBeGreaterThan(antes); // el pending viejo y el failed si se reintentaron
+  expect((await reembolsar(admin.token, filas[0]!.id)).status).toBe(200); // la gestion si
+});
+
+test("problemas: un contracargo aparece en su lista", async () => {
+  const { admin, liq } = await cobrada([33]);
+  await prisma.paymentTransaction.update({ where: { id: liq.id }, data: { status: "Contracargo" } });
+  const r = await problemas(admin.token);
+  const c = r.body.contracargos.find((x: { id: string }) => x.id === liq.id);
+  expect(c).toMatchObject({ mp_payment_id: liq.mp_payment_id, monto: "33.00" });
+  expect(c.cargos).toHaveLength(1);
+  expect(JSON.stringify(c)).not.toContain('"raw"');
+});
+
+/** Una fila Pagado con un Refund `failed` o `rejected` ya creado. */
+async function conReembolsoFallido(estado: "failed" | "rejected", monto = 90) {
+  const c = await cobrada([monto]);
+  const refund = await prisma.refund.create({
+    data: {
+      transaction_id: c.liq.id, payment_id: c.filas[0]!.id, amount: monto, status: estado, requested_by: c.admin.id,
+      attempts: 1, last_error: "HTTP 500", idempotency_key: keyDe(c.liq.id, c.filas[0]!.id),
+    },
+  });
+  return { ...c, refund };
+}
+
+test("resolver sin devolver plata: queda resolved_offline, la fila sigue Pagado y no hay egreso", async () => {
+  const { admin, filas, liq, refund } = await conReembolsoFallido("failed");
+  const r = await resolver(admin.token, refund.id, { note: "se acredita en la proxima cuota", devuelto_en_mano: false });
+  expect(r.status).toBe(200);
+  expect(r.body.reembolso).toEqual({ id: refund.id, estado: "resolved_offline", devuelto_en_mano: false });
+  const despues = await prisma.refund.findUniqueOrThrow({ where: { id: refund.id } });
+  expect(despues).toMatchObject({ status: "resolved_offline", resolved_by: admin.id, resolved_note: "se acredita en la proxima cuota", refunded_at: null });
+  expect(despues.resolved_at).not.toBeNull();
+  expect((await prisma.payment.findUniqueOrThrow({ where: { id: filas[0]!.id } })).status).toBe("Pagado");
+  expect((await prisma.paymentTransaction.findUniqueOrThrow({ where: { id: liq.id } })).status).toBe("Aprobado");
+  expect((await problemas(admin.token)).body.reembolsos.some((x: { id: number }) => x.id === refund.id)).toBe(false);
+  // terminal: ni el barrido ni /reembolso lo vuelven a intentar
+  const antes = stub.reembolsos.length;
+  await reintentarReembolsos(20);
+  expect(stub.reembolsos.length).toBe(antes);
+  expect((await reembolsar(admin.token, filas[0]!.id)).status).toBe(409);
+  expect(stub.reembolsos.length).toBe(antes);
+});
+
+test("resolver con devolucion en mano (rejected): fila Anulado (conserva paid_at/method), refunded_at hoy, liquidacion intacta", async () => {
+  const { admin, filas, liq, refund } = await conReembolsoFallido("rejected");
+  const r = await resolver(admin.token, refund.id, { note: "se devolvio en efectivo en secretaria", devuelto_en_mano: true });
+  expect(r.status).toBe(200);
+  const despues = await prisma.refund.findUniqueOrThrow({ where: { id: refund.id } });
+  expect(despues.status).toBe("resolved_offline");
+  expect(despues.refunded_at).not.toBeNull();
+  expect(Math.abs(Date.now() - despues.refunded_at!.getTime())).toBeLessThan(60_000); // egreso del mes de la resolucion
+  const fila = await prisma.payment.findUniqueOrThrow({ where: { id: filas[0]!.id } });
+  expect(fila).toMatchObject({ status: "Anulado", method: "MercadoPago", resolved_by: admin.id, resolved_reason: "se devolvio en efectivo en secretaria" });
+  expect(fila.paid_at).not.toBeNull();
+  expect((await prisma.paymentTransaction.findUniqueOrThrow({ where: { id: liq.id } })).status).toBe("Aprobado");
+});
+
+test("resolver con devolucion en mano e income_reversal=false: marca refunded_at pero no toca la fila (no hay egreso)", async () => {
+  const { admin, filas, refund } = await conReembolsoFallido("failed", 25);
+  await prisma.refund.update({ where: { id: refund.id }, data: { income_reversal: false } });
+  expect((await resolver(admin.token, refund.id, { note: "devuelto en mano", devuelto_en_mano: true })).status).toBe(200);
+  expect((await prisma.payment.findUniqueOrThrow({ where: { id: filas[0]!.id } })).status).toBe("Pagado");
+});
+
+test("resolver con devolucion en mano de una Reserva cancela la reserva", async () => {
+  const schedule = await prisma.schedule.findFirst();
+  const fee = await prisma.fee.findFirst();
+  if (!schedule || !fee) return; // la base de test no trae turnos ni tarifas sembrados
+  const { admin, socio, filas, refund } = await conReembolsoFallido("failed", 20);
+  const booking = await prisma.booking.create({
+    data: { schedule_id: schedule.id, fee_id: fee.id, user_id: socio.id, date: new Date("2034-04-04T00:00:00Z"), status: "Confirmada", active: true },
+  });
+  await prisma.payment.update({ where: { id: filas[0]!.id }, data: { concept: "Reserva", booking_id: booking.id } });
+  expect((await resolver(admin.token, refund.id, { note: "devuelto en mano", devuelto_en_mano: true })).status).toBe(200);
+  expect(await prisma.booking.findUniqueOrThrow({ where: { id: booking.id } })).toMatchObject({ status: "Cancelada", active: null });
+});
+
+test("resolver: 400 sin nota o campos sueltos, 403 no admin, 404 inexistente, 409 pending / aprobado / ya resuelto", async () => {
+  const { admin, socio, refund } = await conReembolsoFallido("failed");
+  expect((await resolver(admin.token, refund.id, { devuelto_en_mano: false })).status).toBe(400);
+  expect((await resolver(admin.token, refund.id, { note: "ok", devuelto_en_mano: false })).status).toBe(400); // nota < 3
+  expect((await resolver(admin.token, refund.id, { note: "motivo", devuelto_en_mano: false, extra: 1 })).status).toBe(400);
+  expect((await resolver(socio.token, refund.id, { note: "motivo", devuelto_en_mano: false })).status).toBe(403);
+  expect((await resolver(admin.token, 2_000_000_000, { note: "motivo", devuelto_en_mano: false })).status).toBe(404);
+
+  const pendiente = await prisma.refund.create({
+    data: { transaction_id: refund.transaction_id, payment_id: null, amount: 1, status: "pending", requested_by: "sistema", idempotency_key: `reembolso:${refund.transaction_id}:total` },
+  });
+  expect((await resolver(admin.token, pendiente.id, { note: "motivo", devuelto_en_mano: false })).status).toBe(409);
+  await prisma.refund.update({ where: { id: pendiente.id }, data: { status: "approved" } });
+  expect((await resolver(admin.token, pendiente.id, { note: "motivo", devuelto_en_mano: false })).status).toBe(409);
+
+  expect((await resolver(admin.token, refund.id, { note: "motivo", devuelto_en_mano: false })).status).toBe(200);
+  expect((await resolver(admin.token, refund.id, { note: "otra vez", devuelto_en_mano: true })).status).toBe(409);
+});
+
+test("resolver concurrente contra el barrido: exactamente uno gana", async () => {
+  const { admin, filas, refund } = await conReembolsoFallido("failed", 45);
+  const [res] = await Promise.all([
+    resolver(admin.token, refund.id, { note: "devuelto en mano", devuelto_en_mano: true }),
+    reintentarReembolsos(20),
+  ]);
+  const final = await prisma.refund.findUniqueOrThrow({ where: { id: refund.id } });
+  const fila = await prisma.payment.findUniqueOrThrow({ where: { id: filas[0]!.id } });
+  if (res.status === 200) {
+    expect(final.status).toBe("resolved_offline");
+  } else {
+    // el barrido lo reclamo primero: ya no es resoluble y el reembolso salio por MP
+    expect(res.status).toBe(409);
+    expect(final.status).toBe("approved");
+  }
+  expect(fila.status).toBe("Anulado"); // en ambos caminos la fila queda anulada una sola vez
+});

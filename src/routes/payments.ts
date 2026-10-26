@@ -1236,11 +1236,13 @@ paymentsRouter.post("/:id/reembolso", requireAdmin, async (req: Request<{ id: st
     if (r.estado === "approved") {
       return res.json({ success: true, reembolso: { id: r.refundId, estado: "aprobado" } });
     }
-    if (r.estado === "en_curso" || r.estado === "ya_reembolsado") {
-      return res.status(409).json({
-        success: false,
-        error: r.estado === "en_curso" ? "Hay un reembolso en curso" : "Esa cuota ya fue reembolsada",
-      });
+    if (r.estado === "en_curso" || r.estado === "ya_reembolsado" || r.estado === "resuelto") {
+      const error = {
+        en_curso: "Hay un reembolso en curso",
+        ya_reembolsado: "Esa cuota ya fue reembolsada",
+        resuelto: "Ese reembolso ya fue resuelto fuera de Mercado Pago",
+      }[r.estado];
+      return res.status(409).json({ success: false, error });
     }
     return res.status(502).json({
       success: false,
