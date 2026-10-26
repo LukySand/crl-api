@@ -406,3 +406,28 @@ model PartnerStore {
 
   @@map("partner_stores")
 }
+
+// Token de la API de Instagram del club. Una sola fila (id = 1). Si no hay token,
+// /api/novedades cae a los `NovedadLink` cargados a mano. La API nunca devuelve
+// el token completo: solo una máscara.
+model InstagramConfig {
+  id               Int       @id
+  access_token     String?   @db.Text
+  token_updated_at DateTime?
+
+  @@map("instagram_config")
+}
+
+// Post o reel de Instagram cargado a mano para la vitrina de novedades. `code` es
+// el shortcode de la URL (instagram.com/p/<code>/); es único aunque la URL traiga
+// parámetros de seguimiento distintos. Orden de la vitrina: fijados, luego `position`.
+model NovedadLink {
+  id         Int      @id @default(autoincrement())
+  code       String   @unique @db.VarChar(50)
+  kind       String   @db.VarChar(10)
+  pinned     Boolean  @default(false)
+  position   Int      @default(0)
+  created_at DateTime @default(now())
+
+  @@map("novedad_links")
+}
