@@ -4,6 +4,8 @@ import prisma from "../lib/prisma";
 import { requireAuth, isAdmin, veComoGestion } from "../lib/auth";
 import { findOrCreateFeeForPlace } from "../lib/fee";
 import { refReserva } from "../lib/payment";
+import { bloqueaTurno } from "../lib/schedule-block";
+import { bloqueoQueCierra, bloqueosDelDia } from "../lib/schedule-block-db";
 import {
   parseDate,
   matchesDayOfWeek,
@@ -107,6 +109,14 @@ bookingsRouter.get("/", async (req: Request, res: Response) => {
   }
 });
 
+/** Por qué un turno no se puede reservar ese día. `detalle` trae el motivo de un bloqueo. */
+interface SlotDisponibilidad {
+  id: number;
+  ocupado: true;
+  motivo: "reserva" | "bloqueo";
+  detalle: string | null;
+}
+
 /**
  * GET /api/bookings/availability?place_id=1&date=2026-08-17 — qué turnos están
  * tomados ese día. Devuelve sólo ids, sin datos de quién reservó: el socio
@@ -127,13 +137,44 @@ bookingsRouter.get("/availability", async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: "La fecha debe ser YYYY-MM-DD" });
     }
 
-    const rows = await prisma.booking.findMany({
-      // active: true deja afuera las canceladas (que quedan en null y liberan el turno)
-      where: { date: parseDate(date), active: true, schedule: { place_id: placeId } },
-      select: { schedule_id: true },
+    const dia = parseDate(date);
+    if (Number.isNaN(dia.getTime())) {
+      return res.status(400).json({ success: false, error: "Fecha inválida" });
+    }
+
+    const [rows, turnos, bloqueos] = await Promise.all([
+      prisma.booking.findMany({
+        // active: true deja afuera las canceladas (que quedan en null y liberan el turno)
+        where: { date: dia, active: true, schedule: { place_id: placeId } },
+        select: { schedule_id: true },
+      }),
+      // Los turnos que caen ese día de la semana: son los únicos que un bloqueo
+      // puede cerrar ese día.
+      prisma.schedule.findMany({
+        where: { place_id: placeId, day_of_week: dia.getUTCDay() },
+        select: { id: true, start_time: true, end_time: true },
+      }),
+      bloqueosDelDia(placeId, date),
+    ]);
+
+    const reservados = new Set(rows.map((r) => r.schedule_id));
+
+    // Por qué está ocupado cada turno. Un bloqueo manda sobre una reserva: si los
+    // dos coinciden, lo que ve el socio es que el espacio está cerrado.
+    const slots = turnos.flatMap((t): SlotDisponibilidad[] => {
+      const cierre = bloqueos.find((b) =>
+        bloqueaTurno(b, date, { start: timeToHHMM(t.start_time), end: timeToHHMM(t.end_time) }),
+      );
+      if (cierre) return [{ id: t.id, ocupado: true, motivo: "bloqueo", detalle: cierre.reason }];
+      if (reservados.has(t.id)) return [{ id: t.id, ocupado: true, motivo: "reserva", detalle: null }];
+      return [];
     });
 
-    return res.json({ success: true, taken: rows.map((r) => r.schedule_id) });
+    // `taken` sigue siendo la lista plana de ids no reservables (bloqueados incluidos),
+    // para las pantallas que sólo necesitan saber qué turnos no se pueden tomar.
+    const taken = [...new Set([...rows.map((r) => r.schedule_id), ...slots.map((x) => x.id)])];
+
+    return res.json({ success: true, taken, slots });
   } catch (error) {
     console.error("Availability error:", error);
     return res.status(500).json({ success: false, error: "Error al consultar disponibilidad" });
@@ -283,6 +324,18 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
         success: false,
         error: `Ese turno es los ${dias[schedule.day_of_week]}, y la fecha elegida es ${dias[when.getUTCDay()]}`,
       });
+    }
+
+    // Un bloqueo temporal (mantenimiento, evento…) cierra el turno en esa fecha
+    // para todos, también para la gestión: si hace falta usarlo, se levanta antes.
+    const bloqueo = await bloqueoQueCierra(schedule.place_id, date, {
+      start: timeToHHMM(schedule.start_time),
+      end: timeToHHMM(schedule.end_time),
+    });
+    if (bloqueo) {
+      return res
+        .status(409)
+        .json({ success: false, error: `Ese horario está bloqueado: ${bloqueo.reason}` });
     }
 
     // Snapshot del precio. Por defecto sale del turno, no del cliente: si no,

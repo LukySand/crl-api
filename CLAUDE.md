@@ -122,6 +122,22 @@ Todos en `src/routes/auth.ts`, montados bajo `/api/auth` (salvo health).
 | GET | `/api/reports/export` | gestión | Descarga Excel o PDF de lo que muestra la pantalla de reportes. `?format=xlsx\|pdf &bucket= &from= &to= &canchas= &disciplinas=` (los dos últimos se repiten una vez por nombre; ausente = todas, vacío = ninguna) |
 | GET | `/api/enrollments/export` | gestión o profe de esa disciplina | Lista de inscriptos para bajar o imprimir. `?discipline_id= &format=xlsx\|pdf`. Sin celular ni email a propósito (ver `lib/enrollment-export.ts`) |
 
+### Bloqueo de espacios
+
+Cierra un espacio durante un rango de fechas (y, si trae franja horaria, sólo en esa franja) sin
+tocar los turnos: borrar el turno de los lunes valdría para todos los lunes, y el bloqueo es "el
+lunes 21 por mantenimiento". Modelo `ScheduleBlock`; la lógica pura vive en `lib/schedule-block.ts`.
+
+| Método | Ruta | Guard | Qué hace |
+| --- | --- | --- | --- |
+| GET | `/api/blocks` | gestión | Bloqueos vigentes (los que no terminaron). `?place_id=` |
+| POST | `/api/blocks` | gestión | `{place_id, from, to?, start_time?, end_time?, reason}`. Sin `to` es un día; sin franja, todo el día. **409 con `conflictos` si ya hay reservas vivas en ese rango**: no las cancela solo |
+| DELETE | `/api/blocks/:id` | gestión | Lo levanta: el espacio vuelve a poder reservarse |
+
+`POST /api/bookings` responde 409 si el turno está bloqueado ese día (también para la gestión), y
+`GET /api/bookings/availability` suma `slots: [{id, ocupado, motivo: "reserva"|"bloqueo", detalle}]`,
+con el motivo del bloqueo en `detalle`. `taken` sigue siendo la lista plana e incluye los bloqueados.
+
 `/ingresos` corta por **una** dimensión; `/series` es la de **dos** (tiempo × algo), que es lo
 que hace falta para "cuánto facturó cada cancha por día". Cuatro reglas de `/series`:
 
