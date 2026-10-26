@@ -23,7 +23,8 @@ import {
   palabrasDeBusqueda,
   type QuienCobra,
 } from "../lib/cobro";
-import { refDisciplina, serializePayment, serializePayments } from "../lib/payment";
+import { emitirCargos } from "../lib/emission";
+import { serializePayment, serializePayments } from "../lib/payment";
 import {
   cursoEnPeriodo,
   esPeriodoValido,
@@ -234,7 +235,7 @@ paymentsRouter.get("/resumen", async (req: Request, res: Response) => {
 });
 
 /**
- * POST /api/payments/generate — genera las cuotas de disciplina de un período.
+ * POST /api/payments/generate — dispara a mano el motor de emisión (lib/emission.ts).
  * Sólo gestión.
  *
  * Es idempotente: cada cuota lleva un `ref` único (disciplina:<enrollment>:<periodo>)
@@ -255,59 +256,19 @@ paymentsRouter.post("/generate", requireAdmin, async (req: Request, res: Respons
       });
     }
     const { period } = parsed.data;
-    // El día de vencimiento es un ajuste del club. Rige para las cuotas que se
-    // generan ahora: las ya generadas conservan su fecha.
-    const { payment_due_day } = await getAjustes();
-    const due = vencimientoDe(period, payment_due_day);
-
-    // Todas las inscripciones que tocaron el período, activas o ya dadas de baja:
-    // si el socio cursó marzo y se fue en abril, la cuota de marzo se le cobra
-    // igual. Por eso no se filtra por active.
-    const enrollments = await prisma.enrollment.findMany({
-      where: { discipline: { fee_id: { not: null } } },
-      select: {
-        id: true,
-        user_id: true,
-        created_at: true,
-        left_at: true,
-        discipline: {
-          select: { id: true, name: true, fee: { select: { id: true, amount: true } } },
-        },
-      },
-    });
-
-    const aCobrar = enrollments.filter((e) =>
-      cursoEnPeriodo(e.created_at, e.left_at, period),
-    );
-
-    const filas = aCobrar.map((e) => ({
-      user_id: e.user_id,
-      concept: "Disciplina" as const,
-      name: `Cuota de ${e.discipline.name} ${period}`,
-      enrollment_id: e.id,
-      fee_id: e.discipline.fee!.id,
-      // Monto congelado: si mañana repuntan la tarifa de la disciplina, esta
-      // cuota sigue valiendo lo que valía el mes que se generó.
-      amount: e.discipline.fee!.amount,
-      period,
-      due_date: due,
-      ref: refDisciplina(e.id, period),
-    }));
-
-    // skipDuplicates se apoya en el unique de `ref`: las que ya existían no se
-    // tocan (pueden estar pagas) y sólo entran las nuevas.
-    const { count } = await prisma.payment.createMany({
-      data: filas,
-      skipDuplicates: true,
-    });
+    // Disparo manual del motor de emisión (D5). El período elegido fija el "hoy"
+    // del motor: el mes corriente usa el día real; otro mes, su día 1 (la gestión
+    // lo usa para reponer un mes puntual).
+    const hoy = period === periodoActual() ? todayInClub() : `${period}-01`;
+    const { generadas, candidatas } = await emitirCargos({ hoy });
 
     return res.status(201).json({
       success: true,
       period,
-      generadas: count,
-      candidatas: filas.length,
+      generadas,
+      candidatas,
       // La diferencia son las que ya existían de una corrida anterior.
-      omitidas: filas.length - count,
+      omitidas: candidatas - generadas,
     });
   } catch (error) {
     console.error("Generate payments error:", error);
