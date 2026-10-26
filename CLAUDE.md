@@ -119,15 +119,19 @@ Todos en `src/routes/auth.ts`, montados bajo `/api/auth` (salvo health).
 | GET | `/api/reports/ingresos` | gestión | Totales + un corte. `?from= &to= &concept= &group=mes\|concepto\|metodo\|disciplina\|espacio` |
 | GET | `/api/reports/series` | gestión | Serie temporal. `?bucket=dia\|semana\|mes &by=espacio\|disciplina\|concepto\|metodo &from= &to=` |
 | GET | `/api/reports/morosos` | gestión | Quién debe y desde cuándo |
+| GET | `/api/reports/export` | gestión | Descarga Excel o PDF de lo que muestra la pantalla de reportes. `?format=xlsx\|pdf &bucket= &from= &to= &canchas= &disciplinas=` (los dos últimos se repiten una vez por nombre; ausente = todas, vacío = ninguna) |
 
 `/ingresos` corta por **una** dimensión; `/series` es la de **dos** (tiempo × algo), que es lo
-que hace falta para "cuánto facturó cada cancha por día". Tres reglas de `/series`:
+que hace falta para "cuánto facturó cada cancha por día". Cuatro reglas de `/series`:
 
 - **El eje X no tiene huecos.** `rangoBuckets()` emite todos los cajones y los vacíos van en
   cero. Agrupando sólo los cobros que existen, un día muerto desaparece y las columnas se
   corren: el gráfico miente sobre su propia forma.
 - **La ventana tiene tope por bucket** (30 días / 12 semanas / 12 meses). Sin tope,
   `bucket=dia` sobre todo el historial son cientos de columnas.
+- **El rango tiene tope de columnas por corte** (`LIMITE_COLUMNAS` en `report-data.ts`): 62 por día
+  (2 meses), 54 por semana (1 año), 72 por mes (6 años). Pasado eso las barras no se leen y
+  `/series` y `/export` responden 400. Está duplicado en el front (`LIMITES`), que avisa antes de pedir.
 - **La semana se etiqueta por su lunes.** Orden lexicográfico = cronológico, el mismo truco que
   `todayInClub()` y `period`.
 
