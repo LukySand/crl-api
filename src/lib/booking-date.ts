@@ -101,16 +101,17 @@ function stampInClub(d: Date): string {
  * puede. Una reserva pasada cae sola — su inicio ya quedó atrás del límite — así
  * que no hace falta un chequeo aparte de fecha vencida.
  *
- * `ahora` entra por parámetro para poder testear sin tocar el reloj del sistema.
+ * `ahora` entra por parámetro para poder testear sin tocar el reloj del sistema, y
+ * `horas` porque es un ajuste del club (`lib/settings.ts`); el default es la
+ * constante de siempre.
  */
 export function dentroDeVentanaCancelacion(
   date: Date,
   startTime: Date,
   ahora: Date = new Date(),
+  horas: number = HORAS_ANTES_CANCELAR,
 ): boolean {
   const inicio = `${date.toISOString().slice(0, 10)}T${timeToHHMM(startTime)}`;
-  const limite = stampInClub(
-    new Date(ahora.getTime() + HORAS_ANTES_CANCELAR * 3_600_000),
-  );
+  const limite = stampInClub(new Date(ahora.getTime() + horas * 3_600_000));
   return limite <= inicio;
 }

@@ -5,6 +5,7 @@ import { requireAuth, isAdmin, veComoGestion } from "../lib/auth";
 import { findOrCreateFeeForPlace } from "../lib/fee";
 import { refReserva } from "../lib/payment";
 import { bloqueaTurno } from "../lib/schedule-block";
+import { getAjustes } from "../lib/settings-db";
 import { bloqueoQueCierra, bloqueosDelDia } from "../lib/schedule-block-db";
 import {
   parseDate,
@@ -13,9 +14,6 @@ import {
   nowTimeInClub,
   timeToHHMM,
   ultimaFechaReservable,
-  DIAS_ADELANTE_SOCIO,
-  DIAS_ADELANTE_ADMIN,
-  HORAS_ANTES_CANCELAR,
   dentroDeVentanaCancelacion,
 } from "../lib/booking-date";
 
@@ -278,16 +276,14 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: "No se puede reservar una fecha pasada" });
     }
 
-    // Tope hacia adelante: 3 semanas para el socio, 6 meses para la gestión.
-    const tope = ultimaFechaReservable(
-      admin ? DIAS_ADELANTE_ADMIN : DIAS_ADELANTE_SOCIO,
-    );
-    if (date > tope) {
+    // Tope hacia adelante: lo fija el club en los ajustes (por defecto 3 semanas
+    // para el socio y 6 meses para la gestión).
+    const ajustes = await getAjustes();
+    const diasAdelante = admin ? ajustes.days_ahead_admin : ajustes.days_ahead_member;
+    if (date > ultimaFechaReservable(diasAdelante)) {
       return res.status(400).json({
         success: false,
-        error: admin
-          ? "No se puede reservar con más de 6 meses de anticipación"
-          : "No se puede reservar con más de 3 semanas de anticipación",
+        error: `No se puede reservar con más de ${diasAdelante} días de anticipación`,
       });
     }
 
@@ -542,7 +538,7 @@ bookingsRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response)
  * en el mismo update: el NULL saca la fila de la unique constraint y libera el turno,
  * pero la reserva queda para el historial.
  *
- * El socio tiene ventana: hasta HORAS_ANTES_CANCELAR antes de que arranque el turno.
+ * El socio tiene ventana: hasta las horas que fije el club (ajustes) antes de que arranque el turno.
  * La gestión no.
  */
 bookingsRouter.delete("/:id", async (req: Request<{ id: string }>, res: Response) => {
@@ -560,17 +556,24 @@ bookingsRouter.delete("/:id", async (req: Request<{ id: string }>, res: Response
       return res.status(403).json({ success: false, error: "No tenés permisos para esta acción" });
     }
 
-    // La gestión cancela siempre; el socio, hasta HORAS_ANTES_CANCELAR antes del
-    // turno. Va en el backend y no sólo en el front: escondiendo el botón, un
-    // DELETE a mano seguiría liberando la cancha cinco minutos antes.
-    if (
-      !isAdmin(req) &&
-      !dentroDeVentanaCancelacion(existing.date, existing.schedule.start_time)
-    ) {
-      return res.status(409).json({
-        success: false,
-        error: `Las reservas se cancelan hasta ${HORAS_ANTES_CANCELAR} horas antes del turno. Comunicate con el club.`,
-      });
+    // La gestión cancela siempre; el socio, hasta las horas que fije el club en los
+    // ajustes antes del turno. Va en el backend y no sólo en el front: escondiendo
+    // el botón, un DELETE a mano seguiría liberando la cancha cinco minutos antes.
+    if (!isAdmin(req)) {
+      const { cancel_hours_before } = await getAjustes();
+      if (
+        !dentroDeVentanaCancelacion(
+          existing.date,
+          existing.schedule.start_time,
+          new Date(),
+          cancel_hours_before,
+        )
+      ) {
+        return res.status(409).json({
+          success: false,
+          error: `Las reservas se cancelan hasta ${cancel_hours_before} horas antes del turno. Comunicate con el club.`,
+        });
+      }
     }
 
     // Cancelar dos veces en paralelo (doble tap, dos pestañas) tiene que dejar
