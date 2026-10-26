@@ -8,6 +8,7 @@
  */
 import ExcelJS from "exceljs";
 import PDFDocument from "pdfkit";
+import { CLUB_TZ } from "./booking-date";
 import type { Bucket } from "./payment-period";
 
 export type TipoColumna = "texto" | "moneda" | "numero";
@@ -32,6 +33,8 @@ export interface Seccion {
 }
 
 export interface Reporte {
+  /** Hoja del PDF. Por defecto apaisada, que es la que entra con varias columnas. */
+  orientacion?: "vertical" | "horizontal";
   titulo: string;
   subtitulo: string;
   generadoEn: string;
@@ -63,6 +66,15 @@ export interface MorosoExport {
   vencido: number;
   cuotas_vencidas: number;
   vencimiento_mas_viejo: Date | null;
+}
+
+/** Fecha y hora de ahora en el huso del club, para el "Generado el" de los archivos. */
+export function fechaHoraClub(ahora: Date = new Date()): string {
+  return new Intl.DateTimeFormat("es-AR", {
+    dateStyle: "short",
+    timeStyle: "short",
+    timeZone: CLUB_TZ,
+  }).format(ahora);
 }
 
 const MESES = [
@@ -305,7 +317,12 @@ function textoDeCelda(celda: Celda, tipo: TipoColumna): string {
 /** PDF apaisado: título, y cada sección como una tabla que continúa en la hoja siguiente. */
 export function aPdf(reporte: Reporte): Promise<Buffer> {
   return new Promise((resolver, rechazar) => {
-    const doc = new PDFDocument({ size: "A4", layout: "landscape", margin: 36, bufferPages: true });
+    const doc = new PDFDocument({
+      size: "A4",
+      layout: reporte.orientacion === "vertical" ? "portrait" : "landscape",
+      margin: 36,
+      bufferPages: true,
+    });
     const partes: Buffer[] = [];
     doc.on("data", (parte: Buffer) => partes.push(parte));
     doc.on("end", () => resolver(Buffer.concat(partes)));

@@ -120,6 +120,7 @@ Todos en `src/routes/auth.ts`, montados bajo `/api/auth` (salvo health).
 | GET | `/api/reports/series` | gestión | Serie temporal. `?bucket=dia\|semana\|mes &by=espacio\|disciplina\|concepto\|metodo &from= &to=` |
 | GET | `/api/reports/morosos` | gestión | Quién debe y desde cuándo |
 | GET | `/api/reports/export` | gestión | Descarga Excel o PDF de lo que muestra la pantalla de reportes. `?format=xlsx\|pdf &bucket= &from= &to= &canchas= &disciplinas=` (los dos últimos se repiten una vez por nombre; ausente = todas, vacío = ninguna) |
+| GET | `/api/enrollments/export` | gestión o profe de esa disciplina | Lista de inscriptos para bajar o imprimir. `?discipline_id= &format=xlsx\|pdf`. Sin celular ni email a propósito (ver `lib/enrollment-export.ts`) |
 
 `/ingresos` corta por **una** dimensión; `/series` es la de **dos** (tiempo × algo), que es lo
 que hace falta para "cuánto facturó cada cancha por día". Cuatro reglas de `/series`:
