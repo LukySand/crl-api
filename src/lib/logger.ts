@@ -52,6 +52,14 @@ export type LogData = {
 
 export type AuditAction = 'create'|'delete'|'update';
 
+/** `audit_action` va al final: los metadatos del llamador no pueden pisarlo. */
+export function buildAuditData(action: AuditAction, data?: LogData): LogData {
+    return {
+        ...data,
+        metadata: { ...data?.metadata, "audit_action": action },
+    };
+}
+
 export class Logger {
     private readonly buffer: LogEntry[] = [];
     private flushing: boolean = false
@@ -65,14 +73,8 @@ export class Logger {
      * Logs an audit log event.
      */
     public audit(action: AuditAction, data?: LogData, message?: string): void {
-        const logData: LogData = {
-            metadata: {
-                "audit_action": action,
-                ...data?.metadata ?? {},
-            },
-            ...data ?? {}
-        }
-        
+        const logData = buildAuditData(action, data);
+
         this.log('INFO', message ?? '', 'audit', null, null, logData)
     }
 
