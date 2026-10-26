@@ -82,6 +82,17 @@ export function periodoDe(fecha: Date): string {
 }
 
 /**
+ * Filtro de períodos que quedan después del mes de la baja (D21).
+ *
+ * `gte` del mes siguiente y no `gt` del mes de la baja: los períodos diarios son
+ * "YYYY-MM-DD" y `"2026-10-15" > "2026-10"` anularía un cargo del mes de la baja.
+ * Con esto "2026-11" y "2026-11-03" entran; "2026-10" y "2026-10-15" no.
+ */
+export function periodosDesdeElMesSiguiente(baja: Date): { gte: string } {
+  return { gte: periodoSiguiente(periodoDe(baja)) };
+}
+
+/**
  * ¿Ya pasó el vencimiento?
  *
  * Deriva el estado "vencido" en vez de guardarlo (ver el comentario en el modelo

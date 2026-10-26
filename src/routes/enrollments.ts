@@ -3,7 +3,7 @@ import { z } from "zod";
 import prisma from "../lib/prisma";
 import { requireAuth, isAdmin, hasRole, veComoGestion } from "../lib/auth";
 import { nombresDeRoles, rolesInclude } from "../lib/roles";
-import { periodoDe } from "../lib/payment-period";
+import { periodosDesdeElMesSiguiente } from "../lib/payment-period";
 import { todayInClub } from "../lib/booking-date";
 import { armarListaInscriptos, slugDe } from "../lib/enrollment-export";
 import { aPdf, aXlsx, fechaHoraClub } from "../lib/report-export";
@@ -304,7 +304,7 @@ enrollmentsRouter.delete("/:id", async (req: Request<{ id: string }>, res: Respo
         where: {
           enrollment_id: id,
           status: { in: ["Pendiente", "EnRevision"] },
-          period: { gt: periodoDe(baja) },
+          period: periodosDesdeElMesSiguiente(baja),
         },
         data: { status: "Anulado" },
       });
