@@ -156,24 +156,28 @@ test("webhook: firma invalida -> 401 y no toca nada", async () => {
   expect((await prisma.payment.findUnique({ where: { id: fila.id } }))?.status).toBe("Pendiente");
 });
 
-test("aprobacion de una fila anulada durante el checkout: no salda y deja el reembolso pedido", async () => {
+test("aprobacion de una fila anulada durante el checkout: no salda y devuelve la plata (reembolso aprobado)", async () => {
   const { fila, liqId, mpId } = await checkoutDeUna();
   await prisma.payment.update({ where: { id: fila.id }, data: { status: "Anulado" } });
   pagoMP(mpId, liqId);
   expect(await webhook(mpId)).toBe(200);
   expect((await prisma.payment.findUnique({ where: { id: fila.id } }))?.status).toBe("Anulado");
   const r = await prisma.refund.findFirst({ where: { transaction_id: liqId, payment_id: fila.id } });
-  expect(r?.status).toBe("pending");
+  expect(r).toMatchObject({ status: "approved", attempts: 1, income_reversal: false, requested_by: "sistema" });
   expect(r?.idempotency_key).toBe(`reembolso:${liqId}:${fila.id}`);
+  // B6 lo ejecuta contra MP con esa misma clave; la fila cubre todo el cobro, sin `amount`.
+  expect(stub.reembolsos.at(-1)).toMatchObject({ paymentId: mpId, key: r?.idempotency_key, body: {} });
 });
 
-test("monto inconsistente: no salda y pide el reembolso total", async () => {
+test("monto inconsistente: no salda y devuelve el total (reembolso aprobado)", async () => {
   const { fila, liqId, mpId } = await checkoutDeUna();
   pagoMP(mpId, liqId, { transaction_amount: 50 });
   expect(await webhook(mpId)).toBe(200);
   expect((await prisma.payment.findUnique({ where: { id: fila.id } }))?.status).toBe("Pendiente");
   const r = await prisma.refund.findFirst({ where: { transaction_id: liqId, payment_id: null } });
-  expect(r?.status).toBe("pending");
+  expect(r).toMatchObject({ status: "approved", attempts: 1, income_reversal: false, idempotency_key: `reembolso:${liqId}:total` });
+  expect(Number(r?.amount)).toBe(50);
+  expect(stub.reembolsos.at(-1)).toMatchObject({ paymentId: mpId, key: r?.idempotency_key, body: {} });
 });
 
 test("un approved tardio no pisa ReembolsadoParcial", async () => {
