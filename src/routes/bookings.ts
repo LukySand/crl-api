@@ -3,7 +3,9 @@ import { z } from "zod";
 import prisma from "../lib/prisma";
 import { requireAuth, isAdmin, veComoGestion } from "../lib/auth";
 import { findOrCreateFeeForPlace } from "../lib/fee";
+import { METODOS_MANUALES } from "../lib/cobro";
 import { refReserva } from "../lib/payment";
+import { saldarItems } from "../lib/settlement";
 import { bloqueaTurno } from "../lib/schedule-block";
 import { getAjustes } from "../lib/settings-db";
 import { bloqueoQueCierra, bloqueosDelDia } from "../lib/schedule-block-db";
@@ -60,7 +62,7 @@ const createSchema = z.object({
   status: z.enum(["Pendiente", "Confirmada"]).optional(),
   // Cómo cobró la gestión al confirmar en el acto. Sólo se mira si status es
   // Confirmada; si no viene, se asume efectivo (es el mostrador del club).
-  method: z.enum(["Efectivo", "Transferencia", "MercadoPago"]).optional(),
+  method: z.enum(METODOS_MANUALES).optional(),
 });
 
 const updateSchema = z.object({
@@ -70,7 +72,7 @@ const updateSchema = z.object({
   // reservas de ese turno siguen saliendo al precio del turno.
   amount: amountSchema.optional(),
   // Medio de cobro, sólo se mira al confirmar. Como en el POST.
-  method: z.enum(["Efectivo", "Transferencia", "MercadoPago"]).optional(),
+  method: z.enum(METODOS_MANUALES).optional(),
 });
 
 
@@ -372,7 +374,7 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
         include: bookingInclude,
       });
 
-      await tx.payment.create({
+      const pagoCreado = await tx.payment.create({
         data: {
           user_id: userId,
           concept: "Reserva",
@@ -385,16 +387,18 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
           // Vence el día del turno: se juega pagando.
           due_date: when,
           ref: refReserva(creada.id),
-          ...(cobrada
-            ? {
-                status: "Pagado" as const,
-                paid_at: new Date(),
-                method: parsed.data.method ?? ("Efectivo" as const),
-                registered_by: req.user!.id,
-              }
-            : {}),
         },
       });
+
+      // Cobrada en el acto: liquidación manual por el helper (D4/D10).
+      if (cobrada) {
+        await saldarItems(tx, {
+          userId,
+          method: parsed.data.method ?? "Efectivo",
+          registeredBy: req.user!.id,
+          filas: [{ id: pagoCreado.id, amount: monto }],
+        });
+      }
 
       return creada;
     });
@@ -503,18 +507,18 @@ bookingsRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response)
         });
       }
       if (status === "Confirmada") {
-        await tx.payment.updateMany({
-          where: {
-            booking_id: req.params.id,
-            status: { in: ["Pendiente", "EnRevision"] },
-          },
-          data: {
-            status: "Pagado",
-            paid_at: new Date(),
-            method: parsed.data.method ?? "Efectivo",
-            registered_by: req.user!.id,
-          },
+        const pendiente = await tx.payment.findFirst({
+          where: { booking_id: req.params.id, status: { in: ["Pendiente", "EnRevision"] } },
+          select: { id: true, user_id: true, amount: true },
         });
+        if (pendiente) {
+          await saldarItems(tx, {
+            userId: pendiente.user_id,
+            method: parsed.data.method ?? "Efectivo",
+            registeredBy: req.user!.id,
+            filas: [pendiente],
+          });
+        }
       }
       return count;
     });

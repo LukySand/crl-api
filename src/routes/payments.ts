@@ -23,6 +23,14 @@ import {
   palabrasDeBusqueda,
   type QuienCobra,
 } from "../lib/cobro";
+import { auditar } from "../lib/audit";
+import { estadoCuota } from "../lib/payment-rules";
+import {
+  liquidacionViva,
+  registrarCobroManual,
+  verificarOrdenDePago,
+} from "../lib/settlement";
+import type { PaymentMethod } from "../../prisma/generated/client";
 import { emitirCargos } from "../lib/emission";
 import { serializePayment, serializePayments } from "../lib/payment";
 import {
@@ -116,6 +124,8 @@ const cobroSchema = z
     notes: z.string().trim().max(1000).optional(),
   })
   .strict();
+
+const revertirSchema = z.object({ reason: z.string().trim().min(3).max(500) }).strict();
 
 const uploadSchema = z.object({
   file: z.instanceof(File, { message: "Falta el archivo" }),
@@ -338,24 +348,189 @@ paymentsRouter.get("/por-cobrar", async (req: Request, res: Response) => {
   }
 });
 
+const MSG_SIN_PERMISO = "No tenés permisos para registrar cobros";
+
+const cobroMultipleSchema = cobroSchema.extend({
+  payment_ids: z.array(z.string().min(1)).min(1).max(50),
+});
+
 /**
- * POST /api/payments/:id/cobro — registra que el socio pagó en mano y deja la
- * cuota Pagada. Lo hace la gestión (efectivo o transferencia) o un profesor (sólo
- * efectivo, y sólo cuotas de disciplinas que dicta): ver `decidirCobro`.
- *
- * Queda quién lo registró (`registered_by`). La condición de estado va en el
- * UPDATE y no en un if previo, igual que en PATCH: dos cobros a la vez dejan uno.
+ * Cobro manual de una o varias filas (D10). Compartido por `/cobro` y `/:id/cobro`.
+ * Orden de chequeos: 403 permisos/deuda propia/regla de cobro → 400 socios distintos
+ * o Reserva mezclada → 409 cuotas → 409 orden_de_pago (P7) → 409 pago_en_curso → cobro.
+ */
+async function cobrarFilas(req: Request, res: Response, ids: string[], body: unknown, unico: boolean) {
+  const quien = quienCobra(req);
+  if (!quien.esGestion && !quien.esProfesor) {
+    return res.status(403).json({ success: false, error: MSG_SIN_PERMISO });
+  }
+
+  const parsed = cobroMultipleSchema.omit({ payment_ids: true }).safeParse(body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json({
+      success: false,
+      error: "Validación fallida",
+      errors: formatErrors(parsed.error.issues),
+    });
+  }
+
+  const filas = await prisma.payment.findMany({
+    where: { id: { in: ids } },
+    select: {
+      id: true,
+      user_id: true,
+      concept: true,
+      status: true,
+      amount: true,
+      due_date: true,
+      booking_id: true,
+      deleted_at: true,
+      enrollment: {
+        select: { discipline: { select: { professors: { select: { professor_id: true } } } } },
+      },
+    },
+  });
+  if (filas.length !== ids.length) {
+    return res.status(404).json({ success: false, error: "Cuota no encontrada" });
+  }
+  if (new Set(filas.map((f) => f.user_id)).size !== 1) {
+    return res.status(400).json({ success: false, error: "Las cuotas tienen que ser del mismo socio" });
+  }
+  if (filas[0]!.user_id === req.user!.id) {
+    return res.status(403).json({ success: false, error: "No podés registrar el cobro de tu propia deuda" });
+  }
+  if (filas.length > 1 && filas.some((f) => f.concept === "Reserva")) {
+    return res.status(400).json({ success: false, error: "Una reserva se cobra sola" });
+  }
+
+  let metodo: PaymentMethod = "Efectivo";
+  const noCobrables: { id: string; estado: string }[] = [];
+  for (const f of filas) {
+    const decision = decidirCobro(
+      quien,
+      {
+        concept: f.concept,
+        status: f.deleted_at ? "Anulado" : f.status,
+        esDeSuDisciplina:
+          f.enrollment?.discipline.professors.some((p) => p.professor_id === req.user!.id) ?? false,
+      },
+      parsed.data.method,
+    );
+    if (!decision.ok) {
+      if (decision.status === 403) {
+        return res.status(403).json({ success: false, error: decision.error });
+      }
+      noCobrables.push({
+        id: f.id,
+        estado: estadoCuota({
+          status: f.status,
+          due_date: f.due_date ? f.due_date.toISOString().slice(0, 10) : null,
+        }),
+      });
+      continue;
+    }
+    metodo = decision.method;
+  }
+  if (noCobrables.length > 0) {
+    return res.status(409).json({
+      success: false,
+      error: unico ? "Esa cuota ya fue cobrada o anulada" : "Hay cuotas que ya no se pueden cobrar",
+      cuotas: noCobrables,
+    });
+  }
+
+  const orden = await verificarOrdenDePago(filas[0]!.user_id, ids);
+  if (orden) {
+    return res
+      .status(409)
+      .json({ success: false, error: "Hay cuotas anteriores sin pagar", orden_de_pago: orden });
+  }
+
+  const viva = await liquidacionViva(ids);
+  if (viva) {
+    return res.status(409).json({
+      success: false,
+      error: "Hay un pago en curso para esta cuota",
+      pago_en_curso: {
+        id: viva.id,
+        vence: viva.expires_at?.toISOString() ?? null,
+        checkout_url: viva.checkout_url,
+      },
+    });
+  }
+
+  const r = await registrarCobroManual({
+    userId: filas[0]!.user_id,
+    method: metodo,
+    registeredBy: req.user!.id,
+    notes: parsed.data.notes,
+    filas: filas.map((f) => ({
+      id: f.id,
+      amount: f.amount,
+      concept: f.concept,
+      booking_id: f.booking_id,
+    })),
+  });
+  if (!r) {
+    return res.status(409).json({ success: false, error: "Esa cuota ya fue cobrada o anulada" });
+  }
+
+  auditar(req, "update", "liquidacion", r.liquidacionId, {
+    despues: { metodo, filas: ids, estado: "Aprobado" },
+  });
+
+  const payments = await prisma.payment.findMany({ where: { id: { in: ids } }, include: cobroInclude });
+  return res.json({
+    success: true,
+    liquidacion: { id: r.liquidacionId, status: "Aprobado" },
+    filas: ids,
+    payments: serializePayments(payments),
+    // Contrato de dev de `/:id/cobro`.
+    payment: payments[0] && serializePayment(payments[0]),
+  });
+}
+
+/**
+ * POST /api/payments/cobro — cobro manual de varias cuotas del mismo socio en una
+ * sola operación (una liquidación). Va antes de "/:id".
+ */
+paymentsRouter.post("/cobro", async (req: Request, res: Response) => {
+  try {
+    const ids = z.array(z.string().min(1)).min(1).max(50).safeParse(req.body?.payment_ids);
+    if (!ids.success) {
+      return res.status(400).json({ success: false, error: "payment_ids es obligatorio" });
+    }
+    const { payment_ids: _omitido, ...resto } = req.body;
+    return await cobrarFilas(req, res, [...new Set(ids.data)], resto, false);
+  } catch (error) {
+    console.error("Register manual collection error:", error);
+    return res.status(500).json({ success: false, error: "Error al registrar el cobro" });
+  }
+});
+
+/**
+ * POST /api/payments/:id/cobro — envoltorio de un solo id (contrato de dev). La
+ * gestión cobra por cualquier medio manual; un profesor, sólo efectivo y sólo
+ * cuotas de disciplinas que dicta: ver `decidirCobro`.
  */
 paymentsRouter.post("/:id/cobro", async (req: Request<{ id: string }>, res: Response) => {
   try {
-    const quien = quienCobra(req);
-    if (!quien.esGestion && !quien.esProfesor) {
-      return res
-        .status(403)
-        .json({ success: false, error: "No tenés permisos para registrar cobros" });
-    }
+    return await cobrarFilas(req, res, [req.params.id], req.body, true);
+  } catch (error) {
+    console.error("Register cash payment error:", error);
+    return res.status(500).json({ success: false, error: "Error al registrar el cobro" });
+  }
+});
 
-    const parsed = cobroSchema.safeParse(req.body ?? {});
+/**
+ * POST /api/payments/:id/revertir { reason } — deshace un cobro manual (D11/D22b).
+ * La liquidación pasa a `Anulado` (queda visible) y TODAS sus filas vuelven a
+ * `Pendiente`. Los cobros de MP se reembolsan; los que incluyen una reserva se
+ * deshacen cancelando la reserva.
+ */
+paymentsRouter.post("/:id/revertir", requireAdmin, async (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const parsed = revertirSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       return res.status(400).json({
         success: false,
@@ -366,73 +541,59 @@ paymentsRouter.post("/:id/cobro", async (req: Request<{ id: string }>, res: Resp
 
     const pago = await prisma.payment.findUnique({
       where: { id: req.params.id },
-      select: {
-        id: true,
-        concept: true,
-        status: true,
-        booking_id: true,
-        enrollment: {
-          select: {
-            discipline: { select: { professors: { select: { professor_id: true } } } },
-          },
-        },
-      },
+      select: { id: true, status: true },
     });
-    if (!pago) {
-      return res.status(404).json({ success: false, error: "Cuota no encontrada" });
+    if (!pago) return res.status(404).json({ success: false, error: "Cuota no encontrada" });
+    if (pago.status !== "Pagado") {
+      return res.status(409).json({ success: false, error: "Esa cuota no está paga" });
     }
 
-    const decision = decidirCobro(
-      quien,
-      {
-        concept: pago.concept,
-        status: pago.status,
-        esDeSuDisciplina:
-          pago.enrollment?.discipline.professors.some((p) => p.professor_id === req.user!.id) ?? false,
-      },
-      parsed.data.method,
-    );
-    if (!decision.ok) {
-      return res.status(decision.status).json({ success: false, error: decision.error });
+    const liq = await prisma.paymentTransaction.findFirst({
+      where: { status: "Aprobado", items: { some: { payment_id: pago.id } } },
+      orderBy: { created_at: "desc" },
+      select: { id: true, method: true, items: { select: { payment: { select: { id: true, concept: true } } } } },
+    });
+    if (!liq) {
+      return res.status(409).json({ success: false, error: "Esa cuota no tiene un cobro para revertir" });
+    }
+    if (liq.method === "MercadoPago") {
+      return res.status(409).json({ success: false, error: "Un cobro de Mercado Pago se reembolsa, no se revierte" });
+    }
+    if (liq.items.some((i) => i.payment.concept === "Reserva")) {
+      return res.status(409).json({ success: false, error: "Un cobro con reserva se deshace cancelando la reserva" });
     }
 
-    const cobrada = await prisma.$transaction(async (tx) => {
-      const { count } = await tx.payment.updateMany({
-        where: { id: pago.id, status: { in: ["Pendiente", "EnRevision"] } },
+    const filas = liq.items.map((i) => i.payment.id);
+    const ok = await prisma.$transaction(async (tx) => {
+      const { count } = await tx.paymentTransaction.updateMany({
+        where: { id: liq.id, status: "Aprobado" },
         data: {
-          status: "Pagado",
-          paid_at: new Date(),
-          method: decision.method,
-          registered_by: req.user!.id,
-          ...(parsed.data.notes !== undefined && { notes: parsed.data.notes }),
+          status: "Anulado",
+          voided_by: req.user!.id,
+          voided_reason: parsed.data.reason,
+          voided_at: new Date(),
         },
       });
       if (count === 0) return false;
-
-      // Una reserva Confirmada es una reserva paga: el cobro y el estado viajan
-      // juntos, como al confirmar la reserva en el otro sentido (bookings.ts).
-      if (pago.concept === "Reserva" && pago.booking_id) {
-        await tx.booking.updateMany({
-          where: { id: pago.booking_id, status: "Pendiente" },
-          data: { status: "Confirmada" },
-        });
-      }
+      await tx.payment.updateMany({
+        where: { id: { in: filas }, status: "Pagado" },
+        data: { status: "Pendiente", method: null, paid_at: null, registered_by: null },
+      });
       return true;
     });
-    if (!cobrada) {
-      return res
-        .status(409)
-        .json({ success: false, error: "Esa cuota ya fue cobrada o anulada" });
+    if (!ok) {
+      return res.status(409).json({ success: false, error: "Ese cobro ya fue revertido" });
     }
 
-    const payment = await prisma.payment.findUnique({
-      where: { id: pago.id },
-      include: cobroInclude,
+    auditar(req, "update", "liquidacion", liq.id, {
+      motivo: parsed.data.reason,
+      antes: { estado: "Aprobado", filas },
+      despues: { estado: "Anulado" },
     });
-    return res.json({ success: true, payment: payment && serializePayment(payment) });
+    return res.json({ success: true, liquidacion: { id: liq.id, status: "Anulado" }, filas });
   } catch (error) {
-    console.error("Register cash payment error:", error);
-    return res.status(500).json({ success: false, error: "Error al registrar el cobro" });
+    console.error("Revert collection error:", error);
+    return res.status(500).json({ success: false, error: "Error al revertir el cobro" });
   }
 });
 

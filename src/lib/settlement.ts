@@ -1,0 +1,151 @@
+/**
+ * Liquidaciones (D4, D8, D9). Único lugar que escribe un cobro manual: crea la
+ * `PaymentTransaction` + sus items y actualiza, en la MISMA transacción de base,
+ * los campos desnormalizados de cada fila (`status/method/paid_at/registered_by`).
+ */
+import type { Prisma, PaymentMethod } from "../../prisma/generated/client";
+import prisma from "./prisma";
+import { bloqueantesDeOrden } from "./payment-rules";
+
+type Db = Prisma.TransactionClient;
+
+/** Una fila ya no estaba `Pendiente`/`EnRevision`: el perdedor de la carrera. */
+export class CuotaYaSaldada extends Error {
+  constructor() {
+    super("Esa cuota ya fue cobrada o anulada");
+  }
+}
+
+export interface FilaASaldar {
+  id: string;
+  amount: Prisma.Decimal | number | string;
+}
+
+/**
+ * Liquidación manual `Aprobado` que salda `filas`. Cada fila pasa a `Pagado` con un
+ * `updateMany` guardado por estado; si alguna ya no estaba pendiente lanza
+ * `CuotaYaSaldada` y la transacción que la contiene se revierte entera.
+ */
+export async function saldarItems(
+  tx: Db,
+  args: {
+    userId: string;
+    method: PaymentMethod;
+    registeredBy: string;
+    notes?: string;
+    filas: FilaASaldar[];
+  },
+): Promise<{ liquidacionId: string }> {
+  const ahora = new Date();
+  const total = args.filas.reduce((acc, f) => acc + Math.round(Number(f.amount) * 100), 0) / 100;
+
+  const liquidacion = await tx.paymentTransaction.create({
+    data: {
+      user_id: args.userId,
+      method: args.method,
+      status: "Aprobado",
+      amount: total,
+      registered_by: args.registeredBy,
+      notes: args.notes ?? null,
+      paid_at: ahora,
+      items: {
+        create: args.filas.map((f) => ({ payment_id: f.id, amount: f.amount as never })),
+      },
+    },
+    select: { id: true },
+  });
+
+  const { count } = await tx.payment.updateMany({
+    where: { id: { in: args.filas.map((f) => f.id) }, status: { in: ["Pendiente", "EnRevision"] } },
+    data: {
+      status: "Pagado",
+      paid_at: ahora,
+      method: args.method,
+      registered_by: args.registeredBy,
+      ...(args.notes !== undefined && { notes: args.notes }),
+    },
+  });
+  if (count !== args.filas.length) throw new CuotaYaSaldada();
+
+  return { liquidacionId: liquidacion.id };
+}
+
+/**
+ * Cobro manual de una o varias filas del mismo socio. Una fila `Reserva` confirma
+ * además su reserva (viajan juntas). Devuelve `null` si alguien se adelantó.
+ */
+export async function registrarCobroManual(args: {
+  userId: string;
+  method: PaymentMethod;
+  registeredBy: string;
+  notes?: string;
+  filas: (FilaASaldar & { concept: string; booking_id: string | null })[];
+}): Promise<{ liquidacionId: string } | null> {
+  try {
+    return await prisma.$transaction(async (tx) => {
+      const r = await saldarItems(tx, args);
+      for (const f of args.filas) {
+        if (f.concept === "Reserva" && f.booking_id) {
+          await tx.booking.updateMany({
+            where: { id: f.booking_id, status: "Pendiente" },
+            data: { status: "Confirmada" },
+          });
+        }
+      }
+      return r;
+    });
+  } catch (e) {
+    if (e instanceof CuotaYaSaldada) return null;
+    throw e;
+  }
+}
+
+/** Liquidación de MP `Pendiente` y sin vencer que incluye alguna de las filas (D8). */
+export async function liquidacionViva(ids: string[], db: Pick<Db, "paymentTransaction"> = prisma) {
+  // ponytail: leer-y-después-escribir; un unique parcial sería el upgrade.
+  return db.paymentTransaction.findFirst({
+    where: {
+      method: "MercadoPago",
+      status: "Pendiente",
+      expires_at: { gt: new Date() },
+      items: { some: { payment_id: { in: ids } } },
+    },
+    select: { id: true, expires_at: true, checkout_url: true },
+  });
+}
+
+/** P7 (D9): lee las pendientes del socio y aplica la regla pura. */
+export async function verificarOrdenDePago(userId: string, ids: string[]) {
+  const pendientes = await prisma.payment.findMany({
+    where: { user_id: userId, status: "Pendiente", deleted_at: null },
+    select: { id: true, concept: true, created_at: true, name: true, amount: true, due_date: true },
+  });
+  const seleccion = pendientes.filter((p) => ids.includes(p.id));
+  const bloqueo = bloqueantesDeOrden(seleccion, pendientes);
+  if (!bloqueo) return null;
+  return {
+    payment_id: bloqueo.cuota_social_id,
+    cuota_social_id: bloqueo.cuota_social_id,
+    bloqueantes: pendientes
+      .filter((p) => bloqueo.bloqueantes.includes(p.id))
+      .map((p) => ({
+        id: p.id,
+        nombre: p.name,
+        monto: p.amount.toString(),
+        vencimiento: p.due_date ? p.due_date.toISOString().slice(0, 10) : null,
+      })),
+  };
+}
+
+/** ¿Puede `actor` pagar la deuda de `deudorId`? Dueño, tutor activo o gestión. */
+export async function puedePagarPor(
+  actor: { id: string; esGestion: boolean },
+  deudorId: string,
+): Promise<boolean> {
+  if (actor.esGestion || actor.id === deudorId) return true;
+  const vinculo = await prisma.family.findFirst({
+    where: { parent_id: actor.id, child_id: deudorId, active: true },
+    select: { id: true },
+  });
+  return vinculo !== null;
+}
