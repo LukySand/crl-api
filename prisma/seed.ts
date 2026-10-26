@@ -1091,6 +1091,69 @@ function vencimientoDe(periodo: string): Date {
  * Idempotente por `ref` (unique): correrlo dos veces no duplica nada. Vale la
  * pena correrlo dos veces justamente para comprobarlo.
  */
+/** Catálogo de tipos de cobro. Idempotente por `key`; sin ellos no entra ninguna fila de `payments` (FK). */
+async function seedChargeTypes() {
+  const tipos = [
+    { key: "Reserva", name: "Reserva", system: true, due_rule: "Ninguna" as const },
+    { key: "Disciplina", name: "Cuota de disciplina", system: true, due_rule: "DiaDelMes" as const },
+    { key: "Socio", name: "Cuota social", system: true, due_rule: "DiaDelMes" as const },
+    { key: "Inscripcion", name: "Inscripción", system: false, due_rule: "Ninguna" as const },
+    { key: "Buffet", name: "Buffet", system: false, due_rule: "Ninguna" as const },
+    { key: "Otro", name: "Otro", system: false, due_rule: "Ninguna" as const },
+  ];
+  for (const t of tipos) {
+    await prisma.chargeType.upsert({ where: { key: t.key }, update: {}, create: t });
+  }
+  console.log(`Catálogo de cobros listo (${tipos.length} tipos).`);
+}
+
+/** Plantillas recurrentes y cobros sueltos de ejemplo (sin vencimiento). Idempotente por nombre / `ref`. */
+async function seedTemplates() {
+  const base = { period_mode: "DiaDelMes" as const, day_of_month: 1, start_date: parseDate(todayInClub()), created_by: USER.admin };
+  const plantillas = [
+    { ...base, concept: "Socio", name: "Cuota social", amount: 15000, target_mode: "Todos" as const },
+    { ...base, concept: "Disciplina", name: "Cuota de disciplina", amount: null, target_mode: "Todos" as const },
+  ];
+  for (const t of plantillas) {
+    const existe = await prisma.recurringTemplate.findFirst({ where: { name: t.name } });
+    if (!existe) await prisma.recurringTemplate.create({ data: t });
+  }
+  const sueltos = [
+    { ref: "seed:suelto:buffet", concept: "Buffet", name: "Buffet - torneo", amount: 3500 },
+    { ref: "seed:suelto:inscripcion", concept: "Inscripcion", name: "Inscripción torneo de verano", amount: 8000 },
+  ];
+  for (const c of sueltos) {
+    await prisma.payment.upsert({
+      where: { ref: c.ref },
+      update: {},
+      create: { ...c, user_id: USER.socioMartin, created_by: USER.admin },
+    });
+  }
+  console.log("Plantillas y cobros sueltos listos.");
+}
+
+/** Liquidación manual `seed:{payment_id}` + item para una fila Pagado (upsert, no depende de settlement.ts). */
+async function seedSettlement(p: {
+  id: string;
+  user_id: string;
+  amount: unknown;
+  method: "Efectivo" | "Transferencia";
+  paid_at: Date;
+}) {
+  const id = `seed:${p.id}`;
+  const amount = p.amount as number;
+  await prisma.paymentTransaction.upsert({
+    where: { id },
+    update: {},
+    create: { id, user_id: p.user_id, method: p.method, status: "Aprobado", amount, registered_by: USER.admin, paid_at: p.paid_at },
+  });
+  await prisma.paymentTransactionItem.upsert({
+    where: { transaction_id_payment_id: { transaction_id: id, payment_id: p.id } },
+    update: {},
+    create: { transaction_id: id, payment_id: p.id, amount },
+  });
+}
+
 async function seedPayments() {
   let creados = 0;
   // ponytail: el huso del club, NO todayUTC(). Corriendo el seed a la noche en
@@ -1119,6 +1182,7 @@ async function seedPayments() {
     const data = {
       user_id: b.user_id,
       concept: "Reserva" as const,
+      name: `Reserva ${b.date.toISOString().slice(0, 10).split("-").reverse().join("/")}`,
       booking_id: b.id,
       fee_id: b.fee.id,
       amount: b.fee.amount,
@@ -1138,18 +1202,21 @@ async function seedPayments() {
         : {}),
     };
 
-    await prisma.payment.upsert({
+    const pago = await prisma.payment.upsert({
       where: { ref: `reserva:${b.id}` },
       update: data,
       create: { ref: `reserva:${b.id}`, ...data },
     });
+    if (data.status === "Pagado") {
+      await seedSettlement({ id: pago.id, user_id: pago.user_id, amount: pago.amount, method: "Efectivo", paid_at: pago.paid_at! });
+    }
     creados++;
   }
 
   // ── Cuotas de disciplina ───────────────────────────────────────────────
   const enrollments = await prisma.enrollment.findMany({
     where: { active: true, discipline: { fee_id: { not: null } } },
-    include: { discipline: { select: { fee: { select: { id: true, amount: true } } } } },
+    include: { discipline: { select: { name: true, fee: { select: { id: true, amount: true } } } } },
   });
 
   // Períodos de más viejo a más nuevo: el corriente es el último.
@@ -1186,6 +1253,7 @@ async function seedPayments() {
       const data = {
         user_id: e.user_id,
         concept: "Disciplina" as const,
+        name: `Cuota de ${e.discipline.name} ${periodo}`,
         enrollment_id: e.id,
         fee_id: fee.id,
         amount: fee.amount,
@@ -1203,11 +1271,14 @@ async function seedPayments() {
       };
 
       const ref = `disciplina:${e.id}:${periodo}`;
-      await prisma.payment.upsert({
+      const pago = await prisma.payment.upsert({
         where: { ref },
         update: data,
         create: { ref, ...data },
       });
+      if (data.status === "Pagado") {
+        await seedSettlement({ id: pago.id, user_id: pago.user_id, amount: pago.amount, method, paid_at: pago.paid_at! });
+      }
       creados++;
     }
   }
@@ -1228,6 +1299,9 @@ async function main() {
       `⚠️  ${sinRoles} usuario(s) sin roles: asignáselos desde Gestión de usuarios.`,
     );
   }
+
+  // Siempre, también en producción: payments.concept tiene FK a este catálogo.
+  await seedChargeTypes();
 
   const esProduccion = process.env.NODE_ENV === "production";
   if (esProduccion && process.env.SEED_DEMO !== "true") {
@@ -1254,6 +1328,7 @@ async function main() {
 
   // Va último: las cuotas cuelgan de las reservas y las inscripciones.
   await seedPayments();
+  await seedTemplates();
 
   console.log(
     `\nSeed completado. Usuarios de ejemplo con contraseña "${DEMO_PASSWORD}":`,
