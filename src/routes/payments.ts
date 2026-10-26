@@ -267,7 +267,8 @@ function accionesDe(f: FilaConLiq, liq: LiqInfo | undefined): Accion[] {
  * Filtros: ?status=Pendiente ?concept=Disciplina ?period=2026-09 ?user_id=... ?from=&to=
  * Gestión además: ?q= (socio por nombre/apellido/DNI o nombre del cargo),
  * ?estado=vencida (D25), ?eliminados=1 (incluye las bajas lógicas, D7),
- * ?page=&page_size= (agrega `hay_mas`; sin `page` devuelve todo, como antes).
+ * ?page=&page_size= (agrega `hay_mas`; sin `page` devuelve todo, como antes),
+ * ?id= o ?ids=a,b (hasta 200 ids; también ve las bajas lógicas sólo con ?eliminados=1).
  *
  * `from`/`to` filtran por vencimiento, que es lo que le importa a un socio
  * mirando qué debe. Los reportes de ingresos filtran por fecha de cobro y viven
@@ -276,7 +277,7 @@ function accionesDe(f: FilaConLiq, liq: LiqInfo | undefined): Accion[] {
  */
 paymentsRouter.get("/", async (req: Request, res: Response) => {
   try {
-    const { status, concept, period, user_id, from, to, q, estado, eliminados, page, page_size } = req.query;
+    const { status, concept, period, user_id, from, to, q, estado, eliminados, page, page_size, id, ids } = req.query;
     // Gestión ve todas salvo que pida `?propias=true` (ver veComoGestion).
     const admin = veComoGestion(req);
 
@@ -297,6 +298,14 @@ paymentsRouter.get("/", async (req: Request, res: Response) => {
     const nPagina = Math.max(1, Number.parseInt(String(page), 10) || 1);
     const tamano = Math.min(200, Math.max(1, Number.parseInt(String(page_size), 10) || 50));
     const palabras = admin ? palabrasDeBusqueda(q) : [];
+    // ?id= / ?ids=a,b (gestión): abre un cargo puntual con sus `acciones`, sin buscar por socio.
+    const porId = admin
+      ? [id, ids]
+          .flatMap((v) => (typeof v === "string" ? v.split(",") : []))
+          .map((v) => v.trim())
+          .filter(Boolean)
+          .slice(0, 200)
+      : [];
     const hoy = todayInClub();
 
     const payments = await prisma.payment.findMany({
@@ -308,6 +317,7 @@ paymentsRouter.get("/", async (req: Request, res: Response) => {
         // La baja lógica sólo se ve con ?eliminados=1 y sólo en el panel de gestión.
         ...(!(admin && eliminados === "1") && { deleted_at: null }),
         ...(estado === "vencida" && whereVencida(hoy)),
+        ...(porId.length > 0 && { id: { in: porId } }),
         ...(typeof status === "string" && { status: status as any }),
         ...(typeof concept === "string" && { concept: concept as any }),
         ...(typeof period === "string" && { period }),

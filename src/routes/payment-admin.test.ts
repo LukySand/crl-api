@@ -265,3 +265,20 @@ test("accionesPermitidas == guardas: una Pagado no ofrece anular ni eliminar", a
   expect(l.body.payments[0].acciones).toEqual(["revertir"]);
   expect(l.body.payments[0].liquidacion.status).toBe("Aprobado");
 });
+
+test("listado ?id= / ?ids=: solo gestion, devuelve las filas pedidas con acciones", async () => {
+  const admin = await makeUser({ roles: ["Administrador"] });
+  const socio = await makeUser({ roles: ["Socio"] });
+  const a = await cuota(socio.id, "Otro");
+  const b = await cuota(socio.id, "Otro");
+  await cuota(socio.id, "Otro");
+  const uno = await api("GET", `/api/payments?id=${a.id}`, { token: admin.token });
+  expect(uno.body.payments.map((p: any) => p.id)).toEqual([a.id]);
+  expect(Array.isArray(uno.body.payments[0].acciones)).toBe(true);
+  const dos = await api("GET", `/api/payments?ids=${a.id},${b.id}`, { token: admin.token });
+  expect(dos.body.payments.map((p: any) => p.id).sort()).toEqual([a.id, b.id].sort());
+  // Un socio no usa el filtro para ver filas ajenas: sigue acotado a las propias.
+  const otro = await makeUser({ roles: ["Socio"] });
+  const ajeno = await api("GET", `/api/payments?id=${a.id}`, { token: otro.token });
+  expect(ajeno.body.payments).toHaveLength(0);
+});
