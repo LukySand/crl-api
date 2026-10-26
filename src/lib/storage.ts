@@ -123,6 +123,7 @@ export namespace Storage {
     "accountImages",
     "postImages",
     "localImages",
+    "receipts", // comprobantes de transferencia
   ] as const;
   const ALL_AVAILABLE_MIME_TYPES: readonly string[] = [
     "image/jpeg",
@@ -134,6 +135,25 @@ export namespace Storage {
     "image/bmp",
     "image/avif",
   ] as const;
+
+  /**
+   * Tipos aceptados por kind. El default son imágenes (ALL_AVAILABLE_MIME_TYPES);
+   * sólo se declara acá el kind que necesita otra cosa.
+   *
+   * ponytail: la lista era una sola y global. Los comprobantes de transferencia
+   * suelen ser PDF (es lo que exporta el homebanking), pero agregar
+   * application/pdf a la lista global habilitaría subir un PDF como foto de
+   * perfil. Por kind, el PDF entra sólo donde tiene sentido.
+   */
+  const MIME_TYPES_BY_KIND: Partial<Record<FileKind, readonly string[]>> = {
+    receipts: [...ALL_AVAILABLE_MIME_TYPES, "application/pdf"],
+  };
+
+  /** Tipos aceptados para un kind. */
+  function allowedMimeTypes(kind: FileKind): readonly string[] {
+    return MIME_TYPES_BY_KIND[kind] ?? ALL_AVAILABLE_MIME_TYPES;
+  }
+
   type FileKindTuple = typeof ALL_FILE_KINDS;
 
   let ready = false;
@@ -179,13 +199,11 @@ export namespace Storage {
     //     mime: 'image/jpeg'
     // }
 
-    // verify if mime is available
-    if (!ALL_AVAILABLE_MIME_TYPES.includes(fileType.mime)) {
+    // verify if mime is available for this kind
+    const accepted = allowedMimeTypes(arg.kind);
+    if (!accepted.includes(fileType.mime)) {
       console.error("[Storage.create] Invalid mime type:", fileType.mime);
-      console.error(
-        "[Storage.create] Allowed mime types:",
-        ALL_AVAILABLE_MIME_TYPES,
-      );
+      console.error("[Storage.create] Allowed mime types:", accepted);
       throw new Error("invalid-image-type");
     }
 

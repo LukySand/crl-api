@@ -1,10 +1,15 @@
 import { Router, type Request, type Response } from "express";
 import prisma from "../lib/prisma";
+import { z } from "zod";
 import { requireAuth, requireAdmin } from "../lib/auth";
+import { adminCreateUserSchema, adminUpdateUserSchema, roleSchema } from "../lib/validation";
 import {
-  adminCreateUserSchema,
-  adminUpdateUserSchema,
-} from "../lib/validation";
+  denyCambioDeRoles,
+  nombresDeRoles,
+  ordenarRoles,
+  rolesInclude,
+  validarRoles,
+} from "../lib/roles";
 import { parseDate, todayInClub } from "../lib/booking-date";
 import type { ZodError } from "zod";
 
@@ -24,11 +29,37 @@ const userSelect = {
   birth_date: true,
   active: true,
   file_id: true, // para mostrar la foto en los listados y buscadores
-  role: { select: { name: true } },
+  ...rolesInclude,
 } as const;
 
-// Aplana role.name → role en la respuesta.
-const flatten = (u: { role: { name: string } }) => ({ ...u, role: u.role.name });
+/**
+ * Los roles del body: lista, ordenada y sin repetidos al parsear. Se validan
+ * dentro del schema y no después, para que un formulario con varios errores los
+ * reciba todos juntos, el de roles incluido.
+ */
+const rolesField = z
+  .array(roleSchema, "Elegí al menos un rol")
+  .transform(ordenarRoles)
+  .superRefine((roles, ctx) => {
+    const error = validarRoles(roles);
+    if (error) ctx.addIssue({ code: "custom", message: error });
+  });
+
+const createSchema = adminCreateUserSchema.extend({ roles: rolesField });
+const updateSchema = adminUpdateUserSchema.extend({ roles: rolesField });
+
+/** Aplana los roles de la relación a una lista de nombres. */
+const flatten = <T extends { roles: { role: { name: string } }[] }>(u: T) => ({
+  ...u,
+  roles: nombresDeRoles(u),
+});
+
+/** Ids de los roles, en el mismo orden. null si alguno no existe en la tabla. */
+async function idsDeRoles(roles: string[]) {
+  const filas = await prisma.role.findMany({ where: { name: { in: roles as any } } });
+  if (filas.length !== roles.length) return null;
+  return roles.map((r) => filas.find((f) => f.name === r)!.id);
+}
 
 // Convierte los errores de Zod en { campo: mensaje }.
 function zodErrors(err: ZodError): Record<string, string> {
@@ -61,7 +92,7 @@ adminRouter.get("/users", async (_req: Request, res: Response) => {
  */
 adminRouter.post("/users", async (req: Request, res: Response) => {
   try {
-    const parsed = adminCreateUserSchema.safeParse(req.body ?? {});
+    const parsed = createSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       return res.status(400).json({
         success: false,
@@ -69,9 +100,9 @@ adminRouter.post("/users", async (req: Request, res: Response) => {
         errors: zodErrors(parsed.error),
       });
     }
-    const { role, password, celular, birth_date, ...rest } = parsed.data;
+    const { roles, password, celular, birth_date, ...rest } = parsed.data;
 
-    if (role === "SuperAdmin" && req.user?.role !== "SuperAdmin") {
+    if (roles.includes("SuperAdmin") && !req.user!.roles.includes("SuperAdmin")) {
       return res.status(403).json({
         success: false,
         error: "Solo un SuperAdmin puede asignar el rol SuperAdmin",
@@ -87,8 +118,8 @@ adminRouter.post("/users", async (req: Request, res: Response) => {
         .status(409)
         .json({ success: false, error: "El email ya está registrado" });
     }
-    const roleRow = await prisma.role.findFirst({ where: { name: role } });
-    if (!roleRow) {
+    const roleIds = await idsDeRoles(roles);
+    if (!roleIds) {
       return res.status(400).json({ success: false, error: "Rol inválido" });
     }
 
@@ -98,7 +129,7 @@ adminRouter.post("/users", async (req: Request, res: Response) => {
         celular: celular ?? null,
         birth_date: new Date(birth_date),
         password: await Bun.password.hash(password),
-        role_id: roleRow.id,
+        roles: { create: roleIds.map((role_id) => ({ role_id })) },
       },
       select: userSelect,
     });
@@ -115,7 +146,9 @@ adminRouter.post("/users", async (req: Request, res: Response) => {
 
 /**
  * PUT /api/admin/users/:id — edición. La contraseña es opcional (vacío = no cambia).
- * Solo un SuperAdmin puede tocar cuentas SuperAdmin (existentes o de destino).
+ * Los roles se reemplazan por los que vienen. Solo un SuperAdmin puede tocar
+ * cuentas SuperAdmin (existentes o de destino), y nadie se saca a sí mismo el
+ * rol de gestión.
  */
 adminRouter.put("/users/:id", async (req: Request, res: Response) => {
   try {
@@ -123,7 +156,7 @@ adminRouter.put("/users/:id", async (req: Request, res: Response) => {
     if (typeof id !== "string") {
       return res.status(400).json({ success: false, error: "ID inválido" });
     }
-    const parsed = adminUpdateUserSchema.safeParse(req.body ?? {});
+    const parsed = updateSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       return res.status(400).json({
         success: false,
@@ -131,21 +164,25 @@ adminRouter.put("/users/:id", async (req: Request, res: Response) => {
         errors: zodErrors(parsed.error),
       });
     }
-    const { role, password, celular, birth_date, ...rest } = parsed.data;
+    const { roles, password, celular, birth_date, ...rest } = parsed.data;
 
     const target = await prisma.user.findUnique({
       where: { id },
-      include: { role: true },
+      include: rolesInclude,
     });
     if (!target) {
       return res.status(404).json({ success: false, error: "Usuario no encontrado" });
     }
-    const tocaSuperAdmin = role === "SuperAdmin" || target.role.name === "SuperAdmin";
-    if (tocaSuperAdmin && req.user?.role !== "SuperAdmin") {
-      return res.status(403).json({
-        success: false,
-        error: "Solo un SuperAdmin puede gestionar cuentas SuperAdmin",
-      });
+    const antes = nombresDeRoles(target);
+    const deny = denyCambioDeRoles({
+      actorId: req.user!.id,
+      actorRoles: req.user!.roles,
+      targetId: id,
+      antes,
+      despues: roles,
+    });
+    if (deny) {
+      return res.status(deny.status).json({ success: false, error: deny.error });
     }
     const dup = await prisma.user.findFirst({
       where: { dni: rest.dni, NOT: { id } },
@@ -163,18 +200,20 @@ adminRouter.put("/users/:id", async (req: Request, res: Response) => {
         .status(409)
         .json({ success: false, error: "El email ya está registrado" });
     }
-    const roleRow = await prisma.role.findFirst({ where: { name: role } });
-    if (!roleRow) {
+    const roleIds = await idsDeRoles(roles);
+    if (!roleIds) {
       return res.status(400).json({ success: false, error: "Rol inválido" });
     }
 
+    // Borrar y volver a crear los roles va en el mismo update: Prisma lo corre en
+    // una transacción, así que el usuario nunca queda sin roles a mitad de camino.
     const user = await prisma.user.update({
       where: { id },
       data: {
         ...rest,
         celular: celular ?? null,
         birth_date: new Date(birth_date),
-        role_id: roleRow.id,
+        roles: { deleteMany: {}, create: roleIds.map((role_id) => ({ role_id })) },
         ...(password ? { password: await Bun.password.hash(password) } : {}),
       },
       select: userSelect,
@@ -212,12 +251,12 @@ adminRouter.delete("/users/:id", async (req: Request, res: Response) => {
     }
     const target = await prisma.user.findUnique({
       where: { id },
-      include: { role: true },
+      include: rolesInclude,
     });
     if (!target) {
       return res.status(404).json({ success: false, error: "Usuario no encontrado" });
     }
-    if (target.role.name === "SuperAdmin" && req.user?.role !== "SuperAdmin") {
+    if (nombresDeRoles(target).includes("SuperAdmin") && !req.user!.roles.includes("SuperAdmin")) {
       return res.status(403).json({
         success: false,
         error: "Solo un SuperAdmin puede dar de baja cuentas SuperAdmin",
@@ -225,7 +264,7 @@ adminRouter.delete("/users/:id", async (req: Request, res: Response) => {
     }
 
     const hoy = parseDate(todayInClub());
-    const [user, canceladas] = await prisma.$transaction([
+    const [user, canceladas, anuladas] = await prisma.$transaction([
       prisma.user.update({
         where: { id },
         data: { active: false },
@@ -236,8 +275,29 @@ adminRouter.delete("/users/:id", async (req: Request, res: Response) => {
         where: { user_id: id, date: { gte: hoy }, status: { not: "Cancelada" } },
         data: { status: "Cancelada", active: null },
       }),
+      // Y anula el cobro de esas reservas, en la misma transacción: una cancha
+      // que ya no va a usar no se le cobra. Se acota por `due_date` (que en una
+      // reserva es el día del turno) para no tocar la deuda vieja: lo que quedó
+      // debiendo antes de la baja se sigue debiendo.
+      //
+      // Lo ya pagado no se toca, igual que al cancelar una reserva suelta: la
+      // plata entró y borrarla falsearía los ingresos.
+      prisma.payment.updateMany({
+        where: {
+          user_id: id,
+          concept: "Reserva",
+          due_date: { gte: hoy },
+          status: { in: ["Pendiente", "EnRevision"] },
+        },
+        data: { status: "Anulado" },
+      }),
     ]);
-    res.json({ success: true, user: flatten(user), reservasCanceladas: canceladas.count });
+    res.json({
+      success: true,
+      user: flatten(user),
+      reservasCanceladas: canceladas.count,
+      cuotasAnuladas: anuladas.count,
+    });
   } catch (error) {
     console.error("Deactivate user error:", error);
     res.status(500).json({ success: false, error: "Error al dar de baja al usuario" });
@@ -256,12 +316,12 @@ adminRouter.patch("/users/:id/reactivate", async (req: Request, res: Response) =
     }
     const target = await prisma.user.findUnique({
       where: { id },
-      include: { role: true },
+      include: rolesInclude,
     });
     if (!target) {
       return res.status(404).json({ success: false, error: "Usuario no encontrado" });
     }
-    if (target.role.name === "SuperAdmin" && req.user?.role !== "SuperAdmin") {
+    if (nombresDeRoles(target).includes("SuperAdmin") && !req.user!.roles.includes("SuperAdmin")) {
       return res.status(403).json({
         success: false,
         error: "Solo un SuperAdmin puede reactivar cuentas SuperAdmin",

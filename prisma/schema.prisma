@@ -25,9 +25,23 @@ model Role {
   id   Int      @id @default(autoincrement())
   name RoleType @unique
 
-  users User[]
+  user_roles UserRole[]
 
   @@map("roles")
+}
+
+// Qué roles tiene cada usuario (M:N): una persona puede ser Profesor y Socio a la
+// vez, y los permisos se suman. Reemplazó a `User.role_id`, que admitía uno solo.
+model UserRole {
+  user_id    String   @db.Char(128)
+  role_id    Int
+  created_at DateTime @default(now())
+
+  user User @relation(fields: [user_id], references: [id])
+  role Role @relation(fields: [role_id], references: [id])
+
+  @@id([user_id, role_id]) // un rol no se repite en el mismo usuario
+  @@map("user_roles")
 }
 
 model File {
@@ -42,15 +56,16 @@ model File {
   size          BigInt
   mime          String   @db.VarChar(255)
 
-  users  User[]
-  places Place[]
+  users    User[]
+  places   Place[]
+  payments Payment[] // comprobantes de transferencia
 
   @@map("files")
 }
 
 model User {
   id         String   @id @default(uuid())
-  role_id    Int
+
   name       String   @db.VarChar(50)
   last_name  String   @db.VarChar(50)
   dni        String   @db.VarChar(20)
@@ -62,14 +77,19 @@ model User {
   active     Boolean  @default(true) // baja lógica: false = dado de baja (#46)
   has_credentials Boolean @default(true)
 
-  role Role  @relation(fields: [role_id], references: [id])
-  file File? @relation(fields: [file_id], references: [id])
+  roles UserRole[] // sus roles; los permisos son la suma
+  file  File?      @relation(fields: [file_id], references: [id])
 
   families_as_parent Family[]              @relation("FamilyParent") // hijos a cargo (es el padre/tutor)
   families_as_child  Family[]              @relation("FamilyChild") // vínculos en los que es el hijo
   bookings           Booking[]
   disciplines        DisciplineProfessor[] // disciplinas que dicta (rol Profesor)
   enrollments        Enrollment[] // disciplinas en las que está inscripto (rol Socio)
+
+  // Dos relaciones a Payment, así que van nombradas: una es lo que el usuario
+  // debe, la otra los cobros que registró (sólo gestión).
+  payments            Payment[] @relation("PaymentUser")
+  payments_registered Payment[] @relation("PaymentRegistrar")
 
   @@map("users")
 }
@@ -118,36 +138,46 @@ enum BookingStatus {
   Cancelada
 }
 
-// Para qué es una tarifa. Existe porque `Fee` es una bolsa compartida por
-// Schedule, Booking y Discipline, y hasta ahora la única forma de saber de qué
-// tipo era una tarifa era mirar quién la referenciaba — imposible para las que
-// todavía no tienen modelo propio (cuota de socio, donación).
+// Clasifica una tarifa y, con los mismos valores, el concepto de un pago. Un
+// solo enum para las dos cosas a propósito: mantiene alineado que un Payment de
+// concepto Disciplina apunte a una Fee de disciplina y no a una de cancha.
 //
-// `Reserva` la pone sola findOrCreateFeeForPlace(); el resto las elige el admin
-// en POST /api/fees. Ver el comentario de ese endpoint.
-enum FeeCategory {
+// Hasta ahora Fee no tenía tipo, y como GET /api/fees devuelve todas, nada
+// impedía que una disciplina terminara apuntando a "Cancha de fútbol 5 — $12.000".
+enum FeeKind {
   Reserva
-  CuotaSocio
   Disciplina
-  Donacion
-  Otro
+  Socio // todavía sin usar: la cuota de socio entra por acá sin migrar nada
+}
+
+enum PaymentStatus {
+  Pendiente
+  EnRevision // el socio subió comprobante, administración todavía no lo confirmó
+  Pagado
+  Anulado
+}
+
+enum PaymentMethod {
+  Efectivo
+  Transferencia
+  MercadoPago
 }
 
 // ponytail: inmutable — no hay endpoint de update. Cambiar precio = crear una
 // fila nueva y repuntar Schedule.fee_id. Así el historial de Booking (que
 // guarda su propio fee_id) nunca queda pisado por un cambio de precio.
-// La categoría entra en esa inmutabilidad: se fija al crear y no se toca.
 model Fee {
-  id          Int         @id @default(autoincrement())
-  name        String      @db.VarChar(255)
-  amount      Decimal     @db.Decimal(10, 2)
-  category    FeeCategory @default(Otro)
-  description String?     @db.Text
-  created_at  DateTime    @default(now())
+  id          Int      @id @default(autoincrement())
+  name        String   @db.VarChar(255)
+  amount      Decimal  @db.Decimal(10, 2)
+  kind        FeeKind  @default(Reserva) // para qué sirve esta tarifa
+  description String?  @db.Text
+  created_at  DateTime @default(now())
 
   schedules   Schedule[]
   bookings    Booking[]
   disciplines Discipline[]
+  payments    Payment[]
 
   @@map("fees")
 }
@@ -164,6 +194,7 @@ model Place {
   file        File?        @relation(fields: [file_id], references: [id])
   schedules   Schedule[]
   disciplines Discipline[]
+  blocks      ScheduleBlock[]
 
   @@map("places")
 }
@@ -245,6 +276,7 @@ model Enrollment {
 
   user       User       @relation(fields: [user_id], references: [id])
   discipline Discipline @relation(fields: [discipline_id], references: [id])
+  payments   Payment[] // una cuota por mes cursado
 
   @@unique([user_id, discipline_id, active]) // una sola inscripción activa por par
   @@map("enrollments")
@@ -258,20 +290,11 @@ model Schedule {
   start_time  DateTime @db.Time()
   end_time    DateTime @db.Time()
 
-  // ponytail: mismo truco que Booking y Enrollment — true mientras el turno está
-  // vivo, null cuando se da de baja. Va DENTRO del unique de abajo a propósito:
-  // MySQL ignora los null en los índices únicos, así que muchos turnos muertos y
-  // uno vivo conviven en la misma clave. Con un Boolean común, dar de baja el
-  // martes 19:00 ocuparía esa clave para siempre y no se podría volver a crear
-  // ese turno nunca más — el arreglo sería peor que el bug.
-  // Sin @default a propósito, igual que Booking: cada alta lo setea explícito.
-  active Boolean?
-
   place    Place     @relation(fields: [place_id], references: [id])
   fee      Fee       @relation(fields: [fee_id], references: [id])
   bookings Booking[]
 
-  @@unique([place_id, day_of_week, start_time, active])
+  @@unique([place_id, day_of_week, start_time])
   @@map("schedules")
 }
 
@@ -296,7 +319,156 @@ model Booking {
   schedule Schedule @relation(fields: [schedule_id], references: [id])
   fee      Fee      @relation(fields: [fee_id], references: [id])
   user     User     @relation(fields: [user_id], references: [id])
+  payment  Payment? // el cobro de esta reserva (1:1)
 
   @@unique([schedule_id, date, active])
   @@map("bookings")
+}
+
+// Una fila = un período adeudado, que además registra cómo se saldó.
+// Cubre las reservas de cancha (pago único) y las cuotas de disciplina (mensuales).
+//
+// ponytail: acá vive tanto la deuda como el cobro a propósito. Separarlo en dos
+// tablas (cargo + pago) sólo hace falta para pagos parciales, que el club no
+// tiene: se paga la cuota entera o no se paga. Con una sola tabla, "qué debe
+// Martín" es un WHERE status = Pendiente y no un LEFT JOIN con sumas.
+model Payment {
+  id String @id @default(uuid())
+
+  user_id String  @db.Char(128) // quién debe
+  concept FeeKind
+
+  // Origen: exactamente uno según el concepto. Reserva → booking_id,
+  // Disciplina → enrollment_id, Socio → ninguno de los dos.
+  //
+  // Apunta a Enrollment y no a Discipline porque la inscripción ya tiene el
+  // historial de períodos (created_at → left_at): así se generan cuotas
+  // exactamente por los meses que el socio cursó. La disciplina se llega igual
+  // navegando enrollment.discipline.
+  enrollment_id Int?
+  booking_id    String? @unique @db.Char(128) // una reserva = un solo pago
+
+  // ponytail: mismo criterio que Booking.fee_id. `fee_id` es el snapshot de la
+  // tarifa y `amount` una copia congelada del monto. Las dos cosas: el snapshot
+  // por trazabilidad, la copia porque la inmutabilidad de Fee es una convención
+  // (no hay endpoint de update, pero la base no lo impide) y un cobro manual
+  // puede no corresponder a ninguna tarifa cargada.
+  //
+  // Sin la copia, repuntar Discipline.fee_id repreciaría todo el historial: las
+  // cuotas de marzo cambiarían de monto porque alguien editó una tarifa en
+  // septiembre.
+  fee_id Int?
+  amount Decimal @db.Decimal(10, 2)
+
+  period   String?  @db.Char(7) // "YYYY-MM" en las mensuales; null en las reservas
+  due_date DateTime @db.Date
+
+  // ponytail: no hay estado "Vencido". Se deriva de due_date < hoy con status
+  // Pendiente — guardarlo obligaría a un job que a medianoche dé vuelta filas, y
+  // el front ya lo trata como presentacional (DueStatus: ok | warn | late).
+  status PaymentStatus @default(Pendiente)
+
+  paid_at       DateTime?
+  method        PaymentMethod?
+  file_id       String?        @db.Char(128) // comprobante de transferencia
+  registered_by String?        @db.Char(128) // admin que confirmó el cobro
+  external_id   String?        @unique @db.VarChar(120) // id de Mercado Pago, a futuro
+  notes         String?        @db.Text
+
+  // ponytail: clave de idempotencia. "reserva:<bookingId>",
+  // "disciplina:<enrollmentId>:<YYYY-MM>", "socio:<userId>:<YYYY-MM>".
+  // Hace que la generación mensual se pueda volver a correr sin duplicar, igual
+  // que el seed con sus UUID fijos.
+  ref String @unique @db.VarChar(160)
+
+  created_at DateTime @default(now())
+
+  user       User        @relation("PaymentUser", fields: [user_id], references: [id])
+  registrar  User?       @relation("PaymentRegistrar", fields: [registered_by], references: [id])
+  enrollment Enrollment? @relation(fields: [enrollment_id], references: [id])
+  booking    Booking?    @relation(fields: [booking_id], references: [id])
+  fee        Fee?        @relation(fields: [fee_id], references: [id])
+  file       File?       @relation(fields: [file_id], references: [id])
+
+  @@index([user_id, status])
+  @@index([status, due_date])
+  @@index([concept, due_date])
+  @@map("payments")
+}
+
+// Local adherido con beneficio para socios. La API recorta y valida los textos;
+// `active` cambia únicamente mediante baja o reactivación lógica.
+model PartnerStore {
+  id                   Int     @id @default(autoincrement())
+  name                 String  @db.VarChar(100)
+  address              String  @db.VarChar(255)
+  discount_description String  @db.Text
+  active               Boolean @default(true)
+
+  @@map("partner_stores")
+}
+
+// Token de la API de Instagram del club. Una sola fila (id = 1). Si no hay token,
+// /api/novedades cae a los `NovedadLink` cargados a mano. La API nunca devuelve
+// el token completo: solo una máscara.
+model InstagramConfig {
+  id               Int       @id
+  access_token     String?   @db.Text
+  token_updated_at DateTime?
+
+  @@map("instagram_config")
+}
+
+// Post o reel de Instagram cargado a mano para la vitrina de novedades. `code` es
+// el shortcode de la URL (instagram.com/p/<code>/); es único aunque la URL traiga
+// parámetros de seguimiento distintos. Orden de la vitrina: fijados, luego `position`.
+model NovedadLink {
+  id         Int      @id @default(autoincrement())
+  code       String   @unique @db.VarChar(50)
+  kind       String   @db.VarChar(10)
+  pinned     Boolean  @default(false)
+  position   Int      @default(0)
+  created_at DateTime @default(now())
+
+  @@map("novedad_links")
+}
+
+// Bloqueo temporal de un espacio: no se puede reservar en ese rango de fechas (y,
+// si trae franja horaria, sólo en esa franja). Es lo que permite cerrar la cancha
+// "el lunes 21 por mantenimiento" sin borrar el turno de los lunes, que valdría
+// para todos los lunes. Se levanta borrando la fila: es configuración vigente, no
+// historial. `created_by` es un id de usuario sin relación a propósito: alcanza
+// para saber quién lo puso y no ata el borrado de un usuario a sus bloqueos.
+model ScheduleBlock {
+  id         Int       @id @default(autoincrement())
+  place_id   Int
+  date_from  DateTime  @db.Date
+  date_to    DateTime  @db.Date // inclusive; igual a date_from si es un solo día
+  start_time DateTime? @db.Time() // null = todo el día
+  end_time   DateTime? @db.Time()
+  reason     String    @db.VarChar(255)
+  created_by String    @db.Char(128)
+  created_at DateTime  @default(now())
+
+  place Place @relation(fields: [place_id], references: [id])
+
+  @@index([place_id, date_from, date_to])
+  @@map("schedule_blocks")
+}
+
+// Ajustes del club: una sola fila (id = 1). Lo que antes eran constantes en el código
+// —cuánto antes se cancela una reserva, con cuánta anticipación se reserva, el día de
+// vencimiento de la cuota—. Sin fila la API usa los valores por defecto de
+// `lib/settings.ts`.
+// `updated_by` es un id de usuario sin relación, igual que `ScheduleBlock.created_by`.
+model ClubSettings {
+  id                  Int      @id
+  cancel_hours_before Int      @default(10)
+  days_ahead_member   Int      @default(21)
+  days_ahead_admin    Int      @default(183)
+  payment_due_day     Int      @default(10)
+  updated_by          String?  @db.Char(128)
+  updated_at          DateTime @default(now()) @updatedAt
+
+  @@map("club_settings")
 }

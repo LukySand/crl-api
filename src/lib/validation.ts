@@ -68,7 +68,7 @@ export const registerSchema = z.object({
 
 export type RegisterData = z.infer<typeof registerSchema>;
 
-// ── Admin: alta/edición de usuarios con rol ─────────────────────────────
+// ── Admin: alta/edición de usuarios ─────────────────────────────────────
 export const roleSchema = z.enum([
   "SuperAdmin",
   "Administrador",
@@ -76,10 +76,11 @@ export const roleSchema = z.enum([
   "Socio",
 ]);
 
-// Alta por admin: como el registro pero con rol elegido y celular opcional
-// (permite crear staff sin teléfono).
+// Alta por admin: como el registro pero con celular opcional (permite crear staff
+// sin teléfono). Los roles (`roles: [...]`) se agregan en `routes/admin.ts`, que es
+// donde viven sus reglas (`lib/roles.ts`) — este archivo está duplicado con el
+// front y allá no se usan estos schemas.
 export const adminCreateUserSchema = registerSchema.extend({
-  role: roleSchema,
   celular: celularSchema.optional(),
 });
 

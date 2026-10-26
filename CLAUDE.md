@@ -38,8 +38,7 @@ Sirve **solo** `/api/*`. El frontend vive en otro repo y le pega vía proxy.
 | Teléfonos | **libphonenumber-js** |
 | Env | **dotenv** |
 
-TypeScript en todo. Tests con `bun:test` (nativo de Bun, sin framework aparte) en
-`src/lib/*.test.ts` y `src/routes/*.test.ts`.
+TypeScript en todo. Sin tests configurados.
 
 ---
 
@@ -67,70 +66,115 @@ same-origin. **Al agregar endpoints nuevos no se toca el proxy del front** — s
 
 ```
 src/
-├── server.ts               # Express: json middleware, /api/health, monta los 10 routers
+├── server.ts             # Express: json middleware, /api/health, monta los routers
 ├── lib/
-│   ├── auth.ts             # JWT: signToken/readToken, requireAuth/requireRole/requireAdmin/isAdmin
-│   ├── availability.ts     # cruza turnos con reservas + clases de disciplina (función pura, testeada)
-│   ├── availability.test.ts
-│   ├── booking-date.ts     # fechas/horas en huso del club, topes de anticipación (testeado)
-│   ├── booking-date.test.ts
-│   ├── fee.ts              # findOrCreateFeeForPlace: reusa/crea la tarifa de un turno o reserva
-│   ├── logger.ts           # buffer de logs a la tabla `logs`, flush por tamaño o cada 5s
-│   ├── prisma.ts           # cliente Prisma + adapter MariaDB (singleton en dev)
-│   ├── random-id.ts        # id numérico pseudo-aleatorio de 31 bits
-│   ├── storage.ts          # Storage: sube/lee/borra archivos en disco + fila en `files`
-│   ├── time.ts             # TIME regex, toTime, overlaps (rangos horarios)
-│   └── validation.ts       # Zod — DUPLICADO con el frontend (ver abajo)
-├── middleware/
-│   └── auth.ts             # authenticate/requireRole — usado solo por socioRouter (ver nota abajo)
+│   ├── prisma.ts         # cliente Prisma + adapter MariaDB (singleton en dev)
+│   ├── auth.ts           # JWT: requireAuth / requireAdmin / isAdmin / hasRole — LA canónica
+│   ├── roles.ts          # varios roles por usuario: orden, validación y reglas de gestión
+│   ├── booking-date.ts   # reglas temporales de reservas
+│   ├── payment-period.ts # períodos y vencimientos de cuotas
+│   ├── payment.ts        # claves `ref` + serialización de Decimal
+│   ├── fee.ts            # findOrCreateFeeForPlace
+│   ├── storage.ts        # archivos en disco (mime permitido por kind)
+│   └── validation.ts     # Zod — DUPLICADO con el frontend (ver abajo)
 └── routes/
-    ├── admin.ts            # adminRouter — CRUD de usuarios con rol
-    ├── auth.ts             # authRouter — login/registro/Google
-    ├── booking-admin.test.ts
-    ├── bookings.ts         # bookingsRouter — reservas de espacios
-    ├── disciplines.ts      # disciplinesRouter — disciplinas + sus horarios de clase
-    ├── enrollments.ts      # enrollmentsRouter — inscripciones socio↔disciplina
-    ├── fee-category.test.ts
-    ├── fees.ts             # feesRouter — tarifas (inmutables, sin PATCH/DELETE)
-    ├── files.ts            # filesRouter — subida/descarga genérica de archivos
-    ├── places.ts           # placesRouter — espacios del club (canchas, salón)
-    ├── schedules.ts        # schedulesRouter — turnos reservables de un espacio
-    └── socio.ts            # socioRouter — foto de perfil del socio logueado
+    ├── auth.ts, admin.ts, socio.ts, families.ts, files.ts
+    ├── places.ts, schedules.ts, fees.ts, bookings.ts
+    ├── disciplines.ts, enrollments.ts
+    └── payments.ts, reports.ts
 
 prisma/
 ├── schema.prisma
-├── seed.ts               # siembra roles, usuarios, archivos, familias, tarifas, espacios,
-│                         # turnos, disciplinas, inscripciones y reservas (idempotente)
-├── migrations/
-└── generated/            # cliente Prisma generado (bun run db:generate) — no editar a mano
+├── seed.ts               # siembra los roles
+└── migrations/
 scripts/dev-setup.sh      # bun run setup
 ```
-
-`src/lib/auth.ts` y `src/middleware/auth.ts` son dos implementaciones de JWT distintas y
-duplicadas: casi todos los routers usan `lib/auth.ts` (`requireAuth`/`requireAdmin`/`isAdmin`),
-pero `socio.ts` usa `middleware/auth.ts` (`authenticate`). Mismo JWT, dos lecturas del token.
 
 ---
 
 ## Endpoints
 
-10 routers montados en `server.ts`, todos bajo `/api/*`. Rutas sin login se marcan **público**;
-el resto exige `requireAuth`/`authenticate` y, si dice **gestión**, además `requireAdmin`
-(rol `SuperAdmin` o `Administrador`).
+Todos en `src/routes/auth.ts`, montados bajo `/api/auth` (salvo health).
 
-| Router | Base | Endpoints |
+| Método | Ruta | Qué hace |
 | --- | --- | --- |
-| — | `/api/health` | `GET /` — healthcheck → `{ok:true}` |
-| `authRouter` | `/api/auth` | `POST /login`, `GET /verify`, `POST /register`, `POST /logout`, `GET /google/config`, `POST /google` — todo público (ver [Auth](#auth-cómo-funciona)) |
-| `filesRouter` | `/api/files` | `GET /?id=` público; `PUT /` (auth, sube/reemplaza); `DELETE /?fileId=` (gestión) |
-| `adminRouter` | `/api/admin` | Todo gestión. `GET /users`; `POST /users`; `PUT /users/:id`; `DELETE /users/:id` (baja lógica + cancela sus reservas futuras); `PATCH /users/:id/reactivate` |
-| `placesRouter` | `/api/places` | `GET /` público (`?all=true` gestión ve inactivos); `GET /occupancy` (gestión); `GET /:id` público; `POST /`, `PATCH /:id`, `DELETE /:id` (baja lógica), `PATCH /:id/reactivate` — gestión |
-| `schedulesRouter` | `/api/schedules` | `GET /?place_id=` y `GET /:id` público (sólo turnos vivos); `POST /`, `PATCH /:id` — gestión, rechazan superponerse con otro turno o con una clase; `DELETE /:id` — gestión, **baja lógica**: 409 si tiene reservas futuras sin cancelar |
-| `feesRouter` | `/api/fees` | `GET /?category=` y `GET /:id` público; `POST /` gestión. Sin PATCH/DELETE: `Fee` es inmutable |
-| `bookingsRouter` | `/api/bookings` | Todo auth. `GET /?status=&place_id=` (propias; gestión ve todas); `GET /availability?place_id=&date=`; `GET /:id`; `POST /` (gestión puede reservar a nombre de otro socio, fijar precio y estado); `PATCH /:id`; `DELETE /:id` (cancela, no borra) |
-| `disciplinesRouter` | `/api/disciplines` | `GET /` y `GET /:id` público; `POST /`, `PATCH /:id`, `DELETE /:id` (baja lógica + desinscribe a todos los socios), `PATCH /:id/reactivate` — gestión. Sub-recurso horarios: `GET /:id/schedules` público; `POST/PATCH/DELETE /:id/schedules(/:sid)` — gestión o el profesor a cargo. `POST` y `PATCH` dan 409 si la clase se pisa con un turno reservable vivo del espacio |
-| `enrollmentsRouter` | `/api/enrollments` | Todo auth. `GET /?discipline_id=` (filtrado por rol: admin todas, profesor las que dicta, socio las propias); `POST /` (a sí mismo, o gestión inscribe a otro); `DELETE /:id` (baja lógica) |
-| `socioRouter` | `/api/socio` | Todo auth (vía `middleware/auth.ts`). `GET /files?id=` (archivo propio); `PATCH /profile-image` (reemplaza la foto de perfil) |
+| GET | `/api/health` | Healthcheck → `{ok:true}` |
+| POST | `/api/auth/login` | Login con `{dni, password}` → JWT 24h |
+| POST | `/api/auth/register` | Alta de Socio + auto-login |
+| GET | `/api/auth/verify` | Valida token (header `Bearer` o cookie `auth_token`) |
+| POST | `/api/auth/logout` | Limpia cookie |
+| GET | `/api/auth/google/config` | Expone el Client ID público al front |
+| POST | `/api/auth/google` | Login/alta con Google (ID token) |
+
+### Cuotas y reportes
+
+| Método | Ruta | Guard | Qué hace |
+| --- | --- | --- | --- |
+| GET | `/api/payments` | sesión | Propias; gestión ve todas. `?status= &concept= &period= &user_id= &from= &to=` |
+| GET | `/api/payments/resumen` | sesión | Totales del socio: pendiente, vencido, próximo vencimiento |
+| POST | `/api/payments/generate` | gestión | Genera las cuotas de un período. **Idempotente** |
+| GET | `/api/payments/:id` | dueño o gestión | Una cuota |
+| POST | `/api/payments/:id/comprobante` | dueño | Sube el comprobante (multipart) → `EnRevision` |
+| PATCH | `/api/payments/:id` | gestión | `{action: confirmar\|rechazar\|anular}` |
+| GET | `/api/payments/por-cobrar` | gestión o profesor | Cuotas pendientes que se pueden cobrar en mano. `?search=` por nombre, apellido o DNI. Gestión ve todas; un profesor sólo las de **disciplinas que dicta** |
+| POST | `/api/payments/:id/cobro` | gestión o profesor | Registra el cobro en mano y deja la cuota Pagada (`registered_by`). Gestión: efectivo o transferencia, cualquier concepto. Profesor: sólo efectivo y sólo cuotas de disciplina de sus alumnos. Reglas en `lib/cobro.ts` |
+| GET | `/api/reports/ingresos` | gestión | Totales + un corte. `?from= &to= &concept= &group=mes\|concepto\|metodo\|disciplina\|espacio` |
+| GET | `/api/reports/series` | gestión | Serie temporal. `?bucket=dia\|semana\|mes &by=espacio\|disciplina\|concepto\|metodo &from= &to=` |
+| GET | `/api/reports/morosos` | gestión | Quién debe y desde cuándo |
+| GET | `/api/reports/export` | gestión | Descarga Excel o PDF de lo que muestra la pantalla de reportes. `?format=xlsx\|pdf &bucket= &from= &to= &canchas= &disciplinas=` (los dos últimos se repiten una vez por nombre; ausente = todas, vacío = ninguna) |
+| GET | `/api/enrollments/export` | gestión o profe de esa disciplina | Lista de inscriptos para bajar o imprimir. `?discipline_id= &format=xlsx\|pdf`. Sin celular ni email a propósito (ver `lib/enrollment-export.ts`) |
+
+### Ajustes del club
+
+Lo que antes eran constantes en el código ahora lo fija la gestión (pestaña Ajustes del admin):
+horas para cancelar una reserva (`cancel_hours_before`, 10), días de anticipación del socio
+(`days_ahead_member`, 21) y de la gestión (`days_ahead_admin`, 183), día de vencimiento de la cuota
+(`payment_due_day`, 10). Una sola fila (`ClubSettings`, id 1); sin fila rige lo de siempre
+(`AJUSTES_POR_DEFECTO` en `lib/settings.ts`, que es lo único que no cambió de valor).
+
+| Método | Ruta | Guard | Qué hace |
+| --- | --- | --- | --- |
+| GET | `/api/settings` | sesión | Los ajustes vigentes. Los lee el socio (horas para cancelar, anticipación) |
+| PATCH | `/api/settings` | gestión | Cambio parcial: se manda sólo lo que cambia |
+
+Las constantes `HORAS_ANTES_CANCELAR`, `DIAS_ADELANTE_*` y `DIA_VENCIMIENTO` siguen existiendo pero
+sólo como default de los parámetros (`dentroDeVentanaCancelacion(..., horas)`,
+`vencimientoDe(periodo, dia)`): los handlers leen `getAjustes()` (`lib/settings-db.ts`, con 30 s de
+cache que se descarta al guardar). Un cambio rige para lo que viene: las reservas ya hechas y las
+cuotas ya generadas conservan su fecha.
+
+### Bloqueo de espacios
+
+Cierra un espacio durante un rango de fechas (y, si trae franja horaria, sólo en esa franja) sin
+tocar los turnos: borrar el turno de los lunes valdría para todos los lunes, y el bloqueo es "el
+lunes 21 por mantenimiento". Modelo `ScheduleBlock`; la lógica pura vive en `lib/schedule-block.ts`.
+
+| Método | Ruta | Guard | Qué hace |
+| --- | --- | --- | --- |
+| GET | `/api/blocks` | gestión | Bloqueos vigentes (los que no terminaron). `?place_id=` |
+| POST | `/api/blocks` | gestión | `{place_id, from, to?, start_time?, end_time?, reason}`. Sin `to` es un día; sin franja, todo el día. **409 con `conflictos` si ya hay reservas vivas en ese rango**: no las cancela solo |
+| DELETE | `/api/blocks/:id` | gestión | Lo levanta: el espacio vuelve a poder reservarse |
+
+`POST /api/bookings` responde 409 si el turno está bloqueado ese día (también para la gestión), y
+`GET /api/bookings/availability` suma `slots: [{id, ocupado, motivo: "reserva"|"bloqueo", detalle}]`,
+con el motivo del bloqueo en `detalle`. `taken` sigue siendo la lista plana e incluye los bloqueados.
+
+`/ingresos` corta por **una** dimensión; `/series` es la de **dos** (tiempo × algo), que es lo
+que hace falta para "cuánto facturó cada cancha por día". Cuatro reglas de `/series`:
+
+- **El eje X no tiene huecos.** `rangoBuckets()` emite todos los cajones y los vacíos van en
+  cero. Agrupando sólo los cobros que existen, un día muerto desaparece y las columnas se
+  corren: el gráfico miente sobre su propia forma.
+- **La ventana tiene tope por bucket** (30 días / 12 semanas / 12 meses). Sin tope,
+  `bucket=dia` sobre todo el historial son cientos de columnas.
+- **El rango tiene tope de columnas por corte** (`LIMITE_COLUMNAS` en `report-data.ts`): 62 por día
+  (2 meses), 54 por semana (1 año), 72 por mes (6 años). Pasado eso las barras no se leen y
+  `/series` y `/export` responden 400. Está duplicado en el front (`LIMITES`), que avisa antes de pedir.
+- **La semana se etiqueta por su lunes.** Orden lexicográfico = cronológico, el mismo truco que
+  `todayInClub()` y `period`.
+
+`/resumen` y `/generate` van declaradas **antes** de `/:id`, igual que `/availability` en
+`bookings.ts`: Express matchea por orden y si no las tomaría como un id.
 
 ### Seguridad — regla al agregar endpoints
 
@@ -142,48 +186,24 @@ que opere "sobre mí" saca el `id` del token verificado.
 
 ## Modelo de datos
 
-- `Role` — enum `RoleType`: `SuperAdmin` / `Administrador` / `Profesor` / `Socio`.
-- `User` — `active` es baja lógica (false = dado de baja). `has_credentials` distingue al que
-  puede entrar solo del menor que depende del tutor.
-- `File` — un archivo subido (imagen), referenciado por `User.file_id` o `Place.file_id`.
-- `Family` — vincula un `User` menor (`child_id`) a un tutor (`parent_id`) + `responsible`.
-  Lo expone `familiesRouter` (`/api/families`).
-- `Log` — buffer de auditoría/informativos que escribe `lib/logger.ts` (tabla `logs`).
-- `Place` — espacio del club (cancha, salón); baja lógica con `active`.
-- `Schedule` — turno reservable semanal de un `Place` (día + hora + `Fee`).
-- `Booking` — una reserva de un `Schedule` para una fecha puntual. Enum `BookingStatus`
-  (`Pendiente`/`Confirmada`/`Cancelada`).
-- `Discipline` — disciplina del club (fútbol, vóley…) con cuota/espacio opcionales; baja lógica
-  con `active` y `full` para cortar inscripciones cuando se llena el cupo.
-- `DisciplineProfessor` — tabla puente: varios profes por disciplina (#6). Reemplaza a
-  `Discipline.professor_id`, que quedó **deprecado** y que nadie lee ni escribe.
-- `DisciplineSchedule` — horario semanal fijo de una `Discipline` (no se reserva, se dicta).
-- `Enrollment` — inscripción de un socio a una `Discipline`, con historial de períodos.
-- `Fee` — tarifa **inmutable** (sin endpoint de update: cambiar precio = fila nueva).
-  Enum `FeeCategory`: `Reserva` / `CuotaSocio` / `Disciplina` / `Donacion` / `Otro`. La
-  categoría `Reserva` sólo la crea `findOrCreateFeeForPlace()`, nunca el admin a mano.
+`Role` (enum `SuperAdmin` / `Administrador` / `Profesor` / `Socio`), `User`, `UserRole` (los
+roles de cada usuario, ver "Varios roles"), `File`, `Family` (vincula menores a un tutor
+responsable).
 
-**IDs**: `User`, `File`, `Family` y `Booking` usan UUID (`String @id @default(uuid())`).
-El resto (`Role`, `Log`, `Fee`, `Place`, `Discipline`, `DisciplineSchedule`, `Enrollment`,
-`Schedule`) usa `Int` autoincremental. Migrado desde int en el commit `4db61f3`.
+Reservas: `Place` (espacio), `Schedule` (turno recurrente: `day_of_week` + TIME, sin fecha),
+`Fee` (tarifa, inmutable, con `kind`) y `Booking` (la reserva: `Schedule` + una fecha concreta).
+Disciplinas: `Discipline`, `DisciplineProfessor`, `DisciplineSchedule`, `Enrollment`.
+Plata: `Payment` (ver "Cuotas y pagos" abajo).
 
-**Truco `active` nullable para uniques parciales** (`ponytail:` en el schema): `Booking`,
-`Enrollment` y `Schedule` tienen `active Boolean?` dentro de un `@@unique(...)` — `true` mientras la
-fila está viva, `null` cuando se cancela/da de baja. MySQL no soporta índices únicos parciales,
-pero sí ignora `NULL` en un unique, así que dar de baja libera el turno/la inscripción sin
-borrar la fila (se conserva el historial). El código que da de baja es siempre el único que
-toca ese campo, en el mismo `update` que cambia el estado, para que nunca quede desincronizado.
+**IDs: `User`, `File`, `Family` y `Booking` usan UUID (`String @id @default(uuid())`).** El
+resto es `Int` autoincremental. Migrado desde int en el commit `4db61f3`.
 
-En `Schedule` el truco además es lo que hace posible la baja lógica: sin `active` dentro del
-unique, dar de baja el turno del martes 19:00 ocuparía `(place_id, day_of_week, start_time)`
-para siempre y no se podría volver a crear ese turno nunca más.
+`Booking.active` es `Boolean?` y forma el unique `(schedule_id, date, active)`. MySQL ignora los
+NULL en un índice único, así que poner `active: null` al cancelar libera el turno **sin borrar
+la fila**: la reserva queda en el historial. Es el truco central del modelo — el código que
+cancela es el único que toca ese campo, siempre en el mismo `update` que pone `status`.
 
-**Ojo con el unique compuesto en Prisma**: los mantenedores confirmaron (discussions
-[#23522](https://github.com/prisma/prisma/discussions/23522) y
-[#21322](https://github.com/prisma/prisma/discussions/21322)) que el input de unique compuesto
-exige un valor para cada campo aunque sea nullable, y no acepta `null` cómodo. Por eso la baja
-lógica actualiza por `where: { id }`, nunca por el tuple. Apuntarle al tuple sólo es válido con
-un valor concreto (el seed usa `active: true`).
+Falta el modelo de cuotas, pagos, locales adheridos y publicaciones.
 
 ---
 
@@ -204,6 +224,31 @@ un valor concreto (el seed usa `active: true`).
   propia. **La cuenta no se crea hasta tenerlos** → nunca queda una cuenta a medias.
 - Usuarios de Google reciben `password = hash(crypto.randomUUID())`: solo para cumplir el
   `NOT NULL`. Nadie la conoce, no pueden entrar por dni+password.
+
+---
+
+## Varios roles por usuario
+
+Una persona puede tener varios roles (Carolina es Profesor + Socio) y **los permisos se suman**.
+La fuente de verdad es la tabla `UserRole`. Reglas:
+
+- **Chequeá contra la lista, nunca contra un rol suelto.** `requireRole` / `requireAdmin` /
+  `isAdmin(req)` / `hasRole(req, "Profesor")` ya miran `req.user.roles`. Un
+  `req.user.role === "Profesor"` o un `else if` por rol asume que tenés uno solo y se rompe.
+- **Socio es un rol:** paga cuota, tiene tarjeta, puede inscribirse. Un profe que no es socio no
+  se inscribe (`POST /api/enrollments` exige el rol Socio).
+- **`?propias=true`** en `GET /api/bookings`, `/api/payments` y `/api/enrollments` devuelve sólo
+  lo del usuario del token, tenga el rol que tenga. Sin eso, un Admin + Socio vería en "Mis
+  reservas" las de todo el club, y una profe + socia vería sus alumnos en vez de sus
+  inscripciones. La app de socio lo manda; el panel de gestión no. Ver `veComoGestion()`.
+- **Combinaciones:** cualquiera menos SuperAdmin + Administrador. Mínimo un rol. Nadie se saca a
+  sí mismo el rol de gestión. Una cuenta que es o pasa a ser SuperAdmin sólo la toca un
+  SuperAdmin. Todo en `lib/roles.ts`, con tests.
+- **Un usuario sin roles no existe:** `User.role_id` se borró (migración
+  `20260915200000_drop_user_role_id`, que antes copia a `UserRole` lo que falte). El token lleva
+  sólo `roles`; uno viejo con `role` se trata como vencido y hay que re-loguearse. El alta y la
+  edición de `/api/admin/users` piden `roles: [...]` (el schema está en `routes/admin.ts`, no en
+  `validation.ts`, que está duplicado con el front).
 
 ---
 
@@ -237,9 +282,8 @@ bun dev                 # :3001, hot reload
 | `bun run db:studio` | UI de Prisma |
 | `bun run db:generate` | Regenera el cliente |
 | `bun run db:push` | Aplica el schema sin migración |
-| `bun run db:seed` | Siembra datos de prueba (roles, usuarios, espacios, turnos…) |
+| `bun run db:seed` | Siembra roles |
 | `docker compose up -d db` | Solo la base |
-| `bun test` | Corre los tests (`bun:test`) |
 
 En prod, `entrypoint.sh` corre `migrate deploy` + seed antes de arrancar.
 
@@ -258,32 +302,57 @@ En prod, `entrypoint.sh` corre `migrate deploy` + seed antes de arrancar.
    no solo la ruta del archivo — si no, Prisma intenta ejecutarlo como binario y tira `EACCES`.
 4. Al agregar deps o tocar `validation.ts`, recordá que hay **dos repos**.
 5. `JWT_SECRET=secret` en el `.env` de dev — cambiar antes de cualquier deploy.
-6. **El cliente Prisma se desincroniza de tres formas distintas.** Las tres dan errores que
-   parecen bugs de código y no lo son. Identificá cuál es antes de tocar nada:
-
-   | Síntoma | Qué está desfasado | Fix |
-   | --- | --- | --- |
-   | `tsc` se queja de un campo que **sí** está en `schema.prisma` (o exige uno que no está) | cliente generado viejo, schema nuevo | `bun run db:generate` |
-   | En runtime: `The column X does not exist in the current database` (P2022) | cliente nuevo, **base** vieja | aplicar la migración con `prisma db execute --file` |
-   | En runtime: `Unknown argument 'X'` pero `tsc` pasa limpio | cliente ok en disco, **el proceso de `bun dev` tiene el viejo en memoria** | reiniciar `bun dev` (Ctrl+C y de nuevo) |
-
-   El tercero es el más confuso justamente porque `tsc --noEmit` sale en 0: `bun --hot`
-   recarga tu código, pero no vuelve a evaluar el cliente generado. Si regeneraste con el
-   server levantado, reinicialo.
 
 ---
 
 ## Estado actual
 
-**Construido**: auth completo (JWT + Google), gestión de usuarios y roles, archivos/fotos de
-perfil, familias (vínculo menor↔tutor), espacios (`Place`) con ocupación, turnos reservables
-(`Schedule`) con validación de solapamiento, reservas (`Booking`) con cancelación y topes de
-anticipación, tarifas (`Fee`) categorizadas, disciplinas con varios profesores y sus horarios
-de clase, e inscripciones socio↔disciplina.
+Construido: auth (`/api/auth/*`), gestión de usuarios y bajas (`/api/admin/*`), archivos
+(`/api/files`), espacios (`/api/places`), turnos (`/api/schedules`), tarifas (`/api/fees`),
+reservas (`/api/bookings`), disciplinas (`/api/disciplines`), inscripciones
+(`/api/enrollments`), cuotas y cobros (`/api/payments`) y reportes de ingresos
+(`/api/reports`).
 
-**Falta** (ni siquiera hay modelo en el schema): pagos (Mercado Pago / comprobante de
-transferencia), cuotas de socio como obligación mensual con vencimiento, publicaciones
-institucionales, locales adheridos con beneficios, y reportes de ingresos.
+Falta: cuota de socio (el enum ya tiene el valor `Socio`, falta decidir dónde vive el monto
+vigente del club), Mercado Pago, publicaciones institucionales, locales adheridos con
+beneficios.
+
+### Cuotas y pagos
+
+`Payment` es el ledger: **una fila = un período adeudado que además registra cómo se saldó**.
+Cubre las reservas de cancha (pago único) y las cuotas de disciplina (mensuales). Antes de
+esto, `BookingStatus.Confirmada` hacía de "pagada" sin registrar quién cobró, cuándo ni cómo.
+
+Reglas que no se rompen:
+
+- **El monto se congela.** `Payment.amount` es una copia, no un join. `fee_id` va igual como
+  snapshot. Sin la copia, repuntar `Discipline.fee_id` repreciaría todo el historial.
+  Mismo criterio que `Booking.fee_id`.
+- **No hay estado "Vencido".** Se deriva de `due_date < hoy` con status `Pendiente`.
+  Guardarlo pediría un job a medianoche.
+- **No hay `next_due_date`.** Es `min(due_date) where status = Pendiente`.
+- **`ref` es único** (`reserva:<id>`, `disciplina:<enrollment>:<YYYY-MM>`,
+  `socio:<user>:<YYYY-MM>`): hace idempotente a `POST /api/payments/generate`, que si no
+  cobraría el mes dos veces cuando alguien lo corre de nuevo.
+- **El pago viaja en la misma transacción que lo que lo origina.** Crear/cancelar una reserva,
+  desinscribirse, dar de baja un socio o una disciplina: todo toca el pago en el mismo
+  `$transaction`, por lo mismo que `status` y `active` de `Booking` nunca se separan.
+- **Lo ya `Pagado` no se anula nunca.** La plata entró de verdad; borrarla falsearía los
+  ingresos del mes. Las devoluciones no existen todavía.
+
+Constantes en `src/lib/payment-period.ts` (nunca sueltas en un handler, igual que
+`booking-date.ts`): `DIA_VENCIMIENTO = 10`. `cursoEnPeriodo()` decide a quién le toca la cuota
+del mes — se cobra el mes completo si cursó aunque sea un día, sin prorrateo. Ahí viven también
+los buckets de los reportes (`lunesDe`, `bucketDe`, `rangoBuckets`, `ventanaPorDefecto`).
+
+⚠️ **"Hoy" siempre con `todayInClub()`, nunca con el reloj UTC** — incluido el seed. Corriendo
+el seed de noche en Argentina (UTC-3) el UTC ya está en el día siguiente, así que los cobros
+quedaban fechados mañana: se caían de la ventana del reporte y volvían a meter ingresos futuros.
+
+`Fee.kind` (`Reserva | Disciplina | Socio`) separa el alquiler por hora de la cuota mensual:
+la cancha de vóley sale $9.000/hora y la disciplina vóley $8.000/mes, y antes las dos podían
+terminar siendo la misma fila. El front tiene que pedir `GET /api/fees?kind=Disciplina` al
+elegir la cuota de una disciplina — el backend además lo valida.
 
 ### Reglas temporales de las reservas
 
@@ -309,10 +378,5 @@ tocá la otra.
 ## Deuda conocida
 
 - El registro normal (dni+password) **no verifica el email**. Alguien podría registrar un email
-  ajeno antes de que el dueño entre por Google. (`email` sí tiene `@unique` en el schema, así
-  que el duplicado explota — pero el registro nunca prueba que el mail sea tuyo.)
-- `src/lib/auth.ts` y `src/middleware/auth.ts` son dos implementaciones duplicadas del mismo
-  JWT. `socio.ts` usa la del medio, todo el resto usa la de `lib/`. Unificar.
-- El no-solapamiento de `Schedule` vive en la aplicación, no en la base: MySQL 8 no tiene
-  exclusion constraints (eso es Postgres). Si algún día se escribe en la tabla por fuera de
-  `POST/PATCH /api/schedules`, nada impide turnos pisados.
+  ajeno antes de que el dueño entre por Google.
+- `email` no tiene constraint `@unique` en el schema; el register solo chequea DNI duplicado.

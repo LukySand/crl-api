@@ -1,8 +1,12 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import prisma from "../lib/prisma";
-import { requireAuth, isAdmin } from "../lib/auth";
+import { requireAuth, isAdmin, veComoGestion } from "../lib/auth";
 import { findOrCreateFeeForPlace } from "../lib/fee";
+import { refReserva } from "../lib/payment";
+import { bloqueaTurno } from "../lib/schedule-block";
+import { getAjustes } from "../lib/settings-db";
+import { bloqueoQueCierra, bloqueosDelDia } from "../lib/schedule-block-db";
 import {
   parseDate,
   matchesDayOfWeek,
@@ -10,12 +14,8 @@ import {
   nowTimeInClub,
   timeToHHMM,
   ultimaFechaReservable,
-  DIAS_ADELANTE_SOCIO,
-  DIAS_ADELANTE_ADMIN,
-  HORAS_ANTES_CANCELAR,
   dentroDeVentanaCancelacion,
 } from "../lib/booking-date";
-import { buildAvailability, claseQuePisa } from "../lib/availability";
 
 export const bookingsRouter = Router();
 
@@ -58,6 +58,9 @@ const createSchema = z.object({
   user_id: z.uuid("user_id inválido").optional(),
   amount: amountSchema.optional(),
   status: z.enum(["Pendiente", "Confirmada"]).optional(),
+  // Cómo cobró la gestión al confirmar en el acto. Sólo se mira si status es
+  // Confirmada; si no viene, se asume efectivo (es el mostrador del club).
+  method: z.enum(["Efectivo", "Transferencia", "MercadoPago"]).optional(),
 });
 
 const updateSchema = z.object({
@@ -66,11 +69,14 @@ const updateSchema = z.object({
   // Precio puntual de esta reserva. No toca Schedule.fee_id: las próximas
   // reservas de ese turno siguen saliendo al precio del turno.
   amount: amountSchema.optional(),
+  // Medio de cobro, sólo se mira al confirmar. Como en el POST.
+  method: z.enum(["Efectivo", "Transferencia", "MercadoPago"]).optional(),
 });
 
 
 /**
  * GET /api/bookings — reservas. El Administrador ve todas; el resto, las propias.
+ * Con `?propias=true` sólo las propias, también para gestión.
  * Filtros: ?status=Confirmada  ?place_id=1
  */
 bookingsRouter.get("/", async (req: Request, res: Response) => {
@@ -84,8 +90,9 @@ bookingsRouter.get("/", async (req: Request, res: Response) => {
 
     const bookings = await prisma.booking.findMany({
       where: {
-        // Sale del token, nunca de la query: nadie mira las reservas de otro
-        ...(isAdmin(req) ? {} : { user_id: req.user!.id }),
+        // Sale del token, nunca de la query: nadie mira las reservas de otro.
+        // Gestión ve todas salvo que pida `?propias=true` (ver veComoGestion).
+        ...(veComoGestion(req) ? {} : { user_id: req.user!.id }),
         ...(typeof status === "string" && { status: status as any }),
         ...(placeId !== undefined && { schedule: { place_id: placeId } }),
       },
@@ -100,15 +107,18 @@ bookingsRouter.get("/", async (req: Request, res: Response) => {
   }
 });
 
+/** Por qué un turno no se puede reservar ese día. `detalle` trae el motivo de un bloqueo. */
+interface SlotDisponibilidad {
+  id: number;
+  ocupado: true;
+  motivo: "reserva" | "bloqueo";
+  detalle: string | null;
+}
+
 /**
  * GET /api/bookings/availability?place_id=1&date=2026-08-17 — qué turnos están
- * tomados ese día. Sin datos de quién reservó: el socio necesita saber qué está
- * ocupado, no de quién es.
- *
- * Además de reservas, un turno también queda tomado si se pisa con una clase de
- * disciplina en ese espacio y día (DisciplineSchedule) — ver lib/availability.ts.
- * `taken` se mantiene por compatibilidad con el front actual (sólo ids); `slots`
- * es la respuesta nueva con el motivo y, si es una clase, su nombre.
+ * tomados ese día. Devuelve sólo ids, sin datos de quién reservó: el socio
+ * necesita saber qué está ocupado, no de quién es.
  *
  * Va antes de "/:id" a propósito: Express matchea por orden y si no, tomaría
  * "availability" como un id.
@@ -125,44 +135,44 @@ bookingsRouter.get("/availability", async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: "La fecha debe ser YYYY-MM-DD" });
     }
 
-    const when = parseDate(date);
-    if (Number.isNaN(when.getTime())) {
+    const dia = parseDate(date);
+    if (Number.isNaN(dia.getTime())) {
       return res.status(400).json({ success: false, error: "Fecha inválida" });
     }
-    const dayOfWeek = when.getUTCDay();
 
-    const [schedules, bookings, disciplineSchedules] = await Promise.all([
-      prisma.schedule.findMany({
-        // active: true deja afuera los turnos dados de baja
-        where: { place_id: placeId, day_of_week: dayOfWeek, active: true },
-        select: { id: true, start_time: true, end_time: true },
-        orderBy: { start_time: "asc" },
-      }),
+    const [rows, turnos, bloqueos] = await Promise.all([
       prisma.booking.findMany({
         // active: true deja afuera las canceladas (que quedan en null y liberan el turno)
-        where: { date: when, active: true, schedule: { place_id: placeId } },
+        where: { date: dia, active: true, schedule: { place_id: placeId } },
         select: { schedule_id: true },
       }),
-      prisma.disciplineSchedule.findMany({
-        where: {
-          day_of_week: dayOfWeek,
-          discipline: { place_id: placeId, active: true },
-        },
-        select: {
-          start_time: true,
-          end_time: true,
-          discipline: { select: { name: true } },
-        },
+      // Los turnos que caen ese día de la semana: son los únicos que un bloqueo
+      // puede cerrar ese día.
+      prisma.schedule.findMany({
+        where: { place_id: placeId, day_of_week: dia.getUTCDay() },
+        select: { id: true, start_time: true, end_time: true },
       }),
+      bloqueosDelDia(placeId, date),
     ]);
 
-    const slots = buildAvailability(schedules, bookings, disciplineSchedules);
+    const reservados = new Set(rows.map((r) => r.schedule_id));
 
-    return res.json({
-      success: true,
-      taken: slots.filter((s) => s.ocupado).map((s) => s.id),
-      slots,
+    // Por qué está ocupado cada turno. Un bloqueo manda sobre una reserva: si los
+    // dos coinciden, lo que ve el socio es que el espacio está cerrado.
+    const slots = turnos.flatMap((t): SlotDisponibilidad[] => {
+      const cierre = bloqueos.find((b) =>
+        bloqueaTurno(b, date, { start: timeToHHMM(t.start_time), end: timeToHHMM(t.end_time) }),
+      );
+      if (cierre) return [{ id: t.id, ocupado: true, motivo: "bloqueo", detalle: cierre.reason }];
+      if (reservados.has(t.id)) return [{ id: t.id, ocupado: true, motivo: "reserva", detalle: null }];
+      return [];
     });
+
+    // `taken` sigue siendo la lista plana de ids no reservables (bloqueados incluidos),
+    // para las pantallas que sólo necesitan saber qué turnos no se pueden tomar.
+    const taken = [...new Set([...rows.map((r) => r.schedule_id), ...slots.map((x) => x.id)])];
+
+    return res.json({ success: true, taken, slots });
   } catch (error) {
     console.error("Availability error:", error);
     return res.status(500).json({ success: false, error: "Error al consultar disponibilidad" });
@@ -237,6 +247,11 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
           .status(403)
           .json({ success: false, error: "No podés fijar el estado de la reserva" });
       }
+      if (parsed.data.method !== undefined) {
+        return res
+          .status(403)
+          .json({ success: false, error: "No podés registrar el cobro de la reserva" });
+      }
     }
 
     let userId = req.user!.id;
@@ -261,33 +276,27 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: "No se puede reservar una fecha pasada" });
     }
 
-    // Tope hacia adelante: 3 semanas para el socio, 6 meses para la gestión.
-    const tope = ultimaFechaReservable(
-      admin ? DIAS_ADELANTE_ADMIN : DIAS_ADELANTE_SOCIO,
-    );
-    if (date > tope) {
+    // Tope hacia adelante: lo fija el club en los ajustes (por defecto 3 semanas
+    // para el socio y 6 meses para la gestión).
+    const ajustes = await getAjustes();
+    const diasAdelante = admin ? ajustes.days_ahead_admin : ajustes.days_ahead_member;
+    if (date > ultimaFechaReservable(diasAdelante)) {
       return res.status(400).json({
         success: false,
-        error: admin
-          ? "No se puede reservar con más de 6 meses de anticipación"
-          : "No se puede reservar con más de 3 semanas de anticipación",
+        error: `No se puede reservar con más de ${diasAdelante} días de anticipación`,
       });
     }
 
-    // findFirst y no findUnique: hay que filtrar por active, que no es único.
-    const schedule = await prisma.schedule.findFirst({
+    const schedule = await prisma.schedule.findUnique({
       where: { id: schedule_id },
-      include: { place: { select: { active: true } } },
+      include: {
+        place: { select: { active: true } },
+        // El monto se congela en el pago, así que hace falta acá y no sólo el fee_id.
+        fee: { select: { amount: true } },
+      },
     });
     if (!schedule) {
       return res.status(404).json({ success: false, error: "El horario no existe" });
-    }
-    // Un turno dado de baja sigue existiendo (conserva su historial de reservas)
-    // pero ya no se reserva. Por eso 409 y no 404: la fila está, el turno no.
-    if (schedule.active !== true) {
-      return res
-        .status(409)
-        .json({ success: false, error: "El horario ya no está disponible" });
     }
     // Un espacio dado de baja no se puede reservar (las reservas viejas siguen ahí)
     if (!schedule.place.active) {
@@ -304,24 +313,6 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
         .json({ success: false, error: "Ese horario ya pasó" });
     }
 
-    // Un turno que se pisa con una clase de disciplina no se reserva: el espacio
-    // está ocupado dictándola. Va acá y no sólo en GET /availability: el front
-    // esconde el turno, pero un POST directo lo reservaría igual.
-    const clases = await prisma.disciplineSchedule.findMany({
-      where: {
-        day_of_week: schedule.day_of_week,
-        discipline: { place_id: schedule.place_id, active: true },
-      },
-      select: { start_time: true, end_time: true, discipline: { select: { name: true } } },
-    });
-    const clase = claseQuePisa(schedule.start_time, schedule.end_time, clases);
-    if (clase) {
-      return res.status(409).json({
-        success: false,
-        error: `Ese horario está ocupado por la clase de ${clase.discipline.name}`,
-      });
-    }
-
     // El schema no puede validar esto: la fecha tiene que caer en el día de semana del turno
     if (!matchesDayOfWeek(when, schedule.day_of_week)) {
       const dias = ["domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"];
@@ -329,6 +320,18 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
         success: false,
         error: `Ese turno es los ${dias[schedule.day_of_week]}, y la fecha elegida es ${dias[when.getUTCDay()]}`,
       });
+    }
+
+    // Un bloqueo temporal (mantenimiento, evento…) cierra el turno en esa fecha
+    // para todos, también para la gestión: si hace falta usarlo, se levanta antes.
+    const bloqueo = await bloqueoQueCierra(schedule.place_id, date, {
+      start: timeToHHMM(schedule.start_time),
+      end: timeToHHMM(schedule.end_time),
+    });
+    if (bloqueo) {
+      return res
+        .status(409)
+        .json({ success: false, error: `Ese horario está bloqueado: ${bloqueo.reason}` });
     }
 
     // Snapshot del precio. Por defecto sale del turno, no del cliente: si no,
@@ -341,18 +344,58 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
         ? await findOrCreateFeeForPlace(parsed.data.amount, schedule.place_id)
         : schedule.fee_id;
 
-    const booking = await prisma.booking.create({
-      data: {
-        schedule_id,
-        fee_id: feeId,
-        user_id: userId,
-        date: when,
-        notes,
-        // La gestión puede darla por paga en el acto (cobró en el club).
-        ...(admin && parsed.data.status ? { status: parsed.data.status } : {}),
-        active: true,
-      },
-      include: bookingInclude,
+    // Monto congelado del cobro. Sale del mismo lado que el fee_id: el override
+    // de la gestión si lo hay, si no el precio del turno.
+    const monto =
+      admin && parsed.data.amount !== undefined
+        ? parsed.data.amount
+        : schedule.fee.amount;
+
+    // La gestión puede darla por paga en el acto (cobró en el club).
+    const cobrada = admin && parsed.data.status === "Confirmada";
+
+    // La reserva y su cobro nacen juntos o no nace ninguno: si el INSERT del
+    // pago fallara aparte, quedaría una cancha ocupada que no le figura a nadie
+    // como deuda. El P2002 del turno duplicado sigue saliendo del create de
+    // abajo y se maneja en el catch igual que antes.
+    const booking = await prisma.$transaction(async (tx) => {
+      const creada = await tx.booking.create({
+        data: {
+          schedule_id,
+          fee_id: feeId,
+          user_id: userId,
+          date: when,
+          notes,
+          ...(admin && parsed.data.status ? { status: parsed.data.status } : {}),
+          active: true,
+        },
+        include: bookingInclude,
+      });
+
+      await tx.payment.create({
+        data: {
+          user_id: userId,
+          concept: "Reserva",
+          booking_id: creada.id,
+          fee_id: feeId,
+          amount: monto,
+          // Sin período: la reserva no es mensual, se paga una sola vez.
+          period: null,
+          // Vence el día del turno: se juega pagando.
+          due_date: when,
+          ref: refReserva(creada.id),
+          ...(cobrada
+            ? {
+                status: "Pagado" as const,
+                paid_at: new Date(),
+                method: parsed.data.method ?? ("Efectivo" as const),
+                registered_by: req.user!.id,
+              }
+            : {}),
+        },
+      });
+
+      return creada;
     });
 
     return res.status(201).json({ success: true, booking });
@@ -421,6 +464,11 @@ bookingsRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response)
         .status(403)
         .json({ success: false, error: "Solo un administrador puede cambiar el precio" });
     }
+    if (parsed.data.method !== undefined && !isAdmin(req)) {
+      return res
+        .status(403)
+        .json({ success: false, error: "Solo un administrador puede registrar el cobro" });
+    }
 
     // No toca Schedule.fee_id: el resto de las reservas de ese turno sigue
     // saliendo al precio del turno, esto sólo repuntea ESTA reserva.
@@ -432,13 +480,42 @@ bookingsRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response)
     // El estado sí puede cambiar entre la lectura y la escritura (otra pestaña
     // cancelando). Va como condición del UPDATE, no como if previo: si alguien
     // canceló en el medio, count sale 0 y no se pisa nada.
-    const { count } = await prisma.booking.updateMany({
-      where: { id: req.params.id, status: { not: "Cancelada" } },
-      data: {
-        ...(notes !== undefined && { notes }),
-        ...(status !== undefined && { status }),
-        ...(feeId !== undefined && { fee_id: feeId }),
-      },
+    const count = await prisma.$transaction(async (tx) => {
+      const { count } = await tx.booking.updateMany({
+        where: { id: req.params.id, status: { not: "Cancelada" } },
+        data: {
+          ...(notes !== undefined && { notes }),
+          ...(status !== undefined && { status }),
+          ...(feeId !== undefined && { fee_id: feeId }),
+        },
+      });
+      if (count === 0) return 0;
+
+      // El cobro acompaña a la reserva en la misma transacción, igual que en la
+      // cancelación: si no, confirmar dejaría la reserva paga y la deuda viva.
+      if (amount !== undefined) {
+        // Repreciar sólo sirve mientras no se cobró: si ya se pagó, el monto que
+        // entró a la caja es el que entró y no se reescribe.
+        await tx.payment.updateMany({
+          where: { booking_id: req.params.id, status: { not: "Pagado" } },
+          data: { amount, fee_id: feeId },
+        });
+      }
+      if (status === "Confirmada") {
+        await tx.payment.updateMany({
+          where: {
+            booking_id: req.params.id,
+            status: { in: ["Pendiente", "EnRevision"] },
+          },
+          data: {
+            status: "Pagado",
+            paid_at: new Date(),
+            method: parsed.data.method ?? "Efectivo",
+            registered_by: req.user!.id,
+          },
+        });
+      }
+      return count;
     });
     if (count === 0) {
       return res.status(409).json({ success: false, error: "La reserva está cancelada" });
@@ -461,7 +538,7 @@ bookingsRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response)
  * en el mismo update: el NULL saca la fila de la unique constraint y libera el turno,
  * pero la reserva queda para el historial.
  *
- * El socio tiene ventana: hasta HORAS_ANTES_CANCELAR antes de que arranque el turno.
+ * El socio tiene ventana: hasta las horas que fije el club (ajustes) antes de que arranque el turno.
  * La gestión no.
  */
 bookingsRouter.delete("/:id", async (req: Request<{ id: string }>, res: Response) => {
@@ -479,24 +556,49 @@ bookingsRouter.delete("/:id", async (req: Request<{ id: string }>, res: Response
       return res.status(403).json({ success: false, error: "No tenés permisos para esta acción" });
     }
 
-    // La gestión cancela siempre; el socio, hasta HORAS_ANTES_CANCELAR antes del
-    // turno. Va en el backend y no sólo en el front: escondiendo el botón, un
-    // DELETE a mano seguiría liberando la cancha cinco minutos antes.
-    if (
-      !isAdmin(req) &&
-      !dentroDeVentanaCancelacion(existing.date, existing.schedule.start_time)
-    ) {
-      return res.status(409).json({
-        success: false,
-        error: `Las reservas se cancelan hasta ${HORAS_ANTES_CANCELAR} horas antes del turno. Comunicate con el club.`,
-      });
+    // La gestión cancela siempre; el socio, hasta las horas que fije el club en los
+    // ajustes antes del turno. Va en el backend y no sólo en el front: escondiendo
+    // el botón, un DELETE a mano seguiría liberando la cancha cinco minutos antes.
+    if (!isAdmin(req)) {
+      const { cancel_hours_before } = await getAjustes();
+      if (
+        !dentroDeVentanaCancelacion(
+          existing.date,
+          existing.schedule.start_time,
+          new Date(),
+          cancel_hours_before,
+        )
+      ) {
+        return res.status(409).json({
+          success: false,
+          error: `Las reservas se cancelan hasta ${cancel_hours_before} horas antes del turno. Comunicate con el club.`,
+        });
+      }
     }
 
     // Cancelar dos veces en paralelo (doble tap, dos pestañas) tiene que dejar
     // una sola cancelación: la condición va en el UPDATE y gana el primero.
-    const { count } = await prisma.booking.updateMany({
-      where: { id: req.params.id, status: { not: "Cancelada" } },
-      data: { status: "Cancelada", active: null },
+    const count = await prisma.$transaction(async (tx) => {
+      const { count } = await tx.booking.updateMany({
+        where: { id: req.params.id, status: { not: "Cancelada" } },
+        data: { status: "Cancelada", active: null },
+      });
+      if (count === 0) return 0;
+
+      // El pago se anula en la misma transacción que la cancelación, por lo
+      // mismo que `status` y `active` viajan juntos (ver el comentario del
+      // modelo Booking): si se separan, un fallo entre medio deja una reserva
+      // cancelada con la deuda todavía viva.
+      //
+      // Un pago ya cobrado NO se anula: la plata entró de verdad y borrarla del
+      // ledger falsearía los ingresos del mes. Queda Pagado contra una reserva
+      // cancelada, que es exactamente lo que pasó. La devolución es otro tema y
+      // todavía no existe.
+      await tx.payment.updateMany({
+        where: { booking_id: req.params.id, status: { not: "Pagado" } },
+        data: { status: "Anulado" },
+      });
+      return count;
     });
     if (count === 0) {
       return res.status(409).json({ success: false, error: "La reserva ya estaba cancelada" });
