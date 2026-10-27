@@ -14,7 +14,7 @@ import { logger } from "./logger";
 import { getAjustes } from "./settings-db";
 import { cursoEnPeriodo, todayInClub } from "./payment-period";
 import { refDisciplina, refRecurrente } from "./payment";
-import { cicloVigente, vencimientoPara, type Periodicidad } from "./recurrence";
+import { cicloVigente, proximoCiclo, vencimientoPara, type Periodicidad } from "./recurrence";
 import type { Prisma } from "../../prisma/generated/client";
 
 const dia = (d: Date) => d.toISOString().slice(0, 10);
@@ -120,6 +120,79 @@ async function destinatarios(
       return out;
     }
   }
+}
+
+export type BorradorPlantilla = Parameters<typeof periodicidadDe>[0] & {
+  concept: string;
+  name: string;
+  description?: string | null;
+  amount: number | null;
+  due_rule?: Prisma.RecurringTemplateGetPayload<object>["due_rule"];
+  due_value?: number | null;
+  target_mode: Prisma.RecurringTemplateGetPayload<object>["target_mode"];
+  discipline_id?: number | null;
+  targets: string[];
+};
+
+export type PrevisualizacionEmision = {
+  fecha: string;
+  period: string;
+  vence: string | null;
+  destinatarios: number;
+  monto_unitario: number | null;
+  monto_total: number;
+};
+
+/**
+ * Qué emitiría una plantilla (sin guardarla) en su próxima fecha de emisión.
+ * Sólo lee: no crea cargos. Mismo cálculo de destinatarios y vencimiento que `emitirCargos`.
+ */
+export async function previsualizarEmision(
+  b: BorradorPlantilla,
+  hoy = todayInClub(),
+): Promise<PrevisualizacionEmision | null> {
+  const p = periodicidadDe(b);
+  const fecha = proximoCiclo(p, hoy);
+  const ciclo = fecha && cicloVigente(p, fecha);
+  if (!fecha || !ciclo) return null;
+
+  const tipo = await prisma.chargeType.findUnique({ where: { key: b.concept } });
+  const ids = [...new Set(b.targets)];
+  const usuarios = ids.length
+    ? await prisma.user.findMany({ where: { id: { in: ids } }, select: { id: true, active: true } })
+    : [];
+  const activos = new Map(usuarios.map((u) => [u.id, u.active]));
+  const t = {
+    ...b,
+    id: 0,
+    description: b.description ?? null,
+    due_rule: b.due_rule ?? null,
+    due_value: b.due_value ?? null,
+    discipline_id: b.discipline_id ?? null,
+    amount: b.amount,
+    type: tipo,
+    targets: ids.map((user_id) => ({ user_id, user: { active: activos.get(user_id) ?? false } })),
+  } as unknown as Plantilla;
+
+  const { payment_due_day } = await getAjustes();
+  const regla = t.due_rule ?? tipo?.due_rule ?? "Ninguna";
+  const valor = t.due_rule ? t.due_value : (tipo?.due_value ?? null);
+  const vence = vencimientoPara({ regla, valor }, ciclo.period, fecha, payment_due_day);
+
+  // Mismo criterio que emitirCargos: un cargo por ref.
+  const porRef = new Map<string, number>();
+  for (const d of await destinatarios(t, ciclo.period, ciclo.emision, undefined)) {
+    if (!porRef.has(d.ref)) porRef.set(d.ref, Number(d.monto ?? 0));
+  }
+  const montos = [...porRef.values()];
+  return {
+    fecha,
+    period: ciclo.period,
+    vence,
+    destinatarios: montos.length,
+    monto_unitario: montos.length > 0 && montos.every((m) => m === montos[0]) ? montos[0]! : null,
+    monto_total: montos.reduce((a, m) => a + m, 0),
+  };
 }
 
 /**
