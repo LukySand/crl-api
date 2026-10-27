@@ -1,0 +1,4 @@
+[test]
+# Apunta Prisma a la base de TEST antes de que cualquier test importe el cliente.
+# Ver src/test/setup.ts.
+preload = ["./src/test/setup.ts"]
