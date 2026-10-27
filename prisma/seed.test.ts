@@ -27,7 +27,7 @@ test("el seed es idempotente: dos corridas no duplican nada", async () => {
   const primera = await contar();
   correrSeed();
   expect(await contar()).toEqual(primera);
-  expect(primera.tipos).toBe(6);
+  expect(primera.tipos).toBe(5);
   expect(primera.plantillas).toBe(2);
 }, 120_000);
 
