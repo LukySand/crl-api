@@ -59,6 +59,7 @@ model File {
   users    User[]
   places   Place[]
   payments Payment[] // comprobantes de transferencia
+  sponsors SponsorApplication[] // logos de postulaciones a sponsor
 
   @@map("files")
 }
@@ -92,6 +93,7 @@ model User {
   payments_registered Payment[] @relation("PaymentRegistrar")
 
   @@map("users")
+  sponsorApplications SponsorApplication[] // postulaciones que mandó con la cuenta
 }
 
 // Vínculo padre/tutor ↔ hijo a cargo. `active` es la dependencia: true = el
@@ -406,6 +408,73 @@ model PartnerStore {
   active               Boolean @default(true)
 
   @@map("partner_stores")
+}
+
+enum SponsorStatus {
+  Pendiente
+  Aprobada
+  Rechazada
+  // El auspicio terminó. No es lo mismo que Rechazada: el trato existió y se
+  // cumplió, sólo que ya no está vigente, así que sale de la vitrina pero la
+  // fila queda. Un auspicio es por temporada; sin este estado, el logo de un
+  // sponsor que ya no acompaña se queda en la landing para siempre.
+  Finalizada
+}
+
+// Postulación de una empresa para ser sponsor del club. Ojo, no es un
+// `PartnerStore`: el sponsor **aporta** al club, el local adherido **da**
+// descuentos a los socios. Son dos tablas porque son dos tratos distintos.
+//
+// La carga es pública (quien se postula no tiene cuenta en el sistema) y la
+// gestión aprueba o rechaza. `rejection_reason` es interno: no hay envío de mails,
+// queda para que el próximo admin entienda por qué se dijo no.
+//
+// Sin CUIT a propósito: pedirle la identidad fiscal a alguien que recién está
+// averiguando es fricción, y ese dato no hace falta hasta que hay acuerdo. Por eso
+// `business_name` es el nombre del comercio **o** de la persona, y el email hace
+// de clave natural para no duplicar postulaciones.
+//
+// `contribution` guarda el `id` de una opción de `lib/sponsor.ts` ("equipo",
+// "especie"…), no su texto: la lista la puede cambiar el club sin migración y sin
+// dejar ilegibles las postulaciones viejas.
+//
+// `reviewed_by` es un id de usuario sin relación, igual que `ScheduleBlock.created_by`:
+// alcanza para saber quién decidió y no ata el borrado de un usuario a su historial.
+// `reviewed_at`/`reviewed_by` guardan el **último** cambio de estado, no sólo el
+// primero: también los mueven la baja y la reactivación.
+model SponsorApplication {
+  id               Int           @id @default(autoincrement())
+  business_name    String        @db.VarChar(150)
+  contact_name     String        @db.VarChar(100)
+  email            String        @db.VarChar(255)
+  phone            String        @db.VarChar(30)
+  sector           String        @db.VarChar(100)
+  contribution     String        @db.VarChar(100)
+  message          String        @db.Text
+  status           SponsorStatus @default(Pendiente)
+  rejection_reason String?       @db.Text
+  created_at       DateTime      @default(now())
+  reviewed_at      DateTime?
+  reviewed_by      String?       @db.VarChar(36)
+
+  logo_file_id String?
+  logo         File?   @relation(fields: [logo_file_id], references: [id])
+
+  // Quién la mandó, si estaba logueado. Null = postulación anónima, que es el
+  // caso de un comercio del pueblo que no tiene cuenta en el sistema.
+  //
+  // **Sale siempre del token, nunca del body.** Y no se vincula sola con una
+  // cuenta que después se registre con el mismo email: el registro no verifica
+  // el email, así que cualquiera que se anote con tu dirección vería tu
+  // postulación.
+  user_id String?
+  user    User?   @relation(fields: [user_id], references: [id])
+
+  // El panel entra siempre filtrando por estado y ordenando por fecha.
+  @@index([status, created_at])
+  // "Mi propuesta" en la app de socio entra por acá.
+  @@index([user_id])
+  @@map("sponsor_applications")
 }
 
 // Token de la API de Instagram del club. Una sola fila (id = 1). Si no hay token,

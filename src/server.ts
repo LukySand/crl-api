@@ -17,6 +17,7 @@ import { partnerStoresRouter } from "./routes/partner-stores";
 import { novedadesRouter } from "./routes/novedades";
 import { blocksRouter } from "./routes/blocks";
 import { settingsRouter } from "./routes/settings";
+import { sponsorsRouter } from "./routes/sponsors";
 
 const app = express();
 app.use(express.json());
@@ -42,6 +43,7 @@ app.use("/api/partner-stores", partnerStoresRouter);
 app.use("/api/novedades", novedadesRouter);
 app.use("/api/blocks", blocksRouter);
 app.use("/api/settings", settingsRouter);
+app.use("/api/sponsors", sponsorsRouter);
 
 const port = Number(process.env.PORT ?? 3001);
 app.listen(port, () => {

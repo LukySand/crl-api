@@ -1217,6 +1217,176 @@ async function seedPayments() {
   );
 }
 
+/**
+ * Postulaciones de sponsors: una de cada estado más una de una persona (no un
+ * comercio), así el panel de gestión tiene los cuatro casos y la vitrina de la
+ * landing tiene algo que mostrar.
+ *
+ * Idempotente por email, que es la clave con la que el formulario evita
+ * duplicados. Sin logo: el seed no tiene imágenes de marcas inventadas y
+ * `logo_file_id` es opcional justamente para eso — la vitrina cae a las
+ * iniciales.
+ */
+async function seedSponsors() {
+  console.log("Sembrando postulaciones de sponsors...");
+
+  const postulaciones = [
+    {
+      business_name: "Panadería del Centro",
+      contact_name: "Laura Benítez",
+      email: "laura@panaderiadelcentro.test",
+      phone: "+5493434112233",
+      sector: "Gastronomía",
+      contribution: "especie",
+      message:
+        "Somos vecinos del club y queremos colaborar con la merienda de las categorías infantiles.",
+      status: "Pendiente" as const,
+    },
+    {
+      business_name: "Deportes Libertador",
+      contact_name: "Hernán Salas",
+      email: "ventas@deporteslibertador.test",
+      phone: "+5493434998877",
+      sector: "Indumentaria deportiva",
+      contribution: "equipo",
+      message: "Nos interesa equipar a las categorías de vóley y hockey con camisetas.",
+      status: "Aprobada" as const,
+    },
+    {
+      business_name: "Financiera del Litoral",
+      contact_name: "Marcela Duarte",
+      email: "contacto@financieralitoral.test",
+      phone: "+5493434445566",
+      sector: "Préstamos personales",
+      contribution: "disciplina",
+      message: "Ofrecemos un aporte mensual a cambio de cartelería en la cancha.",
+      status: "Rechazada" as const,
+      rejection_reason:
+        "El club no acepta sponsors de préstamos personales: el público son menores y sus familias.",
+    },
+    // Un puñado de aprobados más, para que la vitrina —la de la landing y la de
+    // Novedades, que leen el mismo endpoint— se vea como se va a ver de verdad y
+    // no con un solo logo. Nombres inventados a propósito: no se usan comercios
+    // ni instituciones reales de Libertador San Martín. Sin logo: la vitrina cae
+    // a las iniciales, que es el respaldo que ya tiene.
+    {
+      business_name: "Óptica Mirador",
+      contact_name: "Sofía Ramírez",
+      email: "contacto@opticamirador.test",
+      phone: "+5493434221100",
+      sector: "Salud visual",
+      contribution: "disciplina",
+      message: "Queremos acompañar a vóley durante toda la temporada.",
+      status: "Aprobada" as const,
+    },
+    {
+      business_name: "Librería Universo",
+      contact_name: "Nicolás Pereyra",
+      email: "hola@libreriauniverso.test",
+      phone: "+5493434556677",
+      sector: "Librería y papelería",
+      contribution: "especie",
+      message: "Ponemos los útiles y las impresiones de la escuelita.",
+      status: "Aprobada" as const,
+    },
+    {
+      business_name: "Farmacia del Parque",
+      contact_name: "Claudia Ferreyra",
+      email: "farmacia@delparque.test",
+      phone: "+5493434778811",
+      sector: "Farmacia",
+      contribution: "cuota",
+      message: "Nos gustaría bancar la cuota de dos chicos por año.",
+      status: "Aprobada" as const,
+    },
+    {
+      business_name: "Transporte Diamante",
+      contact_name: "Oscar Villalba",
+      email: "oscar@transportediamante.test",
+      phone: "+5493434009988",
+      sector: "Transporte",
+      contribution: "especie",
+      message: "Ponemos el micro para los viajes a los torneos.",
+      status: "Aprobada" as const,
+    },
+    {
+      business_name: "Rotisería La Granja",
+      contact_name: "Daniel Sosa",
+      email: "pedidos@rotiserialagranja.test",
+      phone: "+5493434332211",
+      sector: "Gastronomía",
+      contribution: "especie",
+      message: "La comida del tercer tiempo corre por nuestra cuenta.",
+      status: "Aprobada" as const,
+    },
+    {
+      business_name: "Corralón Sur",
+      contact_name: "Miguel Acuña",
+      email: "ventas@corralonsur.test",
+      phone: "+5493434665544",
+      sector: "Materiales de construcción",
+      contribution: "equipo",
+      message: "Podemos equipar una categoría completa de hockey.",
+      status: "Aprobada" as const,
+    },
+    // Auspicio que ya terminó: estuvo vigente y salió de la vitrina sin perder la
+    // ficha. Es el caso que no existiría si "aprobado" fuera para siempre.
+    {
+      business_name: "Heladería del Parque",
+      contact_name: "Rubén Ortiz",
+      email: "ruben@heladeriadelparque.test",
+      phone: "+5493434556677",
+      sector: "Gastronomía",
+      contribution: "disciplina",
+      message: "Acompañamos a la escuelita de fútbol durante la temporada pasada.",
+      status: "Finalizada" as const,
+    },
+    // Una persona, no un comercio: el formulario no pide CUIT justamente para que
+    // alguien del pueblo pueda ofrecerse sin inventarse una empresa.
+    {
+      business_name: "Mariana Sosa",
+      contact_name: "Mariana Sosa",
+      email: "mariana@correo.test",
+      phone: "+5493434778899",
+      sector: "Particular",
+      contribution: "cuota",
+      message:
+        "No tengo comercio, soy vecina del club y me gustaría bancar la cuota de un chico.",
+      status: "Pendiente" as const,
+    },
+  ];
+
+  for (const p of postulaciones) {
+    // La más vieja con ese nombre. **No se puede usar el email como clave**: la
+    // gestión lo puede corregir (es el caso del email tipeado mal), y entonces el
+    // seed no reconoce su propia fila y la siembra de nuevo duplicada. El nombre
+    // sí es estable para estas filas: no tienen dueño que lo edite, y la gestión
+    // sólo toca datos de contacto.
+    const existing = await prisma.sponsorApplication.findFirst({
+      where: { business_name: p.business_name },
+      orderBy: { created_at: "asc" },
+      select: { id: true },
+    });
+
+    // Las resueltas llevan quién y cuándo, igual que si las hubiera tocado un admin.
+    const revision =
+      p.status === "Pendiente"
+        ? { reviewed_at: null, reviewed_by: null }
+        : { reviewed_at: new Date(), reviewed_by: USER.admin };
+
+    if (existing) {
+      await prisma.sponsorApplication.update({
+        where: { id: existing.id },
+        data: { ...p, ...revision },
+      });
+    } else {
+      await prisma.sponsorApplication.create({ data: { ...p, ...revision } });
+    }
+  }
+
+  console.log(`  ✓ ${postulaciones.length} postulaciones de sponsors`);
+}
+
 async function main() {
   const roleIds = await seedRoles();
 
@@ -1254,6 +1424,8 @@ async function main() {
 
   // Va último: las cuotas cuelgan de las reservas y las inscripciones.
   await seedPayments();
+
+  await seedSponsors();
 
   console.log(
     `\nSeed completado. Usuarios de ejemplo con contraseña "${DEMO_PASSWORD}":`,
