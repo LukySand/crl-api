@@ -16,6 +16,9 @@ test("socio y profesor reciben 403; sin token 401", async () => {
   for (const u of [socio, profe]) {
     expect((await api("GET", "/api/charge-types", { token: u.token })).status).toBe(403);
     expect((await api("GET", "/api/recurring-templates", { token: u.token })).status).toBe(403);
+    expect((await api("POST", "/api/recurring-templates/preview", { token: u.token, body: {} })).status).toBe(403);
+    expect((await api("POST", "/api/recurring-templates/1/targets", { token: u.token, body: { user_id: u.id } })).status).toBe(403);
+    expect((await api("DELETE", `/api/recurring-templates/1/targets/${u.id}`, { token: u.token })).status).toBe(403);
   }
 });
 
@@ -115,4 +118,75 @@ test("cada alta y edición queda en la auditoría", async () => {
   );
   const ops = filas.map((f) => (typeof f.metadata === "string" ? JSON.parse(f.metadata) : f.metadata)).map((m) => m.operacion);
   expect(ops.sort()).toEqual(["create", "update"]);
+});
+
+async function plantillaLista(admin: { token: string }, ids: string[], extra: object = {}) {
+  const key = unico();
+  await api("POST", "/api/charge-types", { token: admin.token, body: { key, name: "T" } });
+  const base = {
+    concept: key, name: "Lista", amount: 100, period_mode: "DiaDelMes", day_of_month: 5,
+    start_date: "2030-01-01", target_mode: "Lista", targets: ids,
+  };
+  return { key, base: { ...base, ...extra } };
+}
+
+test("preview: no guarda nada y cuenta destinatarios activos de una Lista", async () => {
+  const admin = await makeUser({ roles: ["Administrador"] });
+  const a = await makeUser({ roles: ["Socio"] });
+  const b = await makeUser({ roles: ["Socio"] });
+  const baja = await makeUser({ roles: ["Socio"] });
+  await prisma.user.update({ where: { id: baja.id }, data: { active: false } });
+  const { key, base } = await plantillaLista(admin, [a.id, b.id, baja.id]);
+
+  const antes = await prisma.recurringTemplate.count({ where: { concept: key } });
+  const r = await api("POST", "/api/recurring-templates/preview", { token: admin.token, body: base });
+  expect(r.status).toBe(200);
+  expect(r.body.preview).toMatchObject({ fecha: "2030-01-05", period: "2030-01", destinatarios: 2, monto_unitario: 100, monto_total: 200 });
+  expect(await prisma.payment.count({ where: { concept: key } })).toBe(0);
+  expect(await prisma.recurringTemplate.count({ where: { concept: key } })).toBe(antes);
+
+  const fin = await api("POST", "/api/recurring-templates/preview", {
+    token: admin.token,
+    body: { ...base, start_date: "2020-01-01", end_date: "2020-06-01" },
+  });
+  expect(fin.body.preview).toBeNull();
+});
+
+test("asignar socio a una Lista: ok, idempotente, y rechaza otros modos", async () => {
+  const admin = await makeUser({ roles: ["Administrador"] });
+  const a = await makeUser({ roles: ["Socio"] });
+  const b = await makeUser({ roles: ["Socio"] });
+  const { base } = await plantillaLista(admin, [a.id]);
+  const t = await api("POST", "/api/recurring-templates", { token: admin.token, body: base });
+  const id = t.body.template.id;
+
+  const ok = await api("POST", `/api/recurring-templates/${id}/targets`, { token: admin.token, body: { user_id: b.id } });
+  expect(ok.status).toBe(200);
+  expect(ok.body.template.targets.sort()).toEqual([a.id, b.id].sort());
+  const otra = await api("POST", `/api/recurring-templates/${id}/targets`, { token: admin.token, body: { user_id: b.id } });
+  expect(otra.status).toBe(200);
+  expect(otra.body.template.targets).toHaveLength(2);
+  expect((await api("POST", `/api/recurring-templates/${id}/targets`, { token: admin.token, body: { user_id: "no-existe" } })).status).toBe(400);
+  expect((await api("POST", "/api/recurring-templates/99999999/targets", { token: admin.token, body: { user_id: b.id } })).status).toBe(404);
+
+  const socio = await api("POST", "/api/recurring-templates", {
+    token: admin.token,
+    body: { ...base, target_mode: "Socio", targets: [a.id] },
+  });
+  const mal = await api("POST", `/api/recurring-templates/${socio.body.template.id}/targets`, { token: admin.token, body: { user_id: b.id } });
+  expect(mal.status).toBe(400);
+});
+
+test("quitar socio de una Lista: ok, el último -> 409, ajeno -> 404", async () => {
+  const admin = await makeUser({ roles: ["Administrador"] });
+  const a = await makeUser({ roles: ["Socio"] });
+  const b = await makeUser({ roles: ["Socio"] });
+  const { base } = await plantillaLista(admin, [a.id, b.id]);
+  const id = (await api("POST", "/api/recurring-templates", { token: admin.token, body: base })).body.template.id;
+
+  const ok = await api("DELETE", `/api/recurring-templates/${id}/targets/${b.id}`, { token: admin.token });
+  expect(ok.status).toBe(200);
+  expect(ok.body.template.targets).toEqual([a.id]);
+  expect((await api("DELETE", `/api/recurring-templates/${id}/targets/${b.id}`, { token: admin.token })).status).toBe(404);
+  expect((await api("DELETE", `/api/recurring-templates/${id}/targets/${a.id}`, { token: admin.token })).status).toBe(409);
 });

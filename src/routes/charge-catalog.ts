@@ -13,7 +13,7 @@ import { auditar } from "../lib/audit";
 import { toNumber } from "../lib/payment";
 import { todayInClub } from "../lib/payment-period";
 import { CONCEPTO_CUOTA_SOCIAL } from "../lib/payment-rules";
-import { periodicidadDe } from "../lib/emission";
+import { periodicidadDe, previsualizarEmision } from "../lib/emission";
 import { proximoCiclo } from "../lib/recurrence";
 import type { ChargeType, Prisma, RecurringTemplate } from "../../prisma/generated/client";
 
@@ -269,6 +269,29 @@ recurringTemplatesRouter.post("/", async (req: Request, res: Response) => {
   }
 });
 
+// Antes de los /:id. Sólo calcula: no guarda nada.
+recurringTemplatesRouter.post("/preview", async (req: Request, res: Response) => {
+  try {
+    const parsed = plantillaCreate.safeParse(req.body ?? {});
+    if (!parsed.success) return invalido(res, parsed.error.issues);
+    const falla = await referenciasInvalidas(parsed.data);
+    if (falla) return res.status(400).json({ success: false, error: falla });
+    const { start_date, end_date, ...v } = parsed.data;
+    const preview = await previsualizarEmision({
+      ...v,
+      day_of_month: v.day_of_month ?? null,
+      every_n: v.every_n ?? null,
+      unit: v.unit ?? null,
+      start_date: new Date(`${start_date}T00:00:00Z`),
+      end_date: end_date ? new Date(`${end_date}T00:00:00Z`) : null,
+    });
+    return res.json({ success: true, preview });
+  } catch (error) {
+    console.error("Preview template error:", error);
+    return res.status(500).json({ success: false, error: "Error al calcular la vista previa" });
+  }
+});
+
 recurringTemplatesRouter.patch("/:id", async (req: Request<{ id: string }>, res: Response) => {
   try {
     const id = Number(req.params.id);
@@ -308,3 +331,65 @@ recurringTemplatesRouter.patch("/:id", async (req: Request<{ id: string }>, res:
     return res.status(500).json({ success: false, error: "Error al editar la plantilla" });
   }
 });
+
+/** Carga la plantilla y valida que sea de tipo Lista. Devuelve el error ya respondido o la plantilla. */
+async function plantillaLista(req: Request<{ id: string }>, res: Response) {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return void res.status(400).json({ success: false, error: "ID inválido" });
+  const t = await prisma.recurringTemplate.findUnique({ where: { id }, include: incluir });
+  if (!t) return void res.status(404).json({ success: false, error: "Plantilla no encontrada" });
+  if (t.target_mode !== "Lista") {
+    return void res.status(400).json({ success: false, error: "Sólo se pueden asignar socios a plantillas de tipo Lista." });
+  }
+  return t;
+}
+
+// Alta/baja de un socio en una plantilla Lista. No emite en el acto: cobra desde el próximo ciclo.
+recurringTemplatesRouter.post("/:id/targets", async (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const parsed = z.object({ user_id: z.string().min(1) }).strict().safeParse(req.body ?? {});
+    if (!parsed.success) return invalido(res, parsed.error.issues);
+    const antes = await plantillaLista(req, res);
+    if (!antes) return;
+    const { user_id } = parsed.data;
+    if (antes.targets.some((x) => x.user_id === user_id)) {
+      return res.json({ success: true, template: plantillaDto(antes) });
+    }
+    const u = await prisma.user.findUnique({ where: { id: user_id }, select: { active: true } });
+    if (!u || !u.active) return res.status(400).json({ success: false, error: "El socio no existe o está inactivo" });
+
+    await prisma.recurringTemplateTarget.create({ data: { template_id: antes.id, user_id } });
+    const despues = (await prisma.recurringTemplate.findUnique({ where: { id: antes.id }, include: incluir }))!;
+    auditar(req, "update", "recurring_template", antes.id, { antes: plantillaDto(antes), despues: plantillaDto(despues) });
+    return res.json({ success: true, template: plantillaDto(despues) });
+  } catch (error) {
+    console.error("Add template target error:", error);
+    return res.status(500).json({ success: false, error: "Error al asignar el socio" });
+  }
+});
+
+recurringTemplatesRouter.delete(
+  "/:id/targets/:userId",
+  async (req: Request<{ id: string; userId: string }>, res: Response) => {
+    try {
+      const antes = await plantillaLista(req, res);
+      if (!antes) return;
+      const { userId } = req.params;
+      if (!antes.targets.some((x) => x.user_id === userId)) {
+        return res.status(404).json({ success: false, error: "El socio no está en la plantilla" });
+      }
+      if (antes.targets.length <= 1) {
+        return res.status(409).json({ success: false, error: "La plantilla tiene que tener al menos un socio." });
+      }
+      await prisma.recurringTemplateTarget.delete({
+        where: { template_id_user_id: { template_id: antes.id, user_id: userId } },
+      });
+      const despues = (await prisma.recurringTemplate.findUnique({ where: { id: antes.id }, include: incluir }))!;
+      auditar(req, "update", "recurring_template", antes.id, { antes: plantillaDto(antes), despues: plantillaDto(despues) });
+      return res.json({ success: true, template: plantillaDto(despues) });
+    } catch (error) {
+      console.error("Remove template target error:", error);
+      return res.status(500).json({ success: false, error: "Error al quitar el socio" });
+    }
+  },
+);
