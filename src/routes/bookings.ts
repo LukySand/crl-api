@@ -41,6 +41,8 @@ const bookingInclude = {
   user: {
     select: { id: true, name: true, last_name: true, dni: true, email: true, celular: true },
   },
+  // Para avisar antes de cancelar que una reserva cobrada por MP se reembolsa sola.
+  payment: { select: { status: true, method: true, amount: true } },
 } as const;
 
 // Igual que en schedules.ts: se manda el monto, no un fee_id — quien reserva no
