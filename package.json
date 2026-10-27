@@ -11,7 +11,10 @@
     "db:push": "bunx --bun prisma db push",
     "db:migrate": "bunx --bun prisma migrate dev",
     "db:seed": "bunx --bun prisma db seed",
-    "db:studio": "bunx --bun prisma studio"
+    "db:studio": "bunx --bun prisma studio",
+    "test:db": "bash scripts/test-db.sh",
+    "test:webhook": "bash scripts/probar-webhook.sh",
+    "dev:tunnel": "bash scripts/dev-tunnel.sh"
   },
   "prisma": {
     "seed": "bun prisma/seed.ts"

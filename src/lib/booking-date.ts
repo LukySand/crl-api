@@ -115,3 +115,32 @@ export function dentroDeVentanaCancelacion(
   const limite = stampInClub(new Date(ahora.getTime() + horas * 3_600_000));
   return limite <= inicio;
 }
+
+/**
+ * Minutos que tiene un socio para pagar una reserva hecha desde la app (el hold).
+ * Es también la anticipación mínima con la que se puede reservar pagando en el
+ * acto: no tiene sentido retener un turno que arranca antes de que venza el hold.
+ * Espejo en crl-web `src/app/pages/socio/reservas.ts`: si cambia uno, cambia el otro.
+ */
+export const MINUTOS_PARA_PAGAR_RESERVA = 5;
+
+/**
+ * ¿El turno arranca con al menos `minutos` de anticipación? Lo usa el camino de
+ * pago en el acto (D14) con el hold, y el retome de una aprobación tardía con 0
+ * (basta con que el inicio siga en el futuro). Mismo criterio de stamps del club
+ * que `dentroDeVentanaCancelacion`.
+ */
+export function hayTiempoParaPagar(
+  date: Date,
+  startTime: Date,
+  ahora: Date = new Date(),
+  minutos: number = MINUTOS_PARA_PAGAR_RESERVA,
+): boolean {
+  const inicio = `${date.toISOString().slice(0, 10)}T${timeToHHMM(startTime)}`;
+  return stampInClub(new Date(ahora.getTime() + minutos * 60_000)) <= inicio;
+}
+
+/** Corte del hold: una reserva en espera creada antes de este instante ya venció. */
+export function corteHoldReservas(ahora: Date = new Date()): Date {
+  return new Date(ahora.getTime() - MINUTOS_PARA_PAGAR_RESERVA * 60_000);
+}

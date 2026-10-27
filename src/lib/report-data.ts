@@ -13,8 +13,8 @@ import { bucketDe, rangoBuckets, todayInClub, type Bucket } from "./payment-peri
 export const AGRUPACIONES = ["mes", "concepto", "metodo", "disciplina", "espacio"] as const;
 export type Agrupacion = (typeof AGRUPACIONES)[number];
 
-/** Conceptos por los que se puede filtrar. Espeja el enum FeeKind del schema. */
-export const CONCEPTOS = ["Reserva", "Disciplina", "Socio"] as const;
+/** Forma de la `key` de un tipo de cargo (la misma de `charge-catalog.ts`). `concept` se valida por esto, no por una lista fija. */
+export const CONCEPTO_KEY_RE = /^[A-Za-z][A-Za-z0-9_]{1,39}$/;
 
 /** Dimensiones por las que se puede abrir una serie. */
 export const DIMENSIONES = ["espacio", "disciplina", "concepto", "metodo"] as const;
@@ -85,16 +85,135 @@ const SELECT_COBRO = {
   paid_at: true,
   concept: true,
   method: true,
+  type: { select: { name: true } },
   enrollment: { select: { discipline: { select: { name: true } } } },
   booking: {
     select: { schedule: { select: { place: { select: { name: true } } } } },
   },
 } as const;
 
+/** Egreso: un reembolso con las dimensiones de la fila que revierte (D22). */
+const SELECT_REEMBOLSO = {
+  amount: true,
+  refunded_at: true,
+  payment: { select: SELECT_COBRO },
+} as const;
+
+/**
+ * Ingreso: tiene `paid_at` y quedó `Pagado` o `Anulado`. Un reembolso deja la
+ * fila `Anulado` pero conserva `paid_at`: el ingreso sigue en su mes y el egreso
+ * va aparte (D22). Una reversión manual borra `paid_at`, así que esa fila ya no
+ * entra acá aunque su mes esté cerrado (D22b).
+ */
+const ESTADOS_INGRESO = ["Pagado", "Anulado"] as const;
+
+type Rango = { gte?: Date; lt?: Date };
+
+/** Reembolsos que son egreso: aprobados o devueltos en mano (`refunded_at`) y que descuentan ingreso. */
+function whereEgreso(rango: Rango, concept?: string) {
+  return {
+    refunded_at: { not: null, ...rango },
+    income_reversal: true,
+    ...(concept ? { payment: { is: { concept } } } : {}),
+  };
+}
+
+type FilaDimension = {
+  concept: string;
+  method: string | null;
+  enrollment: { discipline: { name: string } } | null;
+  booking: { schedule: { place: { name: string } } } | null;
+};
+
+/**
+ * Clave de una fila en una dimensión. `undefined` = la fila no pertenece a esa
+ * dimensión (una reserva no tiene disciplina: meterla en "Sin definir" inflaría
+ * el gráfico de disciplinas con plata de canchas); `null` = pertenece pero sin dato.
+ */
+export function claveDe(by: Dimension | "total", p: FilaDimension): string | null | undefined {
+  switch (by) {
+    case "espacio":
+      return p.concept === "Reserva" ? (p.booking?.schedule.place.name ?? null) : undefined;
+    case "disciplina":
+      return p.concept === "Disciplina" ? (p.enrollment?.discipline.name ?? null) : undefined;
+    case "concepto":
+      return p.concept;
+    case "metodo":
+      return p.method;
+    case "total":
+      return "Total";
+  }
+}
+
+/** Misma clave para un reembolso: sin fila asignada va a "Sin definir" (D22). */
+export function claveDeEgreso(by: Dimension | "total", p: FilaDimension | null): string | null | undefined {
+  if (!p) return by === "total" ? "Total" : null;
+  return claveDe(by, p);
+}
+
+export interface Movimiento {
+  clave: string | null;
+  fecha: Date;
+  monto: number;
+}
+
+/**
+ * Ingresos y egresos por clave. `total` es neto (cobrado − reembolsado); `cantidad`
+ * cuenta sólo los cobros. Una clave con sólo reembolsos aparece con total negativo.
+ */
+export function agruparNeto(ingresos: Movimiento[], egresos: Movimiento[]) {
+  const acc = new Map<string, { cobrado: number; reembolsado: number; cantidad: number }>();
+  const de = (clave: string | null) => {
+    const k = clave ?? "Sin definir";
+    let v = acc.get(k);
+    if (!v) acc.set(k, (v = { cobrado: 0, reembolsado: 0, cantidad: 0 }));
+    return v;
+  };
+  for (const i of ingresos) {
+    const v = de(i.clave);
+    v.cobrado += i.monto;
+    v.cantidad += 1;
+  }
+  for (const e of egresos) de(e.clave).reembolsado += e.monto;
+  return [...acc.entries()]
+    .map(([clave, v]) => ({ clave, ...v, total: v.cobrado - v.reembolsado }))
+    .sort((a, b) => b.total - a.total);
+}
+
+/**
+ * Series por bucket: ingreso bruto por clave (`series`, alineadas con `buckets`),
+ * reembolsos por bucket (`reembolsos`) y `total` neto. Lo que cae fuera de la
+ * grilla se saltea antes que romper el array.
+ */
+export function armarSerie(ingresos: Movimiento[], egresos: Movimiento[], buckets: string[], bucket: Bucket) {
+  const indice = new Map(buckets.map((b, i) => [b, i]));
+  const acumulado = new Map<string, number[]>();
+  for (const m of ingresos) {
+    const i = indice.get(bucketDe(m.fecha, bucket));
+    if (i === undefined) continue;
+    const clave = m.clave ?? "Sin definir";
+    let puntos = acumulado.get(clave);
+    if (!puntos) acumulado.set(clave, (puntos = new Array(buckets.length).fill(0)));
+    puntos[i]! += m.monto;
+  }
+  const reembolsos: number[] = new Array(buckets.length).fill(0);
+  for (const m of egresos) {
+    const i = indice.get(bucketDe(m.fecha, bucket));
+    if (i !== undefined) reembolsos[i]! += m.monto;
+  }
+  const series = [...acumulado.entries()]
+    .map(([clave, puntos]) => ({ clave, total: puntos.reduce((t, n) => t + n, 0), puntos }))
+    // De mayor a menor: el orden decide el apilado, y la cancha que más factura
+    // queda abajo, que es donde se lee mejor.
+    .sort((a, b) => b.total - a.total);
+  const bruto = series.reduce((t, s) => t + s.total, 0);
+  return { series, reembolsos, total: bruto - reembolsos.reduce((t, n) => t + n, 0) };
+}
+
 /**
  * Totales del período y una serie agrupada. `from`/`to` son inclusivos y
  * opcionales; sin ellos toma todo el histórico. `concept` acota todo —cobrado,
- * pendiente y vencido— a un solo concepto.
+ * reembolsado, pendiente y vencido— a un solo concepto (la `key` de un tipo de cargo).
  */
 export async function calcularIngresos(opts: {
   from?: string;
@@ -106,19 +225,19 @@ export async function calcularIngresos(opts: {
 
   const desde = from ? new Date(`${from}T00:00:00Z`) : undefined;
   const hasta = to ? finDeDia(to) : undefined;
-
-  const rangoPago =
-    desde || hasta
-      ? { paid_at: { ...(desde && { gte: desde }), ...(hasta && { lt: hasta }) } }
-      : {};
+  const rango: Rango = { ...(desde && { gte: desde }), ...(hasta && { lt: hasta }) };
 
   // Filtro de concepto, compartido por lo cobrado y lo adeudado: si el tablero
   // muestra canchas, la deuda que muestra también tiene que ser la de canchas.
-  const filtroConcepto = concept ? { concept: concept as any } : {};
+  const filtroConcepto = concept ? { concept } : {};
 
   const cobrados = await prisma.payment.findMany({
-    where: { status: "Pagado", ...filtroConcepto, ...rangoPago },
+    where: { status: { in: [...ESTADOS_INGRESO] }, ...filtroConcepto, paid_at: { not: null, ...rango } },
     select: SELECT_COBRO,
+  });
+  const reembolsos = await prisma.refund.findMany({
+    where: whereEgreso(rango, concept),
+    select: SELECT_REEMBOLSO,
   });
 
   // La deuda no se filtra por el rango de cobro: se debe hoy, sin importar qué
@@ -129,40 +248,44 @@ export async function calcularIngresos(opts: {
   });
 
   const hoy = todayInClub();
-  const vencidos = pendientes.filter((p) => p.due_date.toISOString().slice(0, 10) < hoy);
+  const vencidos = pendientes.filter((p) => p.due_date != null && p.due_date.toISOString().slice(0, 10) < hoy);
 
-  const serie = (() => {
-    switch (group) {
-      case "mes":
-        // Ordenado cronológicamente y no por monto: es una serie de tiempo.
-        return agrupar(
-          cobrados,
-          (p) => p.paid_at?.toISOString().slice(0, 7) ?? null,
-          (p) => toNumber(p.amount),
-        ).sort((a, b) => a.clave.localeCompare(b.clave));
-      case "concepto":
-        return agrupar(cobrados, (p) => p.concept, (p) => toNumber(p.amount));
-      case "metodo":
-        return agrupar(cobrados, (p) => p.method, (p) => toNumber(p.amount));
-      case "disciplina":
-        return agrupar(
-          cobrados.filter((p) => p.concept === "Disciplina"),
-          (p) => p.enrollment?.discipline.name ?? null,
-          (p) => toNumber(p.amount),
-        );
-      case "espacio":
-        return agrupar(
-          cobrados.filter((p) => p.concept === "Reserva"),
-          (p) => p.booking?.schedule.place.name ?? null,
-          (p) => toNumber(p.amount),
-        );
-    }
-  })();
+  const claveGrupo = (g: Agrupacion, p: FilaDimension | null, fecha: Date, egreso: boolean) =>
+    g === "mes"
+      ? fecha.toISOString().slice(0, 7)
+      : egreso
+        ? claveDeEgreso(g, p)
+        : claveDe(g, p!);
+
+  const aMov = (egreso: boolean) => (f: any): Movimiento | null => {
+    const p = egreso ? f.payment : f;
+    const fecha: Date | null = egreso ? f.refunded_at : f.paid_at;
+    const clave = fecha && claveGrupo(group, p, fecha, egreso);
+    if (!fecha || clave === undefined) return null;
+    return { clave, fecha, monto: toNumber(f.amount) };
+  };
+  const quitarNulos = (m: (Movimiento | null)[]) => m.filter((x): x is Movimiento => x !== null);
+
+  const serie = agruparNeto(quitarNulos(cobrados.map(aMov(false))), quitarNulos(reembolsos.map(aMov(true))));
+  // Ordenado cronológicamente y no por monto: es una serie de tiempo.
+  if (group === "mes") serie.sort((a, b) => a.clave.localeCompare(b.clave));
+
+  // El nombre del tipo para `group=concepto`: la clave es estable pero no se lee.
+  const nombres = new Map<string, string>();
+  for (const p of [...cobrados, ...reembolsos.flatMap((r) => (r.payment ? [r.payment] : []))]) {
+    nombres.set(p.concept, p.type.name);
+  }
+
+  const cobrado = sumar(cobrados);
+  const reembolsado = sumar(reembolsos);
 
   return {
     totales: {
-      cobrado: sumar(cobrados),
+      cobrado,
       cobros: cobrados.length,
+      reembolsado,
+      reembolsos: reembolsos.length,
+      neto: cobrado - reembolsado,
       pendiente: sumar(pendientes),
       // Cuántas cuotas faltan cobrar, no sólo cuánta plata: el tablero muestra
       // las dos cosas y "11 cuotas" dice algo que "$98.000" solo no dice.
@@ -170,7 +293,10 @@ export async function calcularIngresos(opts: {
       vencido: sumar(vencidos),
       cantidad_vencida: vencidos.length,
     },
-    serie,
+    serie:
+      group === "concepto"
+        ? serie.map((s) => ({ ...s, etiqueta: nombres.get(s.clave) ?? s.clave }))
+        : serie,
   };
 }
 
@@ -186,79 +312,39 @@ export async function calcularSerie(opts: {
 }) {
   const { bucket, by, from: desde, to: hasta } = opts;
 
+  // `to` inclusivo: se pide "hasta el 30" y el 30 tiene que entrar.
+  const rango: Rango = { gte: new Date(`${desde}T00:00:00Z`), lt: finDeDia(hasta) };
+
   const cobrados = await prisma.payment.findMany({
-    where: {
-      status: "Pagado",
-      paid_at: {
-        gte: new Date(`${desde}T00:00:00Z`),
-        // `to` inclusivo: se pide "hasta el 30" y el 30 tiene que entrar.
-        lt: finDeDia(hasta),
-      },
-    },
+    where: { status: { in: [...ESTADOS_INGRESO] }, paid_at: rango },
     select: SELECT_COBRO,
   });
+  const reembolsos = await prisma.refund.findMany({ where: whereEgreso(rango), select: SELECT_REEMBOLSO });
 
   // El eje X completo, sin huecos: un día sin cobros tiene que existir igual
   // con cero, si no el gráfico corre las columnas y miente sobre su forma.
   const buckets = rangoBuckets(desde, hasta, bucket);
-  const indice = new Map(buckets.map((b, i) => [b, i]));
+  const dim = by ?? "total";
 
-  const claveDe = (p: (typeof cobrados)[number]): string | null => {
-    switch (by) {
-      case "espacio":
-        return p.booking?.schedule.place.name ?? null;
-      case "disciplina":
-        return p.enrollment?.discipline.name ?? null;
-      case "concepto":
-        return p.concept;
-      case "metodo":
-        return p.method;
-      default:
-        return "Total";
-    }
-  };
-
-  // clave → array de montos alineado con `buckets`.
-  const acumulado = new Map<string, number[]>();
+  const ingresos: Movimiento[] = [];
   for (const p of cobrados) {
-    if (!p.paid_at) continue;
-    const i = indice.get(bucketDe(p.paid_at, bucket));
-    // Un cobro fuera del eje no debería existir (la query ya filtró por rango),
-    // pero si el bucket no cae en la grilla se saltea antes que romper el array.
-    if (i === undefined) continue;
-
-    // Filtrar por dimensión y no mapear a "Sin definir" cuando `by` la excluye:
-    // una reserva no tiene disciplina, y meterla en un cajón "Sin definir"
-    // inflaría el gráfico de disciplinas con plata de canchas.
-    if (by === "espacio" && p.concept !== "Reserva") continue;
-    if (by === "disciplina" && p.concept !== "Disciplina") continue;
-
-    const clave = claveDe(p) ?? "Sin definir";
-    let puntos = acumulado.get(clave);
-    if (!puntos) {
-      puntos = new Array(buckets.length).fill(0);
-      acumulado.set(clave, puntos);
-    }
-    puntos[i]! += toNumber(p.amount);
+    const clave = claveDe(dim, p);
+    if (p.paid_at && clave !== undefined) ingresos.push({ clave, fecha: p.paid_at, monto: toNumber(p.amount) });
   }
-
-  const series = [...acumulado.entries()]
-    .map(([clave, puntos]) => ({
-      clave,
-      total: puntos.reduce((t, n) => t + n, 0),
-      puntos,
-    }))
-    // De mayor a menor: el orden decide el apilado, y la cancha que más factura
-    // queda abajo, que es donde se lee mejor.
-    .sort((a, b) => b.total - a.total);
+  const egresos: Movimiento[] = [];
+  for (const r of reembolsos) {
+    const clave = claveDeEgreso(dim, r.payment);
+    if (r.refunded_at && clave !== undefined) {
+      egresos.push({ clave, fecha: r.refunded_at, monto: toNumber(r.amount) });
+    }
+  }
 
   return {
     bucket,
     by: by ?? null,
     rango: { from: desde, to: hasta },
     buckets,
-    series,
-    total: series.reduce((t, s) => t + s.total, 0),
+    ...armarSerie(ingresos, egresos, buckets, bucket),
   };
 }
 
@@ -274,7 +360,7 @@ export async function calcularMorosos() {
         select: { id: true, name: true, last_name: true, dni: true, email: true, celular: true },
       },
     },
-    orderBy: { due_date: "asc" },
+    orderBy: { due_date: { sort: "asc", nulls: "last" } },
   });
 
   const hoy = todayInClub();
@@ -303,7 +389,7 @@ export async function calcularMorosos() {
     const monto = toNumber(p.amount);
     actual.total += monto;
     actual.cuotas += 1;
-    if (p.due_date.toISOString().slice(0, 10) < hoy) {
+    if (p.due_date && p.due_date.toISOString().slice(0, 10) < hoy) {
       actual.vencido += monto;
       actual.cuotas_vencidas += 1;
       // Las filas vienen ordenadas por vencimiento, así que la primera vencida

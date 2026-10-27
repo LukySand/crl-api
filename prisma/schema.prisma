@@ -64,18 +64,18 @@ model File {
 }
 
 model User {
-  id         String   @id @default(uuid())
+  id String @id @default(uuid())
 
-  name       String   @db.VarChar(50)
-  last_name  String   @db.VarChar(50)
-  dni        String   @db.VarChar(20)
-  email      String   @unique @db.VarChar(75)
-  celular    String?  @db.VarChar(20)
-  password   String   @db.Text
-  file_id    String?  @db.Char(128)
-  birth_date DateTime
-  active     Boolean  @default(true) // baja lógica: false = dado de baja (#46)
-  has_credentials Boolean @default(true)
+  name            String   @db.VarChar(50)
+  last_name       String   @db.VarChar(50)
+  dni             String   @db.VarChar(20)
+  email           String   @unique @db.VarChar(75)
+  celular         String?  @db.VarChar(20)
+  password        String   @db.Text
+  file_id         String?  @db.Char(128)
+  birth_date      DateTime
+  active          Boolean  @default(true) // baja lógica: false = dado de baja (#46)
+  has_credentials Boolean  @default(true)
 
   roles UserRole[] // sus roles; los permisos son la suma
   file  File?      @relation(fields: [file_id], references: [id])
@@ -88,8 +88,10 @@ model User {
 
   // Dos relaciones a Payment, así que van nombradas: una es lo que el usuario
   // debe, la otra los cobros que registró (sólo gestión).
-  payments            Payment[] @relation("PaymentUser")
-  payments_registered Payment[] @relation("PaymentRegistrar")
+  payments            Payment[]                 @relation("PaymentUser")
+  payments_registered Payment[]                 @relation("PaymentRegistrar")
+  transactions        PaymentTransaction[]
+  recurring_targets   RecurringTemplateTarget[]
 
   @@map("users")
 }
@@ -132,13 +134,15 @@ enum LogLevel {
   INFO
   ERROR
 }
+
 enum BookingStatus {
   Pendiente
   Confirmada
   Cancelada
 }
 
-// Clasifica una tarifa y, con los mismos valores, el concepto de un pago. Un
+// Clasifica una tarifa (Fee.kind). El concepto de un pago ahora es un String que
+// referencia charge_types.key. Un
 // solo enum para las dos cosas a propósito: mantiene alineado que un Payment de
 // concepto Disciplina apunte a una Fee de disciplina y no a una de cancha.
 //
@@ -155,12 +159,50 @@ enum PaymentStatus {
   EnRevision // el socio subió comprobante, administración todavía no lo confirmó
   Pagado
   Anulado
+  Condonado
 }
 
 enum PaymentMethod {
   Efectivo
   Transferencia
   MercadoPago
+  MPFueraDeApp
+  TarjetaConPosnet
+}
+
+enum TransactionStatus {
+  Pendiente
+  Aprobado
+  Rechazado
+  Cancelado
+  Reembolsado
+  ReembolsadoParcial
+  Contracargo
+  Anulado
+}
+
+enum DueRule {
+  Ninguna
+  DiasDesdeEmision
+  DiaDelMes
+}
+
+enum PeriodMode {
+  DiaDelMes
+  CadaN
+}
+
+enum PeriodUnit {
+  Dias
+  Semanas
+  Meses
+}
+
+enum TargetMode {
+  Todos
+  Disciplina
+  Lista
+  Socio
 }
 
 // ponytail: inmutable — no hay endpoint de update. Cambiar precio = crear una
@@ -191,7 +233,7 @@ model Place {
   file_id     String? @db.Char(128)
   active      Boolean @default(true) // baja lógica: false = no disponible para reservar
 
-  file        File?        @relation(fields: [file_id], references: [id])
+  file        File?           @relation(fields: [file_id], references: [id])
   schedules   Schedule[]
   disciplines Discipline[]
   blocks      ScheduleBlock[]
@@ -225,6 +267,7 @@ model Discipline {
   professors  DisciplineProfessor[] // profes que la dictan (#6)
   enrollments Enrollment[] // socios inscriptos
   schedules   DisciplineSchedule[] // días y horas de la clase
+  templates   RecurringTemplate[]
 
   @@map("disciplines")
 }
@@ -335,8 +378,10 @@ model Booking {
 model Payment {
   id String @id @default(uuid())
 
-  user_id String  @db.Char(128) // quién debe
-  concept FeeKind
+  user_id     String  @db.Char(128) // quién debe
+  concept     String  @db.VarChar(40) // FK a charge_types.key
+  name        String  @db.VarChar(120)
+  description String? @db.Text
 
   // Origen: exactamente uno según el concepto. Reserva → booking_id,
   // Disciplina → enrollment_id, Socio → ninguno de los dos.
@@ -360,8 +405,8 @@ model Payment {
   fee_id Int?
   amount Decimal @db.Decimal(10, 2)
 
-  period   String?  @db.Char(7) // "YYYY-MM" en las mensuales; null en las reservas
-  due_date DateTime @db.Date
+  period   String?   @db.VarChar(10) // "YYYY-MM" en las mensuales; null en las reservas
+  due_date DateTime? @db.Date
 
   // ponytail: no hay estado "Vencido". Se deriva de due_date < hoy con status
   // Pendiente — guardarlo obligaría a un job que a medianoche dé vuelta filas, y
@@ -372,7 +417,6 @@ model Payment {
   method        PaymentMethod?
   file_id       String?        @db.Char(128) // comprobante de transferencia
   registered_by String?        @db.Char(128) // admin que confirmó el cobro
-  external_id   String?        @unique @db.VarChar(120) // id de Mercado Pago, a futuro
   notes         String?        @db.Text
 
   // ponytail: clave de idempotencia. "reserva:<bookingId>",
@@ -381,14 +425,27 @@ model Payment {
   // que el seed con sus UUID fijos.
   ref String @unique @db.VarChar(160)
 
+  template_id     Int? // plantilla que lo emitió
+  created_by      String?   @db.Char(128) // NULL = motor / sistema
+  resolved_by     String?   @db.Char(128) // Anulado/Condonado; "sistema" | "mercadopago"
+  resolved_reason String?   @db.Text
+  resolved_at     DateTime?
+  deleted_at      DateTime? // baja lógica
+  deleted_by      String?   @db.Char(128)
+  deleted_reason  String?   @db.Text
+
   created_at DateTime @default(now())
 
-  user       User        @relation("PaymentUser", fields: [user_id], references: [id])
-  registrar  User?       @relation("PaymentRegistrar", fields: [registered_by], references: [id])
-  enrollment Enrollment? @relation(fields: [enrollment_id], references: [id])
-  booking    Booking?    @relation(fields: [booking_id], references: [id])
-  fee        Fee?        @relation(fields: [fee_id], references: [id])
-  file       File?       @relation(fields: [file_id], references: [id])
+  user       User                     @relation("PaymentUser", fields: [user_id], references: [id])
+  registrar  User?                    @relation("PaymentRegistrar", fields: [registered_by], references: [id])
+  enrollment Enrollment?              @relation(fields: [enrollment_id], references: [id])
+  booking    Booking?                 @relation(fields: [booking_id], references: [id])
+  fee        Fee?                     @relation(fields: [fee_id], references: [id])
+  file       File?                    @relation(fields: [file_id], references: [id])
+  type       ChargeType               @relation(fields: [concept], references: [key])
+  template   RecurringTemplate?       @relation(fields: [template_id], references: [id])
+  items      PaymentTransactionItem[]
+  refunds    Refund[]
 
   @@index([user_id, status])
   @@index([status, due_date])
@@ -471,4 +528,144 @@ model ClubSettings {
   updated_at          DateTime @default(now()) @updatedAt
 
   @@map("club_settings")
+}
+
+model ChargeType {
+  id               Int      @id @default(autoincrement())
+  key              String   @unique @db.VarChar(40) // inmutable; payments.concept la referencia
+  name             String   @db.VarChar(100)
+  description      String?  @db.Text
+  suggested_amount Decimal? @db.Decimal(10, 2)
+  due_rule         DueRule  @default(Ninguna)
+  due_value        Int?     @db.UnsignedSmallInt // DiaDelMes NULL => ClubSettings.payment_due_day
+  system           Boolean  @default(false) // Reserva, Disciplina, Socio
+  active           Boolean  @default(true)
+  created_at       DateTime @default(now())
+  updated_at       DateTime @updatedAt
+
+  payments  Payment[]
+  templates RecurringTemplate[]
+
+  @@map("charge_types")
+}
+
+model RecurringTemplate {
+  id            Int         @id @default(autoincrement())
+  concept       String      @db.VarChar(40)
+  name          String      @db.VarChar(120)
+  description   String?     @db.Text
+  amount        Decimal?    @db.Decimal(10, 2) // NULL sólo con Disciplina (Fee vigente)
+  period_mode   PeriodMode
+  day_of_month  Int?        @db.UnsignedTinyInt
+  every_n       Int?        @db.UnsignedSmallInt
+  unit          PeriodUnit?
+  start_date    DateTime    @db.Date
+  end_date      DateTime?   @db.Date
+  due_rule      DueRule? // NULL = hereda del tipo
+  due_value     Int?        @db.UnsignedSmallInt
+  target_mode   TargetMode
+  discipline_id Int? // Disciplina; NULL = todas
+  active        Boolean     @default(true)
+  created_by    String      @db.Char(128)
+  created_at    DateTime    @default(now())
+  updated_at    DateTime    @updatedAt
+
+  type       ChargeType                @relation(fields: [concept], references: [key])
+  discipline Discipline?               @relation(fields: [discipline_id], references: [id])
+  targets    RecurringTemplateTarget[]
+  payments   Payment[]
+
+  @@index([active])
+  @@map("recurring_templates")
+}
+
+// Lista (>=1) y Socio (exactamente 1)
+model RecurringTemplateTarget {
+  template_id Int
+  user_id     String @db.Char(128)
+
+  template RecurringTemplate @relation(fields: [template_id], references: [id])
+  user     User              @relation(fields: [user_id], references: [id])
+
+  @@id([template_id, user_id])
+  @@index([user_id])
+  @@map("recurring_template_targets")
+}
+
+model PaymentTransaction {
+  id            String            @id @default(uuid()) // external_reference de MP
+  user_id       String            @db.Char(128) // quién paga (puede ser el tutor)
+  method        PaymentMethod
+  status        TransactionStatus @default(Pendiente)
+  amount        Decimal           @db.Decimal(10, 2) // suma de items, calculada por el servidor
+  registered_by String?           @db.Char(128) // cobro manual
+  notes         String?           @db.Text
+
+  mp_payment_id       String?   @unique @db.VarChar(64)
+  mp_preference_id    String?   @db.VarChar(64)
+  mp_status           String?   @db.VarChar(32)
+  mp_status_detail    String?   @db.VarChar(64)
+  mp_payment_method   String?   @db.VarChar(32)
+  mp_payment_type     String?   @db.VarChar(32)
+  mp_fee              Decimal?  @db.Decimal(10, 2)
+  net_received_amount Decimal?  @db.Decimal(10, 2)
+  mp_last_updated     DateTime?
+  checkout_url        String?   @db.VarChar(512) // init_point, para retomar
+  raw                 Json?
+
+  paid_at       DateTime?
+  expires_at    DateTime?
+  voided_by     String?   @db.Char(128)
+  voided_reason String?   @db.Text
+  voided_at     DateTime?
+  created_at    DateTime  @default(now())
+  updated_at    DateTime  @updatedAt
+
+  user    User                     @relation(fields: [user_id], references: [id])
+  items   PaymentTransactionItem[]
+  refunds Refund[]
+
+  @@index([user_id, status])
+  @@index([status, expires_at])
+  @@map("payment_transactions")
+}
+
+model PaymentTransactionItem {
+  transaction_id String
+  payment_id     String
+  amount         Decimal @db.Decimal(10, 2) // copia de Payment.amount
+
+  transaction PaymentTransaction @relation(fields: [transaction_id], references: [id])
+  payment     Payment            @relation(fields: [payment_id], references: [id])
+
+  @@id([transaction_id, payment_id])
+  @@index([payment_id])
+  @@map("payment_transaction_items")
+}
+
+model Refund {
+  id              Int       @id @default(autoincrement())
+  transaction_id  String
+  payment_id      String? // NULL: total por monto inconsistente o externo sin asignar
+  amount          Decimal   @db.Decimal(10, 2)
+  status          String    @db.VarChar(32) // "pending" | "failed" | "rejected" | "resolved_offline" | estado de MP
+  reason          String?   @db.Text
+  requested_by    String    @db.Char(128) // id de usuario | "sistema" | "mercadopago"
+  income_reversal Boolean   @default(true) // descuenta ingresos en los reportes
+  refunded_at     DateTime? // cuándo MP lo aprobó: bucket del egreso
+  attempts        Int       @default(0) @db.UnsignedInt
+  last_error      String?   @db.VarChar(200)
+  resolved_by     String?   @db.Char(128)
+  resolved_note   String?   @db.Text
+  resolved_at     DateTime?
+  mp_refund_id    String?   @unique @db.VarChar(64)
+  idempotency_key String    @unique @db.VarChar(160)
+  raw             Json?
+  created_at      DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
+
+  transaction PaymentTransaction @relation(fields: [transaction_id], references: [id])
+  payment     Payment?           @relation(fields: [payment_id], references: [id])
+
+  @@map("refunds")
 }
