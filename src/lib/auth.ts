@@ -6,6 +6,11 @@ import { ADMIN_ROLES, esGestion, nombresDeRoles, tieneRol } from "./roles";
 
 export { ADMIN_ROLES };
 
+// Sin secreto en producción tokens firmados con un default público: mejor no arrancar.
+if (process.env.NODE_ENV === "production" && !process.env.JWT_SECRET) {
+  throw new Error("JWT_SECRET es obligatorio en producción");
+}
+
 const JWT_SECRET =
   process.env.JWT_SECRET || "your-secret-key-change-in-production";
 

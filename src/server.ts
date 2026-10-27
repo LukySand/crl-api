@@ -1,49 +1,12 @@
 import "dotenv/config";
-import express from "express";
-import { authRouter } from "./routes/auth";
-import { filesRouter } from "./routes/files";
-import { adminRouter } from "./routes/admin";
-import { placesRouter } from "./routes/places";
-import { schedulesRouter } from "./routes/schedules";
-import { feesRouter } from "./routes/fees";
-import { bookingsRouter } from "./routes/bookings";
-import { disciplinesRouter } from "./routes/disciplines";
-import { enrollmentsRouter } from "./routes/enrollments";
-import { socioRouter } from "./routes/socio";
-import { familiesRouter } from "./routes/families";
-import { paymentsRouter } from "./routes/payments";
-import { reportsRouter } from "./routes/reports";
-import { partnerStoresRouter } from "./routes/partner-stores";
-import { novedadesRouter } from "./routes/novedades";
-import { blocksRouter } from "./routes/blocks";
-import { settingsRouter } from "./routes/settings";
+import { createApp } from "./app";
 
-const app = express();
-app.use(express.json());
+// ponytail: placeholder; B3 lo reemplaza por el scheduler real (respeta DISABLE_CRON).
+function startScheduler() {}
 
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true });
-});
-
-app.use("/api/auth", authRouter);
-app.use("/api/files", filesRouter);
-app.use("/api/admin", adminRouter);
-app.use("/api/places", placesRouter);
-app.use("/api/schedules", schedulesRouter);
-app.use("/api/fees", feesRouter);
-app.use("/api/bookings", bookingsRouter);
-app.use("/api/disciplines", disciplinesRouter);
-app.use("/api/enrollments", enrollmentsRouter);
-app.use("/api/socio", socioRouter);
-app.use("/api/families", familiesRouter);
-app.use("/api/payments", paymentsRouter);
-app.use("/api/reports", reportsRouter);
-app.use("/api/partner-stores", partnerStoresRouter);
-app.use("/api/novedades", novedadesRouter);
-app.use("/api/blocks", blocksRouter);
-app.use("/api/settings", settingsRouter);
-
+const app = createApp();
 const port = Number(process.env.PORT ?? 3001);
 app.listen(port, () => {
   console.log(`🚀 API CRL en http://localhost:${port}`);
 });
+startScheduler();
