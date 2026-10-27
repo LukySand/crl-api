@@ -117,6 +117,16 @@ const generateSchema = z.object({
   period: periodoSchema.default(() => periodoActual()),
 });
 
+// Filtros validados de GET /api/payments. El resto (status, concept, q, page…) se lee crudo.
+const listQuerySchema = z.object({
+  period: periodoSchema.optional(),
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "from debe ser YYYY-MM-DD").optional(),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "to debe ser YYYY-MM-DD").optional(),
+  estado: z.literal("vencida", "estado sólo admite 'vencida'").optional(),
+  discipline_id: z.coerce.number().int().positive("discipline_id debe ser un entero positivo").optional(),
+  method: z.enum(["Efectivo", "Transferencia", "MercadoPago", "MPFueraDeApp", "TarjetaConPosnet"], "method inválido").optional(),
+});
+
 const motivo = z.string().trim().min(3).max(500);
 const fechaIso = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Fecha YYYY-MM-DD");
 
@@ -267,6 +277,7 @@ function accionesDe(f: FilaConLiq, liq: LiqInfo | undefined): Accion[] {
  * Filtros: ?status=Pendiente ?concept=Disciplina ?period=2026-09 ?user_id=... ?from=&to=
  * Gestión además: ?q= (socio por nombre/apellido/DNI o nombre del cargo),
  * ?estado=vencida (D25), ?eliminados=1 (incluye las bajas lógicas, D7),
+ * ?discipline_id= (cuotas de esa disciplina) y ?method= (cobros con ese medio de pago),
  * ?page=&page_size= (agrega `hay_mas`; sin `page` devuelve todo, como antes),
  * ?id= o ?ids=a,b (hasta 200 ids; también ve las bajas lógicas sólo con ?eliminados=1).
  *
@@ -277,23 +288,19 @@ function accionesDe(f: FilaConLiq, liq: LiqInfo | undefined): Accion[] {
  */
 paymentsRouter.get("/", async (req: Request, res: Response) => {
   try {
-    const { status, concept, period, user_id, from, to, q, estado, eliminados, page, page_size, id, ids } = req.query;
+    const { status, concept, user_id, q, eliminados, page, page_size, id, ids } = req.query;
     // Gestión ve todas salvo que pida `?propias=true` (ver veComoGestion).
     const admin = veComoGestion(req);
 
-    if (typeof period === "string" && !esPeriodoValido(period)) {
-      return res.status(400).json({ success: false, error: "El período debe ser YYYY-MM" });
+    const parsed = listQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]!.message,
+        errors: formatErrors(parsed.error.issues),
+      });
     }
-    for (const [nombre, valor] of [["from", from], ["to", to]] as const) {
-      if (typeof valor === "string" && !/^\d{4}-\d{2}-\d{2}$/.test(valor)) {
-        return res
-          .status(400)
-          .json({ success: false, error: `${nombre} debe ser YYYY-MM-DD` });
-      }
-    }
-    if (estado !== undefined && estado !== "vencida") {
-      return res.status(400).json({ success: false, error: "estado sólo admite 'vencida'" });
-    }
+    const { period, from, to, estado, discipline_id, method } = parsed.data;
     const paginar = typeof page === "string";
     const nPagina = Math.max(1, Number.parseInt(String(page), 10) || 1);
     const tamano = Math.min(200, Math.max(1, Number.parseInt(String(page_size), 10) || 50));
@@ -320,14 +327,16 @@ paymentsRouter.get("/", async (req: Request, res: Response) => {
         ...(porId.length > 0 && { id: { in: porId } }),
         ...(typeof status === "string" && { status: status as any }),
         ...(typeof concept === "string" && { concept: concept as any }),
-        ...(typeof period === "string" && { period }),
-        ...((typeof from === "string" || typeof to === "string") && {
+        ...(period !== undefined && { period }),
+        ...((from !== undefined || to !== undefined) && {
           due_date: {
             ...(estado === "vencida" && { lt: new Date(`${hoy}T00:00:00Z`) }),
-            ...(typeof from === "string" && { gte: new Date(`${from}T00:00:00Z`) }),
-            ...(typeof to === "string" && { lte: new Date(`${to}T00:00:00Z`) }),
+            ...(from !== undefined && { gte: new Date(`${from}T00:00:00Z`) }),
+            ...(to !== undefined && { lte: new Date(`${to}T00:00:00Z`) }),
           },
         }),
+        ...(discipline_id !== undefined && { enrollment: { discipline_id } }),
+        ...(method !== undefined && { items: { some: { transaction: { method } } } }),
         ...(palabras.length > 0 && {
           AND: palabras.map((palabra) => ({
             OR: [
@@ -954,6 +963,57 @@ paymentsRouter.post("/:id/revertir", requireAdmin, async (req: Request<{ id: str
   } catch (error) {
     console.error("Revert collection error:", error);
     return res.status(500).json({ success: false, error: "Error al revertir el cobro" });
+  }
+});
+
+/**
+ * GET /api/payments/:id/historial (gestión) — pagos y reembolsos de un cargo, del más nuevo al
+ * más viejo. Un "pago" es cada transacción que lo cubrió (con el monto de ESTE cargo, no el de
+ * la transacción entera); un "reembolso", cada Refund con payment_id = :id.
+ */
+paymentsRouter.get("/:id/historial", requireAdmin, async (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const payment = await prisma.payment.findUnique({
+      where: { id: req.params.id },
+      select: { id: true },
+    });
+    if (!payment) {
+      return res.status(404).json({ success: false, error: "Cuota no encontrada" });
+    }
+    const [items, refunds] = await Promise.all([
+      prisma.paymentTransactionItem.findMany({
+        where: { payment_id: payment.id },
+        include: { transaction: true },
+      }),
+      prisma.refund.findMany({
+        where: { payment_id: payment.id },
+        include: { transaction: { select: { method: true } } },
+      }),
+    ]);
+    const historial = [
+      ...items.map((i) => ({
+        tipo: "pago" as const,
+        id: i.transaction_id,
+        fecha: i.transaction.paid_at ?? i.transaction.created_at,
+        method: i.transaction.method as PaymentMethod | null,
+        amount: toNumber(i.amount),
+        status: i.transaction.status as string,
+      })),
+      ...refunds.map((r) => ({
+        tipo: "reembolso" as const,
+        id: String(r.id),
+        fecha: r.refunded_at ?? r.created_at,
+        method: r.transaction.method as PaymentMethod | null,
+        amount: toNumber(r.amount),
+        status: r.status,
+      })),
+    ]
+      .sort((a, b) => b.fecha.getTime() - a.fecha.getTime())
+      .map((h) => ({ ...h, fecha: h.fecha.toISOString() }));
+    return res.json({ success: true, historial });
+  } catch (error) {
+    console.error("Payment history error:", error);
+    return res.status(500).json({ success: false, error: "Error al obtener el historial" });
   }
 });
 

@@ -282,3 +282,64 @@ test("listado ?id= / ?ids=: solo gestion, devuelve las filas pedidas con accione
   const ajeno = await api("GET", `/api/payments?id=${a.id}`, { token: otro.token });
   expect(ajeno.body.payments).toHaveLength(0);
 });
+
+async function cobroCon(userId: string, paymentId: string, method: "Efectivo" | "MercadoPago", paidAt: Date, amount = 100) {
+  const tx = await prisma.paymentTransaction.create({
+    data: { user_id: userId, method, status: "Aprobado", amount, paid_at: paidAt },
+  });
+  await prisma.paymentTransactionItem.create({ data: { transaction_id: tx.id, payment_id: paymentId, amount } });
+  return tx;
+}
+
+test("listado ?discipline_id= y ?method=: filtran; invalidos 400", async () => {
+  const admin = await makeUser({ roles: ["Administrador"] });
+  const socio = await makeUser({ roles: ["Socio"] });
+  const disc = await prisma.discipline.create({ data: { name: `Filtro ${Date.now()}` } });
+  const enr = await prisma.enrollment.create({ data: { user_id: socio.id, discipline_id: disc.id } });
+  const deDisc = await cuota(socio.id, "Otro", { enrollment_id: enr.id });
+  const otra = await cuota(socio.id, "Otro");
+  await cobroCon(socio.id, deDisc.id, "MercadoPago", new Date());
+  await cobroCon(socio.id, otra.id, "Efectivo", new Date());
+
+  const porDisc = await api("GET", `/api/payments?user_id=${socio.id}&discipline_id=${disc.id}`, { token: admin.token });
+  expect(porDisc.body.payments.map((p: any) => p.id)).toEqual([deDisc.id]);
+  const porMetodo = await api("GET", `/api/payments?user_id=${socio.id}&method=Efectivo`, { token: admin.token });
+  expect(porMetodo.body.payments.map((p: any) => p.id)).toEqual([otra.id]);
+
+  expect((await api("GET", "/api/payments?method=Bitcoin", { token: admin.token })).status).toBe(400);
+  expect((await api("GET", "/api/payments?discipline_id=abc", { token: admin.token })).status).toBe(400);
+  expect((await api("GET", "/api/payments?discipline_id=-3", { token: admin.token })).status).toBe(400);
+});
+
+test("historial: pagos y reembolsos, nuevo primero, con el monto del item; 403 y 404", async () => {
+  const admin = await makeUser({ roles: ["Administrador"] });
+  const socio = await makeUser({ roles: ["Socio"] });
+  const p = await cuota(socio.id, "Otro");
+  const otra = await cuota(socio.id, "Otro");
+  // Una transaccion de 300 que cubrio dos cargos: aca debe verse sólo el item de 100.
+  const tx = await prisma.paymentTransaction.create({
+    data: { user_id: socio.id, method: "MercadoPago", status: "Aprobado", amount: 300, paid_at: new Date("2026-03-01T12:00:00Z") },
+  });
+  await prisma.paymentTransactionItem.createMany({
+    data: [
+      { transaction_id: tx.id, payment_id: p.id, amount: 100 },
+      { transaction_id: tx.id, payment_id: otra.id, amount: 200 },
+    ],
+  });
+  await prisma.refund.create({
+    data: {
+      transaction_id: tx.id, payment_id: p.id, amount: 40, status: "approved", requested_by: admin.id,
+      refunded_at: new Date("2026-04-01T12:00:00Z"), idempotency_key: `test:hist:${Date.now()}:${++n}`,
+    },
+  });
+
+  const r = await api("GET", `/api/payments/${p.id}/historial`, { token: admin.token });
+  expect(r.status).toBe(200);
+  expect(r.body.historial.map((h: any) => h.tipo)).toEqual(["reembolso", "pago"]);
+  expect(r.body.historial[0]).toMatchObject({ amount: 40, status: "approved", method: "MercadoPago" });
+  expect(r.body.historial[1]).toMatchObject({ id: tx.id, amount: 100, status: "Aprobado", method: "MercadoPago" });
+  expect(r.body.historial[1].fecha).toBe("2026-03-01T12:00:00.000Z");
+
+  expect((await api("GET", `/api/payments/${p.id}/historial`, { token: socio.token })).status).toBe(403);
+  expect((await api("GET", "/api/payments/no-existe/historial", { token: admin.token })).status).toBe(404);
+});
