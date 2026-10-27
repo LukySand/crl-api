@@ -376,3 +376,66 @@ test("resolver concurrente contra el barrido: exactamente uno gana", async () =>
   }
   expect(fila.status).toBe("Anulado"); // en ambos caminos la fila queda anulada una sola vez
 });
+
+const reintentar = (token: string, id: number) => api("POST", `/api/transactions/refunds/${id}/reintentar`, { token });
+
+test("reintentar a mano un monto inconsistente (payment_id null, failed): misma clave, sin fila nueva, queda approved", async () => {
+  const { admin, filas, liq, mpId } = await cobrada([60]);
+  const clave = `reembolso:${liq.id}:total`;
+  const refund = await prisma.refund.create({
+    data: { transaction_id: liq.id, payment_id: null, amount: 60, status: "failed", requested_by: "sistema", attempts: 1, last_error: "HTTP 500", idempotency_key: clave },
+  });
+  const antes = stub.reembolsos.length;
+  const r = await reintentar(admin.token, refund.id);
+  expect(r.status).toBe(200);
+  expect(r.body.reembolso).toEqual({ id: refund.id, estado: "aprobado" });
+  expect(stub.reembolsos.slice(antes)).toMatchObject([{ paymentId: mpId, key: clave }]);
+  expect(await prisma.refund.findUniqueOrThrow({ where: { id: refund.id } })).toMatchObject({ status: "approved", attempts: 2, last_error: null });
+  expect(await prisma.refund.count({ where: { transaction_id: liq.id } })).toBe(1);
+  expect((await prisma.payment.findUniqueOrThrow({ where: { id: filas[0]!.id } })).status).toBe("Pagado");
+});
+
+test("reintentar: rejected con MP fallando devuelve 502 y sigue rejected; despues aprueba", async () => {
+  const { admin, refund } = await conReembolsoFallido("rejected", 35);
+  stub.fallarReembolsos(400, { error: "bad_request" });
+  try {
+    const r = await reintentar(admin.token, refund.id);
+    expect(r.status).toBe(502);
+    expect(r.body.reembolso).toEqual({ id: refund.id, estado: "rejected" });
+  } finally {
+    stub.fallarReembolsos(null);
+  }
+  expect((await reintentar(admin.token, refund.id)).status).toBe(200);
+  expect((await prisma.refund.findUniqueOrThrow({ where: { id: refund.id } })).status).toBe("approved");
+});
+
+test("reintentar: 403 no admin, 404 inexistente, 409 pending reciente / aprobado / resuelto", async () => {
+  const { admin, socio, refund } = await conReembolsoFallido("failed");
+  expect((await reintentar(socio.token, refund.id)).status).toBe(403);
+  expect((await reintentar(admin.token, 2_000_000_000)).status).toBe(404);
+  const antes = stub.reembolsos.length;
+
+  const pendiente = await prisma.refund.create({
+    data: { transaction_id: refund.transaction_id, payment_id: null, amount: 1, status: "pending", requested_by: "sistema", idempotency_key: `reembolso:${refund.transaction_id}:total` },
+  });
+  expect((await reintentar(admin.token, pendiente.id)).status).toBe(409);
+  await prisma.refund.update({ where: { id: pendiente.id }, data: { status: "approved" } });
+  expect((await reintentar(admin.token, pendiente.id)).status).toBe(409);
+  await prisma.refund.update({ where: { id: pendiente.id }, data: { status: "resolved_offline" } });
+  expect((await reintentar(admin.token, pendiente.id)).status).toBe(409);
+  expect(stub.reembolsos.length).toBe(antes);
+  // No dejar un failed suelto: el barrido de otros tests lo reintentaria.
+  await prisma.refund.update({ where: { id: refund.id }, data: { status: "resolved_offline" } });
+});
+
+test("reintentar concurrente contra resolver: exactamente uno gana", async () => {
+  const { admin, filas, refund } = await conReembolsoFallido("failed", 55);
+  const [rei, res] = await Promise.all([
+    reintentar(admin.token, refund.id),
+    resolver(admin.token, refund.id, { note: "devuelto en mano", devuelto_en_mano: true }),
+  ]);
+  expect([rei.status, res.status].sort()).toEqual([200, 409]);
+  const final = await prisma.refund.findUniqueOrThrow({ where: { id: refund.id } });
+  expect(final.status).toBe(rei.status === 200 ? "approved" : "resolved_offline");
+  expect((await prisma.payment.findUniqueOrThrow({ where: { id: filas[0]!.id } })).status).toBe("Anulado");
+});

@@ -351,6 +351,10 @@ model Booking {
   notes       String?       @db.Text
   created_at  DateTime      @default(now())
 
+  // Fin del hold de 5 minutos: sólo lo llevan las reservas pagadas en el acto con MP.
+  // NULL = sin plazo propio (la asignada por la gestión vence con el límite para cancelar).
+  hold_until DateTime?
+
   // ponytail: true mientras la reserva está viva (Pendiente/Confirmada), NULL
   // al cancelar. MySQL no soporta índices únicos parciales, pero sí ignora
   // NULL en índices únicos — por eso una reserva cancelada libera el turno
@@ -659,6 +663,7 @@ model Refund {
   resolved_note   String?   @db.Text
   resolved_at     DateTime?
   mp_refund_id    String?   @unique @db.VarChar(64)
+  mp_payment_id   String?   @db.VarChar(64) // pago de MP a devolver; NULL = el `mp_payment_id` de la liquidación (duplicado: otro)
   idempotency_key String    @unique @db.VarChar(160)
   raw             Json?
   created_at      DateTime  @default(now())

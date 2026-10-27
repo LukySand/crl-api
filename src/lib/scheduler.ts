@@ -7,7 +7,7 @@ import { liberarReservasVencidas } from "./booking-hold";
 import { emitirCargos } from "./emission";
 import { logger } from "./logger";
 import { todayInClub } from "./payment-period";
-import { syncPendingPayments } from "./payment-sync";
+import { barrerDuplicados, syncPendingPayments } from "./payment-sync";
 import { reintentarReembolsos } from "./refunds";
 
 export function startScheduler(): void {
@@ -33,6 +33,9 @@ export function startScheduler(): void {
     }
   });
 
+  // El mismo link pagado dos veces: devuelve los pagos aprobados que no saldaron su liquidación.
+  Bun.cron("*/15 * * * *", () => barrerDuplicados(50)); // nunca lanza
+
   // Reembolsos `failed` o `pending` viejos (últimos 7 días), con la misma clave; nunca los `rejected`.
   Bun.cron("*/15 * * * *", async () => {
     try {
@@ -43,7 +46,7 @@ export function startScheduler(): void {
     }
   });
 
-  // Hold de 5 minutos de las reservas pagadas con MP desde la app de socio (D14).
+  // Reservas sin pagar: hold de 5 minutos (pagadas en el acto con MP, D14) y límite para cancelar (asignadas por la gestión).
   Bun.cron("* * * * *", async () => {
     const n = await liberarReservasVencidas(); // nunca lanza
     if (n > 0) logger.info(`Reservas liberadas por vencer el plazo de pago: ${n}`);

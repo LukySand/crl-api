@@ -140,7 +140,29 @@ export function hayTiempoParaPagar(
   return stampInClub(new Date(ahora.getTime() + minutos * 60_000)) <= inicio;
 }
 
-/** Corte del hold: una reserva en espera creada antes de este instante ya venció. */
-export function corteHoldReservas(ahora: Date = new Date()): Date {
-  return new Date(ahora.getTime() - MINUTOS_PARA_PAGAR_RESERVA * 60_000);
+/**
+ * Instante límite para cancelar: `horas` antes del inicio del turno, en el huso del club.
+ * ponytail: offset fijo -03:00, Argentina no tiene horario de verano; si el club cambia de huso, esto también.
+ */
+export function limiteDeCancelacion(date: Date, startTime: Date, horas: number = HORAS_ANTES_CANCELAR): Date {
+  const inicio = new Date(`${date.toISOString().slice(0, 10)}T${timeToHHMM(startTime)}:00-03:00`);
+  return new Date(inicio.getTime() - horas * 3_600_000);
+}
+
+/**
+ * ¿Hay que cancelar ya una reserva sin pagar y sin hold (asignada por la gestión)? Sí cuando
+ * ya pasó el límite para cancelar. Excepción: si nació dentro de la ventana (la gestión
+ * cargó el turno de esta noche) nunca se cancela sola, o caería en el primer barrido.
+ */
+export function debeCancelarseSinPagar(
+  date: Date,
+  startTime: Date,
+  createdAt: Date,
+  ahora: Date = new Date(),
+  horas: number = HORAS_ANTES_CANCELAR,
+): boolean {
+  return (
+    !dentroDeVentanaCancelacion(date, startTime, ahora, horas) &&
+    dentroDeVentanaCancelacion(date, startTime, createdAt, horas)
+  );
 }

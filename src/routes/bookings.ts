@@ -5,7 +5,7 @@ import { requireAuth, isAdmin, veComoGestion } from "../lib/auth";
 import { findOrCreateFeeForPlace } from "../lib/fee";
 import { METODOS_MANUALES } from "../lib/cobro";
 import { refReserva } from "../lib/payment";
-import { liquidacionViva, saldarItems } from "../lib/settlement";
+import { crearLiquidacionMP, liquidacionViva, PagoEnCurso, saldarItems } from "../lib/settlement";
 import { accessToken, createPreference } from "../lib/mercadopago";
 import { liberarReservasVencidas, reembolsarReservaPagada } from "../lib/booking-hold";
 import { bloqueaTurno } from "../lib/schedule-block";
@@ -20,6 +20,7 @@ import {
   ultimaFechaReservable,
   dentroDeVentanaCancelacion,
   hayTiempoParaPagar,
+  limiteDeCancelacion,
   MINUTOS_PARA_PAGAR_RESERVA,
 } from "../lib/booking-date";
 
@@ -213,16 +214,26 @@ bookingsRouter.get("/:id", async (req: Request<{ id: string }>, res: Response) =
 });
 
 /**
- * POST /api/bookings/:id/checkout — retoma el pago de una reserva en hold.
+ * POST /api/bookings/:id/checkout — retoma el pago de una reserva pendiente.
  *
- * Sólo el dueño (la gestión no paga por otro). Devuelve el `checkout_url` de la liquidación
- * viva: nunca crea otra preferencia, así que nunca hay dos pagos vivos para la misma reserva.
+ * Sólo el dueño (la gestión no paga por otro). Con liquidación viva devuelve su `checkout_url`.
+ * Sin liquidación: si la reserva tuvo hold (`hold_until`) ya venció; si no (la asignó la
+ * gestión) se crea el pago acá, con vigencia hasta el límite para cancelar.
  */
 bookingsRouter.post("/:id/checkout", async (req: Request<{ id: string }>, res: Response) => {
   try {
     const booking = await prisma.booking.findUnique({
       where: { id: req.params.id },
-      select: { user_id: true, status: true, active: true, payment: { select: { id: true } } },
+      select: {
+        user_id: true,
+        status: true,
+        active: true,
+        date: true,
+        created_at: true,
+        hold_until: true,
+        schedule: { select: { start_time: true, place: { select: { name: true } } } },
+        payment: { select: { id: true, status: true, amount: true } },
+      },
     });
     if (!booking) {
       return res.status(404).json({ success: false, error: "Reserva no encontrada" });
@@ -234,21 +245,71 @@ bookingsRouter.post("/:id/checkout", async (req: Request<{ id: string }>, res: R
       return res.status(409).json({ success: false, error: "Esta reserva no tiene un pago pendiente" });
     }
 
+    const devolver = (v: { checkout_url: string | null; expires_at: Date | null }) =>
+      v.checkout_url
+        ? res.json({ success: true, checkout_url: v.checkout_url, vence: v.expires_at?.toISOString() ?? null })
+        : res.status(409).json({
+            success: false,
+            error: "No se pudo recuperar el link de pago. Cancelá la reserva e intentá de nuevo.",
+          });
+
     const viva = await liquidacionViva([booking.payment.id]);
-    if (!viva) {
+    if (viva) return devolver(viva);
+    if (booking.hold_until) {
       return res.status(409).json({ success: false, error: "El plazo para pagar esta reserva ya venció" });
     }
-    if (!viva.checkout_url) {
-      return res.status(409).json({
-        success: false,
-        error: "No se pudo recuperar el link de pago. Cancelá la reserva e intentá de nuevo.",
-      });
+
+    // Asignada por la gestión: sin liquidación viva se crea una. Vence en el límite para cancelar
+    // (el barrido la suelta ahí); si nació dentro de esa ventana nunca se cancela sola y vence al iniciar el turno.
+    const { cancel_hours_before: horas } = await getAjustes();
+    const nacioDentro = !dentroDeVentanaCancelacion(booking.date, booking.schedule.start_time, booking.created_at, horas);
+    const expiresAt = limiteDeCancelacion(booking.date, booking.schedule.start_time, nacioDentro ? 0 : horas);
+    if (booking.payment.status !== "Pendiente" || expiresAt <= new Date()) {
+      return res.status(409).json({ success: false, error: "El plazo para pagar esta reserva ya venció" });
     }
-    return res.json({
-      success: true,
-      checkout_url: viva.checkout_url,
-      vence: viva.expires_at?.toISOString() ?? null,
-    });
+    if (!accessToken()) {
+      return res.status(502).json({ success: false, error: "El pago con Mercado Pago no está disponible" });
+    }
+
+    let liq: { id: string };
+    try {
+      liq = await crearLiquidacionMP({
+        userId: booking.user_id,
+        filas: [{ id: booking.payment.id, amount: booking.payment.amount }],
+        expiresAt,
+      });
+    } catch (error) {
+      if (error instanceof PagoEnCurso) return devolver(error.viva);
+      throw error;
+    }
+
+    try {
+      const socio = await prisma.user.findUnique({ where: { id: booking.user_id }, select: { email: true } });
+      const pref = await createPreference({
+        externalReference: liq.id,
+        items: [
+          {
+            title: `Reserva ${booking.schedule.place.name ?? "espacio"} — ${booking.date.toISOString().slice(0, 10)} ${timeToHHMM(booking.schedule.start_time)}`,
+            quantity: 1,
+            unit_price: Number(booking.payment.amount),
+          },
+        ],
+        payerEmail: socio?.email,
+        backUrlBase: process.env.MP_BACK_URL_BASE || "http://localhost:3000",
+        notificationUrl: process.env.MP_NOTIFICATION_URL || undefined,
+        expiresAt,
+      });
+      await prisma.paymentTransaction.update({
+        where: { id: liq.id },
+        data: { mp_preference_id: pref.id, checkout_url: pref.init_point },
+      });
+      return res.json({ success: true, checkout_url: pref.init_point, vence: expiresAt.toISOString() });
+    } catch (error) {
+      // La reserva sigue Pendiente (no hay hold que soltar): se cancela la liquidación y se reintenta.
+      console.error("Resume booking payment error:", error);
+      await prisma.paymentTransaction.updateMany({ where: { id: liq.id, status: "Pendiente" }, data: { status: "Cancelado" } }).catch(() => {});
+      return res.status(502).json({ success: false, error: "No se pudo iniciar el pago, probá de nuevo." });
+    }
   } catch (error) {
     console.error("Resume booking checkout error:", error);
     return res.status(500).json({ success: false, error: "Error al retomar el pago" });
@@ -445,6 +506,8 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
           notes,
           ...(admin && parsed.data.status ? { status: parsed.data.status } : {}),
           ...(gratis ? { status: "Confirmada" as const } : {}),
+          // Sólo la pagada en el acto retiene el turno 5 minutos; la de la gestión no tiene plazo propio.
+          ...(pagaEnElActo ? { hold_until: vence } : {}),
           active: true,
         },
         include: bookingInclude,
@@ -499,8 +562,10 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
     if (liquidacionId) {
       try {
         const socio = await prisma.user.findUnique({ where: { id: userId }, select: { email: true } });
-        // ponytail: sin `expiresAt`. MP exige 1-30 días de vigencia, así que una preferencia de
-        // 5 minutos se rechazaría entera; el hold es nuestro y lo vigila `liberarReservasVencidas`.
+        // El link vence junto con el hold: pasado el plazo MP no deja pagar, así que no hay que
+        // devolver. La doc no pone mínimo a `expiration_date_to` (el 1-30 días es de
+        // `date_of_expiration`, medios offline). Un pago empezado antes del corte y aprobado
+        // después igual llega: lo resuelve `resolverReserva`.
         const pref = await createPreference({
           externalReference: liquidacionId,
           items: [
@@ -513,6 +578,7 @@ bookingsRouter.post("/", async (req: Request, res: Response) => {
           payerEmail: socio?.email,
           backUrlBase: process.env.MP_BACK_URL_BASE || "http://localhost:3000",
           notificationUrl: process.env.MP_NOTIFICATION_URL || undefined,
+          expiresAt: vence,
         });
         await prisma.paymentTransaction.update({
           where: { id: liquidacionId },
