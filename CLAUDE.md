@@ -154,6 +154,84 @@ sólo como default de los parámetros (`dentroDeVentanaCancelacion(..., horas)`,
 cache que se descarta al guardar). Un cambio rige para lo que viene: las reservas ya hechas y las
 cuotas ya generadas conservan su fecha.
 
+### Sponsors
+
+Un comercio —o una persona— se postula como sponsor **desde la web, sin cuenta**, y la gestión
+aprueba o rechaza. No es un local adherido: el sponsor **aporta** al club, el local adherido **da**
+descuentos a los socios (son dos tablas, `SponsorApplication` y `PartnerStore`). Reglas puras en
+`lib/sponsor.ts`, con tests.
+
+| Método | Ruta | Guard | Qué hace |
+| --- | --- | --- | --- |
+| GET | `/api/sponsors` | **público** | La vitrina de la landing: sólo aprobados y sólo `{id, business_name, sector, logo_file_id}` |
+| POST | `/api/sponsors/applications` | **público** | Una empresa se postula. Multipart: los datos + el logo (opcional) en el mismo pedido |
+| GET | `/api/sponsors/applications` | sesión | Gestión ve todas; el resto, **las suyas**. `?status=` y `?propias=true` (ver abajo) |
+| GET | `/api/sponsors/applications/:id` | gestión o dueño | Detalle |
+| PATCH | `/api/sponsors/applications/:id/datos` | gestión o dueño | Corregir datos. Sólo si está `Pendiente` |
+| PATCH | `/api/sponsors/applications/:id` | gestión | `{action: aprobar\|rechazar, rejection_reason?}`. Rechazar exige motivo |
+| DELETE | `/api/sponsors/applications/:id` | gestión | Se terminó el auspicio: pasa a `Finalizada` y sale de la vitrina. Baja lógica |
+| PATCH | `/api/sponsors/applications/:id/reactivate` | gestión | Vuelve a `Aprobada`. El sponsor de la temporada pasada que repite |
+
+Cinco reglas que no se rompen:
+
+- **No se pide CUIT.** A quien recién está averiguando, pedirle la identidad fiscal es fricción, y
+  ese dato no hace falta hasta que hay acuerdo. Por eso tampoco es sólo para empresas:
+  `business_name` es el nombre del comercio **o** de la persona, y en un pueblo de ~9.500
+  habitantes el que quiere ayudar suele ser un vecino, no una S.A.
+- **Lo público sale por un `select` escrito a mano** (`VITRINA_SELECT`). La fila tiene email,
+  teléfono y el mensaje del acuerdo: nada de eso va a una página que ve cualquiera, y un `select`
+  explícito no se rompe solo cuando mañana se agregue una columna.
+- **El logo viaja en el mismo POST**, no en dos pasos. `PUT /api/files` exige sesión y quien se
+  postula no tiene cuenta; además, subirlo aparte dejaría archivos huérfanos si abandona el
+  formulario. `Storage.create` valida tipo por los **bytes** del archivo (no por el content-type que
+  manda el cliente), que es lo que hace tolerable recibirlo sin sesión. Reusa el kind `localImages`.
+- **Hay campo trampa** (`CAMPO_TRAMPA`, escondido en el formulario). Si viene con algo es un bot y
+  la postulación se descarta devolviendo 201, no 400: un error le enseñaría al bot cuál era el campo.
+  Reemplaza al CUIT, que hacía de filtro de basura con su dígito verificador antes de sacarlo.
+- **La cola tiene tope** (`LIMITE_PENDIENTES` = 100 → 503), chequeado **antes** de escribir el logo
+  así tampoco se llena el disco. Un límite por IP no serviría: el front proxea `/api/*` y todas las
+  postulaciones llegan con la IP del proxy.
+
+**Las formas de aportar** (`TIPOS_DE_APORTE`) son una lista cerrada y **sin montos**: una cifra en
+pesos escrita en el código envejece sola —con la inflación de 2026, ~1,9% mensual, pierde un tercio
+de su valor en un año— y además ningún club de este tamaño publica tarifa, se arregla hablando. Las
+opciones dicen **qué** se aporta, no cuánto. Dos están marcadas `aConfirmar` porque el club todavía
+las está definiendo; se muestran igual, avisando. La columna guarda el **`id`** de la opción
+("equipo", "especie"…), no su texto, así la lista se cambia sin migración y sin dejar ilegibles las
+postulaciones viejas (`tituloDeAporte` cae al valor crudo si el id ya no existe). El rubro sigue
+siendo texto libre, y el mensaje es donde se explica cualquier combinación.
+
+Un email no puede tener dos postulaciones Pendiente/Aprobada a la vez (409, comparando en
+minúsculas), pero quien fue **rechazado sí puede volver a postularse**: cambió la propuesta. Por eso
+`email` no es `@unique`. Y una vez resuelta, la postulación no se vuelve a aprobar ni rechazar
+(`denyRevision`, 409): la fila es el registro de lo que se decidió, y pisarla borraría el motivo del
+rechazo sin dejar rastro.
+
+**Se puede postular con cuenta o sin ella.** Si el POST trae sesión, la fila guarda `user_id`
+(**del token, nunca del body**) y esa persona la sigue desde la app —"Mi propuesta al club" en
+Configuración del socio—, donde ve el estado y el motivo del rechazo. `GET /applications` usa la
+misma convención que reservas y cuotas: la gestión ve todas, cualquier otra sesión ve las suyas, y
+un admin pide las propias con `?propias=true` (`veComoGestion`). **Una postulación anónima no se
+vincula sola** con una cuenta que después se registre con el mismo email: el registro no verifica
+el email (deuda conocida), así que cualquiera que se anote con esa dirección vería la ajena.
+
+**`/datos` tiene dos alcances en un mismo endpoint**, porque es el mismo concepto con distinto
+permiso: el **dueño** corrige todo lo que escribió (es su propuesta) y la **gestión** sólo contacto
+—nombre, email, teléfono—, que es el caso real del email tipeado mal de una anónima. El rubro, el
+aporte y el mensaje son lo que la persona propuso y la gestión no los reescribe. Si alguien es dueño
+y admin, manda el alcance de dueño. Sólo mientras esté `Pendiente` (`denyEdicion`): una resuelta es
+el registro de lo que se decidió sobre **esos** datos.
+
+⚠️ El seed se identifica por **`business_name`, no por email**: desde que la gestión puede corregir
+el email, usarlo de clave hacía que el seed no reconociera su propia fila y la sembrara duplicada.
+
+**`Finalizada` es el cuarto estado y no es un rechazo**: el trato existió y se cumplió, sólo que ya
+no está vigente. Existe porque un auspicio es **por temporada**; sin él, el logo de quien dejó de
+acompañar se queda en la landing para siempre. Las transiciones están en `denyBaja` y
+`denyReactivar`, con tests: sólo se baja lo `Aprobada` y sólo se reactiva lo `Finalizada`, y el
+ciclo Aprobada → Finalizada → Aprobada se puede repetir cada año. `reviewed_at`/`reviewed_by`
+guardan el **último** cambio de estado, no sólo el primero.
+
 ### Bloqueo de espacios
 
 Cierra un espacio durante un rango de fechas (y, si trae franja horaria, sólo en esa franja) sin
@@ -205,6 +283,7 @@ Reservas: `Place` (espacio), `Schedule` (turno recurrente: `day_of_week` + TIME,
 `Fee` (tarifa, inmutable, con `kind`) y `Booking` (la reserva: `Schedule` + una fecha concreta).
 Disciplinas: `Discipline`, `DisciplineProfessor`, `DisciplineSchedule`, `Enrollment`.
 Plata: `Payment` (ver "Cuotas y pagos" abajo).
+Sponsors: `SponsorApplication` + enum `SponsorStatus` (ver "Sponsors").
 
 **IDs: `User`, `File`, `Family` y `Booking` usan UUID (`String @id @default(uuid())`).** El
 resto es `Int` autoincremental. Migrado desde int en el commit `4db61f3`.
@@ -324,8 +403,8 @@ En prod, `entrypoint.sh` corre `migrate deploy` + seed antes de arrancar.
 Construido: auth (`/api/auth/*`), gestión de usuarios y bajas (`/api/admin/*`), archivos
 (`/api/files`), espacios (`/api/places`), turnos (`/api/schedules`), tarifas (`/api/fees`),
 reservas (`/api/bookings`), disciplinas (`/api/disciplines`), inscripciones
-(`/api/enrollments`), cuotas y cobros (`/api/payments`) y reportes de ingresos
-(`/api/reports`).
+(`/api/enrollments`), cuotas y cobros (`/api/payments`), reportes de ingresos
+(`/api/reports`) y postulación de sponsors (`/api/sponsors`).
 
 Falta: publicaciones institucionales y locales adheridos con beneficios.
 
