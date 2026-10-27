@@ -46,6 +46,33 @@ const SALDABLES_DESDE: TransactionStatus[] = ["Pendiente", "Rechazado", "Cancela
  * @returns `null` si la notificación era vieja o ya la aplicó otro proceso.
  */
 export async function aplicarPagoMP(mp: Mp, liq: LiquidacionMP): Promise<ResultadoMP | null> {
+  // Una preferencia se puede pagar dos veces (mismo link abierto en dos pestañas). Si la liquidación
+  // ya cerró con OTRO pago, éste es un duplicado: no se vuelca (pisaría `mp_payment_id` y el cobro
+  // original quedaría olvidado) y, si cobró, se devuelve entero. Va antes del chequeo de "vieja":
+  // `mp_last_updated` es del otro pago y no sirve para comparar.
+  const mpId = String(mp?.id ?? "");
+  if (mpId && liq.mp_payment_id && liq.mp_payment_id !== mpId && !SALDABLES_DESDE.includes(liq.status)) {
+    if (mapEstadoMP(String(mp?.status ?? "")) === "Aprobado" && !(Number(mp?.transaction_amount_refunded ?? 0) > 0)) {
+      // Queda como `Refund` (con `mp_payment_id` del duplicado) y sale por la misma máquina que los
+      // reembolsos normales: 5xx -> `failed` y lo reintenta `reintentarReembolsos`; 4xx -> `rejected`
+      // y lo ve el admin en "Problemas de pagos". Si la fila ya existe, los reintentos son de ese
+      // barrido, no de cada webhook. Sólo lanza (webhook 500, MP reintenta) si no se pudo registrar.
+      const clave = `duplicado:${mpId}`;
+      if (await prisma.refund.findUnique({ where: { idempotency_key: clave }, select: { id: true } })) return null;
+      const r = await reembolsarItem({
+        transaccionId: liq.id,
+        filaId: null,
+        motivo: "Pago duplicado de la misma preferencia",
+        actor: "sistema",
+        duplicado: { mpPaymentId: mpId, monto: (centavos(mp?.transaction_amount) / 100).toFixed(2) },
+      });
+      logger.info("Pago duplicado de Mercado Pago registrado", {
+        metadata: { liquidacion_id: liq.id, mp_payment_id: mpId, refund_id: r.refundId, estado: r.estado },
+      });
+    }
+    return null;
+  }
+
   const lastUpdated = mp?.date_last_updated ? new Date(mp.date_last_updated) : null;
   if (lastUpdated && liq.mp_last_updated && lastUpdated <= liq.mp_last_updated) return null;
 
@@ -166,6 +193,7 @@ export async function aplicarPagoMP(mp: Mp, liq: LiquidacionMP): Promise<Resulta
     }
     return true;
   });
+  // Perdió el candado: si ganó otro pago de la misma preferencia, `devolverDuplicados` lo devuelve.
   if (!aplicado) return null;
 
   // La plata que no pudo saldar una fila vuelve sola (D12); la reserva ya tuvo su retome en la transacción.
@@ -209,7 +237,8 @@ export async function conciliarReembolsosExternos(liquidacionId: string, mpPayme
       continue;
     }
     const local = await prisma.refund.findFirst({
-      where: { transaction_id: liquidacionId, status: "pending", amount: monto },
+      // `mp_payment_id: null`: un duplicado pendiente (mismo monto) no es de este pago.
+      where: { transaction_id: liquidacionId, status: "pending", amount: monto, mp_payment_id: null },
       orderBy: { id: "asc" },
       select: { id: true, reason: true, requested_by: true },
     });
@@ -296,7 +325,59 @@ export async function syncPayment(liquidacionId: string) {
       (await searchPaymentsByExternalReference(liq.id)).sort((a, b) =>
         String(b.date_created).localeCompare(String(a.date_created)),
       )[0];
-  return mp ? aplicarPagoMP(mp, liq) : null;
+  const aplicado = mp ? await aplicarPagoMP(mp, liq) : null;
+  try {
+    await devolverDuplicados(liq.id);
+  } catch (error) {
+    // Lo levanta el barrido de duplicados; no le rompe la vuelta del checkout al socio.
+    logger.error(error, "Devolución de duplicados falló", { metadata: { liquidacion_id: liq.id } });
+  }
+  return aplicado;
+}
+
+/**
+ * Devuelve todo pago aprobado de la preferencia que no sea el que saldó la liquidación (el mismo
+ * link pagado dos veces). No depende de que llegue la notificación de ESE pago: alcanza con la del
+ * otro, la vuelta del checkout o el barrido. La devolución en sí es la guarda de `aplicarPagoMP`.
+ * Lanza sólo si no se pudo registrar una devolución (las fallas de MP quedan en el `Refund`).
+ * `yaProcesado`: el pago que el llamador acaba de aplicar.
+ */
+export async function devolverDuplicados(liquidacionId: string, yaProcesado?: string): Promise<void> {
+  const liq = await prisma.paymentTransaction.findUnique({ where: { id: liquidacionId }, select: LIQ_SELECT });
+  if (!liq?.mp_payment_id || SALDABLES_DESDE.includes(liq.status)) return;
+  for (const p of await searchPaymentsByExternalReference(liq.id)) {
+    if (String(p.id) !== liq.mp_payment_id && String(p.id) !== yaProcesado) await aplicarPagoMP(p, liq);
+  }
+}
+
+/**
+ * Red de seguridad: revisa las liquidaciones MP saldadas en los últimos 7 días. Un link se puede
+ * pagar mientras no venza (las cuotas, 24 h). Nunca lanza.
+ * ponytail: una búsqueda en MP por liquidación; con volumen, acotar por `paid_at` reciente.
+ */
+export async function barrerDuplicados(limite = 50): Promise<void> {
+  try {
+    const liqs = await prisma.paymentTransaction.findMany({
+      where: {
+        method: "MercadoPago",
+        status: { notIn: SALDABLES_DESDE },
+        mp_payment_id: { not: null },
+        created_at: { gte: new Date(Date.now() - 7 * 24 * 3600_000) },
+      },
+      orderBy: { created_at: "desc" },
+      select: { id: true },
+      take: limite,
+    });
+    for (const l of liqs) {
+      try {
+        await devolverDuplicados(l.id);
+      } catch (error) {
+        logger.error(error, "Devolución de duplicados falló", { metadata: { liquidacion_id: l.id } });
+      }
+    }
+  } catch (error) {
+    logger.error(error, "Barrido de pagos duplicados falló");
+  }
 }
 
 /**

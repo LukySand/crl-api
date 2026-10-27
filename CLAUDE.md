@@ -376,6 +376,11 @@ elegir la cuota de una disciplina — el backend además lo valida.
 - **Un reembolso deja la fila `Anulado`**, conservando `paid_at` y `method` (la plata entró y
   salió: los reportes restan el egreso en el mes de `refunded_at`). `lib/refunds.ts`; un
   reembolso fallido se reintenta cada 15 minutos o se resuelve a mano (`/api/transactions`).
+- **Pago duplicado** (la misma preferencia pagada dos veces): no se vuelca en la liquidación; queda
+  un `Refund` con `mp_payment_id` del duplicado, clave `duplicado:{id}`, `payment_id` null e
+  `income_reversal` false, y sale por `reembolsarItem` como cualquier reembolso (reintento y
+  "Problemas de pagos" incluidos). Sin efectos: fila `Pagado`, liquidación y reserva no se tocan
+  (`efectosDeReembolso`). `NULL` en `Refund.mp_payment_id` = el pago de la liquidación.
 - **`Payment.concept` es FK a `charge_types.key`**: los tipos (`Reserva`, `Disciplina`, `Socio`
   son de sistema) y las plantillas recurrentes viven en `/api/charge-types` y
   `/api/recurring-templates`. `lib/emission.ts` emite el ciclo vigente; es idempotente por `ref`.

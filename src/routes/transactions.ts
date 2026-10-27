@@ -48,6 +48,7 @@ transactionsRouter.get("/problemas", requireAdmin, async (_req: Request, res: Re
           last_error: true,
           created_at: true,
           updated_at: true,
+          mp_payment_id: true,
           transaction: { select: { mp_payment_id: true } },
           payment: { select: { id: true, name: true, concept: true, user: { select: { name: true, last_name: true } } } },
         },
@@ -71,7 +72,8 @@ transactionsRouter.get("/problemas", requireAdmin, async (_req: Request, res: Re
       reembolsos: reembolsos.map((r) => ({
         id: r.id,
         liquidacion_id: r.transaction_id,
-        mp_payment_id: r.transaction.mp_payment_id,
+        // Un duplicado se devuelve por su propio pago, no por el de la liquidación.
+        mp_payment_id: r.mp_payment_id ?? r.transaction.mp_payment_id,
         monto: r.amount.toFixed(2),
         estado: r.status,
         motivo: r.reason,
