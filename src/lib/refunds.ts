@@ -55,6 +55,11 @@ export interface ReembolsoOpts {
   persona?: boolean;
   /** El llamador acaba de insertar el `pending` (aplicarPagoMP): no esperar a que envejezca. */
   propio?: boolean;
+  /**
+   * Pago duplicado de la misma preferencia: se devuelve ESE pago (no el de la liquidación), entero,
+   * con clave `duplicado:{id}`, y no toca filas, reserva ni estado de la liquidación.
+   */
+  duplicado?: { mpPaymentId: string; monto: string | number };
 }
 
 const esDuplicado = (e: unknown) => (e as { code?: string } | null)?.code === "P2002";
@@ -85,18 +90,20 @@ async function anularFilaReembolsada(
 /**
  * Efectos de contabilidad de un reembolso aprobado, dentro de la transacción del llamador:
  * la fila y la reserva (`anularFilaReembolsada`) y el estado de la liquidación
- * (`Reembolsado` si ya salió todo).
+ * (`Reembolsado` si ya salió todo). Un pago duplicado (`mp_payment_id` seteado) no tiene efectos:
+ * la liquidación y su cobro legítimo siguen como están.
  */
 export async function efectosDeReembolso(
   tx: Prisma.TransactionClient,
-  r: { transaction_id: string; payment_id: string | null; income_reversal: boolean },
+  r: { transaction_id: string; payment_id: string | null; income_reversal: boolean; mp_payment_id?: string | null },
   actor: string,
   motivo: string,
 ) {
+  if (r.mp_payment_id) return;
   await anularFilaReembolsada(tx, r, actor, motivo);
   const liq = await tx.paymentTransaction.findUnique({ where: { id: r.transaction_id }, select: { amount: true } });
   const { _sum } = await tx.refund.aggregate({
-    where: { transaction_id: r.transaction_id, status: "approved" },
+    where: { transaction_id: r.transaction_id, status: "approved", mp_payment_id: null },
     _sum: { amount: true },
   });
   const estado: TransactionStatus =
@@ -129,7 +136,7 @@ export async function aprobarReembolso(
     if (count === 0) return false;
     const r = await tx.refund.findUniqueOrThrow({
       where: { id: refundId },
-      select: { transaction_id: true, payment_id: true, income_reversal: true },
+      select: { transaction_id: true, payment_id: true, income_reversal: true, mp_payment_id: true },
     });
     await efectosDeReembolso(tx, r, datos.actor, datos.motivo);
     return true;
@@ -150,8 +157,10 @@ export async function reembolsarItem(o: ReembolsoOpts): Promise<ResultadoReembol
   }
   const item = o.filaId ? liq.items.find((i) => i.payment_id === o.filaId) : null;
   if (o.filaId && !item) throw Object.assign(new Error("fila-fuera-de-la-liquidacion"), { code: "NOT_ITEM" });
-  const monto = item ? item.amount : liq.amount;
-  const key = `reembolso:${liq.id}:${o.filaId ?? "total"}`;
+  const monto = o.duplicado?.monto ?? (item ? item.amount : liq.amount);
+  const key = o.duplicado ? `duplicado:${o.duplicado.mpPaymentId}` : `reembolso:${liq.id}:${o.filaId ?? "total"}`;
+  // El pago a devolver: el duplicado, o el que saldó la liquidación.
+  const mpPaymentId = o.duplicado?.mpPaymentId ?? liq.mp_payment_id;
 
   let refund: { id: number; status: string; updated_at: Date };
   try {
@@ -169,6 +178,7 @@ export async function reembolsarItem(o: ReembolsoOpts): Promise<ResultadoReembol
         requested_by: o.actor,
         income_reversal: fila?.status === "Pagado",
         idempotency_key: key,
+        mp_payment_id: o.duplicado?.mpPaymentId ?? null,
       },
       select: { id: true, status: true, updated_at: true },
     });
@@ -201,7 +211,7 @@ export async function reembolsarItem(o: ReembolsoOpts): Promise<ResultadoReembol
   try {
     // Sin `amount` cuando es todo lo que queda de la liquidación.
     const todo = !item || centavos(monto) === centavos(liq.amount);
-    const res = await refundPayment(liq.mp_payment_id, key, todo ? undefined : Number(monto));
+    const res = await refundPayment(mpPaymentId, key, todo ? undefined : Number(monto));
     // Si devuelve false otro proceso (conciliación) ya lo aprobó: el resultado es el mismo.
     await aprobarReembolso(refund.id, {
       mpRefundId: res?.id !== undefined && res?.id !== null ? String(res.id) : null,
@@ -219,7 +229,7 @@ export async function reembolsarItem(o: ReembolsoOpts): Promise<ResultadoReembol
     });
     // Se loguea el resumen seguro, no el error de MP (su cuerpo puede traer datos del pagador).
     logger.error(new Error(lastError), "Reembolso de Mercado Pago falló", {
-      metadata: { liquidacion_id: liq.id, payment_id: o.filaId, refund_id: refund.id, rechazado },
+      metadata: { liquidacion_id: liq.id, payment_id: o.filaId, mp_payment_id: mpPaymentId, refund_id: refund.id, rechazado },
     });
     if (rechazado) {
       logger.audit(
@@ -245,7 +255,7 @@ export async function reintentarReembolsos(limite = 20): Promise<number> {
     },
     orderBy: { created_at: "asc" },
     take: limite,
-    select: { transaction_id: true, payment_id: true, reason: true, requested_by: true },
+    select: { transaction_id: true, payment_id: true, reason: true, requested_by: true, amount: true, mp_payment_id: true },
   });
   let aprobados = 0;
   for (const c of candidatos) {
@@ -255,6 +265,7 @@ export async function reintentarReembolsos(limite = 20): Promise<number> {
         filaId: c.payment_id,
         motivo: c.reason ?? "reintento",
         actor: c.requested_by,
+        duplicado: c.mp_payment_id ? { mpPaymentId: c.mp_payment_id, monto: c.amount.toString() } : undefined,
       });
       if (r.estado === "approved") aprobados++;
     } catch (error) {

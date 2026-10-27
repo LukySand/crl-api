@@ -1,7 +1,7 @@
 /**
  * Hold de reservas pagadas en el acto (D14).
  *
- * La reserva de la app de socio nace `Pendiente` y retiene el turno mientras paga con MP.
+ * La reserva de la app de socio nace `Pendiente` con `hold_until` y retiene el turno mientras paga con MP.
  * `liberarReservasVencidas` la suelta al vencer el plazo; `resolverReserva` la retoma si el
  * pago aprobado llega tarde (lo llama `aplicarPagoMP`).
  */
@@ -9,52 +9,84 @@ import { Prisma } from "../../prisma/generated/client";
 import prisma from "./prisma";
 import { logger } from "./logger";
 import { bloqueoQueCierra } from "./schedule-block-db";
-import { corteHoldReservas, hayTiempoParaPagar, timeToHHMM } from "./booking-date";
+import { debeCancelarseSinPagar, hayTiempoParaPagar, parseDate, timeToHHMM, todayInClub } from "./booking-date";
+import { getAjustes } from "./settings-db";
 import { reembolsarItem } from "./refunds";
 import { esConflictoDeEscritura } from "./settlement";
 
 const MOTIVO_VENCIDA = "Venció el plazo para pagar la reserva";
+const MOTIVO_SIN_PAGAR = "No se pagó antes del límite para cancelar";
 
 /**
- * Suelta las reservas `Pendiente` y `active` creadas antes del corte que tienen una liquidación
- * de MP (las de mostrador no se tocan): reserva `Cancelada` + `active NULL` y fila `Pendiente →
- * Anulado` (`resolved_by "sistema"`), en una transacción guardada por el estado de la fila.
+ * Suelta una reserva: reserva `Cancelada` + `active NULL` y fila `Pendiente → Anulado`
+ * (`resolved_by "sistema"`), en una transacción guardada por el estado de la fila.
+ * @returns `false` si la fila ya no estaba `Pendiente` (el webhook la saldó) o perdió la carrera.
+ */
+async function soltarReserva(bookingId: string, motivo: string): Promise<boolean> {
+  try {
+    return await prisma.$transaction(async (tx) => {
+      // La guarda es la fila: si el webhook la saldó entre la lectura y acá, no se suelta nada.
+      const { count } = await tx.payment.updateMany({
+        where: { booking_id: bookingId, status: "Pendiente" },
+        data: { status: "Anulado", resolved_by: "sistema", resolved_reason: motivo, resolved_at: new Date() },
+      });
+      if (count === 0) return false;
+      await tx.booking.updateMany({
+        where: { id: bookingId, status: "Pendiente", active: true },
+        data: { status: "Cancelada", active: null },
+      });
+      return true;
+    });
+  } catch (error) {
+    // Perdió contra otro proceso (webhook): la próxima pasada lo ve resuelto.
+    if (!esConflictoDeEscritura(error)) logger.error(error, "Liberar reserva vencida falló", { metadata: { booking_id: bookingId } });
+    return false;
+  }
+}
+
+/**
+ * Suelta las reservas sin pagar que ya vencieron, de dos clases:
+ * - con hold (`hold_until` vencido): las pagadas en el acto con MP, a los 5 minutos;
+ * - sin hold (`hold_until` NULL): las asignadas por la gestión, al pasar el límite para
+ *   cancelar (`debeCancelarseSinPagar`). Su fila sigue `Pendiente` y el socio la puede pagar
+ *   hasta entonces.
  * Nunca lanza: la llaman el cron y `GET /availability`.
  * @returns cuántas reservas liberó.
  */
 export async function liberarReservasVencidas(): Promise<number> {
   let liberadas = 0;
   try {
-    const vencidas = await prisma.booking.findMany({
+    const ahora = new Date();
+    const conHold = await prisma.booking.findMany({
       where: {
         status: "Pendiente",
         active: true,
-        created_at: { lt: corteHoldReservas() },
-        payment: { is: { status: "Pendiente", items: { some: { transaction: { method: "MercadoPago" } } } } },
+        hold_until: { lt: ahora },
+        payment: { is: { status: "Pendiente" } },
       },
       select: { id: true },
       take: 200,
     });
-    for (const b of vencidas) {
-      try {
-        const ok = await prisma.$transaction(async (tx) => {
-          // La guarda es la fila: si el webhook la saldó entre la lectura y acá, no se suelta nada.
-          const { count } = await tx.payment.updateMany({
-            where: { booking_id: b.id, status: "Pendiente" },
-            data: { status: "Anulado", resolved_by: "sistema", resolved_reason: MOTIVO_VENCIDA, resolved_at: new Date() },
-          });
-          if (count === 0) return false;
-          await tx.booking.updateMany({
-            where: { id: b.id, status: "Pendiente", active: true },
-            data: { status: "Cancelada", active: null },
-          });
-          return true;
-        });
-        if (ok) liberadas++;
-      } catch (error) {
-        // Perdió contra otro proceso (webhook): la próxima pasada lo ve resuelto.
-        if (!esConflictoDeEscritura(error)) logger.error(error, "Liberar reserva vencida falló", { metadata: { booking_id: b.id } });
-      }
+    for (const b of conHold) if (await soltarReserva(b.id, MOTIVO_VENCIDA)) liberadas++;
+
+    const { cancel_hours_before: horas } = await getAjustes();
+    // Pre-filtro por fecha (el resto lo decide la regla pura): sólo cuentan turnos de hoy a unos días.
+    const hasta = parseDate(todayInClub());
+    hasta.setUTCDate(hasta.getUTCDate() + Math.ceil(horas / 24) + 1);
+    const sinHold = await prisma.booking.findMany({
+      where: {
+        status: "Pendiente",
+        active: true,
+        hold_until: null,
+        date: { lte: hasta },
+        payment: { is: { status: "Pendiente", deleted_at: null } },
+      },
+      select: { id: true, date: true, created_at: true, schedule: { select: { start_time: true } } },
+      take: 200,
+    });
+    for (const b of sinHold) {
+      if (!debeCancelarseSinPagar(b.date, b.schedule.start_time, b.created_at, ahora, horas)) continue;
+      if (await soltarReserva(b.id, MOTIVO_SIN_PAGAR)) liberadas++;
     }
   } catch (error) {
     logger.error(error, "Barrido de reservas vencidas falló");

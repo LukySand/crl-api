@@ -70,7 +70,7 @@ async function aprobar(liqId: string, monto: number) {
 
 /** Retrocede el reloj de la reserva: como si hubieran pasado más de 5 minutos. */
 const envejecer = (bookingId: string) =>
-  prisma.booking.update({ where: { id: bookingId }, data: { created_at: new Date(Date.now() - 6 * 60_000) } });
+  prisma.booking.update({ where: { id: bookingId }, data: { hold_until: new Date(Date.now() - 60_000) } });
 
 test("el socio reserva y paga en el acto: reserva y fila Pendiente, liquidacion MP con vencimiento a 5 minutos y checkout_url", async () => {
   const { bookingId, liqId, fila } = await reservaConHold();
@@ -84,8 +84,9 @@ test("el socio reserva y paga en el acto: reserva y fila Pendiente, liquidacion 
   expect(minutos).toBeGreaterThan(4);
   expect(minutos).toBeLessThanOrEqual(5);
   expect(liq.checkout_url).toContain("mp.test/checkout/");
-  // MP no acepta vigencias de minutos: la preferencia sale sin `expires`.
-  expect(stub.preferencias.at(-1)?.expires).toBeUndefined();
+  // El link vence junto con el hold.
+  expect(stub.preferencias.at(-1)?.expires).toBe(true);
+  expect(stub.preferencias.at(-1)?.expiration_date_to).toBe(liq.expires_at!.toISOString());
   expect(stub.preferencias.at(-1)?.external_reference).toBe(liqId);
 });
 
@@ -145,7 +146,6 @@ test("el hold vencido se libera: reserva Cancelada, fila Anulado por el sistema,
     body: { schedule_id: t2.schedule.id, date: FECHA, user_id: otroSocio.id },
   });
   await envejecer(c.bookingId);
-  await envejecer(mostrador.body.booking.id);
 
   expect(await liberarReservasVencidas()).toBeGreaterThanOrEqual(1);
   expect(await prisma.booking.findUniqueOrThrow({ where: { id: c.bookingId } })).toMatchObject({ status: "Cancelada", active: null });

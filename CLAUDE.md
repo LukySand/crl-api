@@ -455,6 +455,11 @@ elegir la cuota de una disciplina — el backend además lo valida.
 - **Un reembolso deja la fila `Anulado`**, conservando `paid_at` y `method` (la plata entró y
   salió: los reportes restan el egreso en el mes de `refunded_at`). `lib/refunds.ts`; un
   reembolso fallido se reintenta cada 15 minutos o se resuelve a mano (`/api/transactions`).
+- **Pago duplicado** (la misma preferencia pagada dos veces): no se vuelca en la liquidación; queda
+  un `Refund` con `mp_payment_id` del duplicado, clave `duplicado:{id}`, `payment_id` null e
+  `income_reversal` false, y sale por `reembolsarItem` como cualquier reembolso (reintento y
+  "Problemas de pagos" incluidos). Sin efectos: fila `Pagado`, liquidación y reserva no se tocan
+  (`efectosDeReembolso`). `NULL` en `Refund.mp_payment_id` = el pago de la liquidación.
 - **`Payment.concept` es FK a `charge_types.key`**: los tipos (`Reserva`, `Disciplina`, `Socio`
   son de sistema) y las plantillas recurrentes viven en `/api/charge-types` y
   `/api/recurring-templates`. `lib/emission.ts` emite el ciclo vigente; es idempotente por `ref`.
@@ -465,6 +470,11 @@ elegir la cuota de una disciplina — el backend además lo valida.
 - **Mercado Pago:** `lib/mercadopago.ts` (cliente), `lib/payment-sync.ts` (webhook + conciliación;
   `syncPendingPayments` también se llama al leer la cuenta del socio). Variables `MP_*` en
   `.env.example`; sin `MP_ACCESS_TOKEN` el checkout responde 502 y el resto anda.
+- **Reservas sin pagar:** sólo la pagada en el acto con MP lleva `Booking.hold_until` (5 minutos);
+  la asignada por la gestión nace `Pendiente` sin plazo propio, el socio la paga desde
+  `POST /api/bookings/:id/checkout` (que crea el pago si no hay uno vivo) y `liberarReservasVencidas`
+  la cancela al pasar el límite para cancelar (`cancel_hours_before`), salvo que haya nacido ya
+  dentro de esa ventana (`debeCancelarseSinPagar`).
 - **Scheduler** (`lib/scheduler.ts`): emisión diaria, conciliación y reintento de reembolsos cada
   15 minutos, y liberación de reservas sin pagar cada minuto. `DISABLE_CRON=true` lo apaga
   (tests, segunda instancia).

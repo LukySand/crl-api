@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import prisma from "../lib/prisma";
 import { verifySignature, getPayment, MercadoPagoError } from "../lib/mercadopago";
-import { aplicarPagoMP, LIQ_SELECT } from "../lib/payment-sync";
+import { aplicarPagoMP, devolverDuplicados, LIQ_SELECT } from "../lib/payment-sync";
 import { logger } from "../lib/logger";
 
 export const webhooksRouter = Router();
@@ -49,6 +49,9 @@ webhooksRouter.post("/mercadopago", async (req: Request, res: Response) => {
     }
 
     const aplicado = await aplicarPagoMP(mp, liq);
+    // Con cualquier notificación de la preferencia se devuelven los otros pagos aprobados: la del
+    // duplicado puede no llegar nunca. Si falla, 500 y MP reintenta.
+    await devolverDuplicados(liq.id, String(mp?.id ?? dataId));
     if (aplicado === null) return res.status(200).json({ ok: true, stale: true });
     return res.status(200).json({ ok: true });
   } catch (error) {
