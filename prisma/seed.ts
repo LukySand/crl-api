@@ -1098,7 +1098,6 @@ async function seedChargeTypes() {
     { key: "Disciplina", name: "Cuota de disciplina", system: true, due_rule: "DiaDelMes" as const },
     { key: "Socio", name: "Cuota social", system: true, due_rule: "DiaDelMes" as const },
     { key: "Inscripcion", name: "Inscripción", system: false, due_rule: "Ninguna" as const },
-    { key: "Buffet", name: "Buffet", system: false, due_rule: "Ninguna" as const },
     { key: "Otro", name: "Otro", system: false, due_rule: "Ninguna" as const },
   ];
   for (const t of tipos) {
@@ -1119,7 +1118,6 @@ async function seedTemplates() {
     if (!existe) await prisma.recurringTemplate.create({ data: t });
   }
   const sueltos = [
-    { ref: "seed:suelto:buffet", concept: "Buffet", name: "Buffet - torneo", amount: 3500 },
     { ref: "seed:suelto:inscripcion", concept: "Inscripcion", name: "Inscripción torneo de verano", amount: 8000 },
   ];
   for (const c of sueltos) {
