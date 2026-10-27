@@ -15,7 +15,8 @@ import {
   dentroDeVentanaCancelacion,
   MINUTOS_PARA_PAGAR_RESERVA,
   hayTiempoParaPagar,
-  corteHoldReservas,
+  debeCancelarseSinPagar,
+  limiteDeCancelacion,
 } from "./booking-date";
 
 test("parsea en UTC, sin correrse por el huso del server", () => {
@@ -174,7 +175,14 @@ test("hayTiempoParaPagar con 0 minutos sólo pide que el inicio siga en el futur
   expect(hayTiempoParaPagar(LUNES, T19, enClub("2026-08-10T19:01"), 0)).toBe(false);
 });
 
-test("corteHoldReservas es ahora menos 5 minutos", () => {
-  const ahora = new Date("2026-08-10T12:00:00Z");
-  expect(corteHoldReservas(ahora).toISOString()).toBe("2026-08-10T11:55:00.000Z");
+test("limiteDeCancelacion resta las horas al inicio en el huso del club", () => {
+  expect(limiteDeCancelacion(LUNES, T19, 10).toISOString()).toBe("2026-08-10T12:00:00.000Z");
+});
+
+test("debeCancelarseSinPagar: antes de la ventana no; pasada la ventana y creada antes sí; creada dentro no", () => {
+  const creada = enClub("2026-08-05T10:00");
+  expect(debeCancelarseSinPagar(LUNES, T19, creada, enClub("2026-08-10T08:59"), 10)).toBe(false);
+  expect(debeCancelarseSinPagar(LUNES, T19, creada, enClub("2026-08-10T09:01"), 10)).toBe(true);
+  const creadaAdentro = enClub("2026-08-10T15:00");
+  expect(debeCancelarseSinPagar(LUNES, T19, creadaAdentro, enClub("2026-08-10T16:00"), 10)).toBe(false);
 });

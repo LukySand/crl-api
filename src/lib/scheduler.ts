@@ -43,7 +43,7 @@ export function startScheduler(): void {
     }
   });
 
-  // Hold de 5 minutos de las reservas pagadas con MP desde la app de socio (D14).
+  // Reservas sin pagar: hold de 5 minutos (pagadas en el acto con MP, D14) y límite para cancelar (asignadas por la gestión).
   Bun.cron("* * * * *", async () => {
     const n = await liberarReservasVencidas(); // nunca lanza
     if (n > 0) logger.info(`Reservas liberadas por vencer el plazo de pago: ${n}`);

@@ -386,6 +386,11 @@ elegir la cuota de una disciplina — el backend además lo valida.
 - **Mercado Pago:** `lib/mercadopago.ts` (cliente), `lib/payment-sync.ts` (webhook + conciliación;
   `syncPendingPayments` también se llama al leer la cuenta del socio). Variables `MP_*` en
   `.env.example`; sin `MP_ACCESS_TOKEN` el checkout responde 502 y el resto anda.
+- **Reservas sin pagar:** sólo la pagada en el acto con MP lleva `Booking.hold_until` (5 minutos);
+  la asignada por la gestión nace `Pendiente` sin plazo propio, el socio la paga desde
+  `POST /api/bookings/:id/checkout` (que crea el pago si no hay uno vivo) y `liberarReservasVencidas`
+  la cancela al pasar el límite para cancelar (`cancel_hours_before`), salvo que haya nacido ya
+  dentro de esa ventana (`debeCancelarseSinPagar`).
 - **Scheduler** (`lib/scheduler.ts`): emisión diaria, conciliación y reintento de reembolsos cada
   15 minutos, y liberación de reservas sin pagar cada minuto. `DISABLE_CRON=true` lo apaga
   (tests, segunda instancia).

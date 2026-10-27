@@ -351,6 +351,10 @@ model Booking {
   notes       String?       @db.Text
   created_at  DateTime      @default(now())
 
+  // Fin del hold de 5 minutos: sólo lo llevan las reservas pagadas en el acto con MP.
+  // NULL = sin plazo propio (la asignada por la gestión vence con el límite para cancelar).
+  hold_until DateTime?
+
   // ponytail: true mientras la reserva está viva (Pendiente/Confirmada), NULL
   // al cancelar. MySQL no soporta índices únicos parciales, pero sí ignora
   // NULL en índices únicos — por eso una reserva cancelada libera el turno
