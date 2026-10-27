@@ -52,6 +52,14 @@ export type LogData = {
 
 export type AuditAction = 'create'|'delete'|'update';
 
+/** `audit_action` va al final: los metadatos del llamador no pueden pisarlo. */
+export function buildAuditData(action: AuditAction, data?: LogData): LogData {
+    return {
+        ...data,
+        metadata: { ...data?.metadata, "audit_action": action },
+    };
+}
+
 export class Logger {
     private readonly buffer: LogEntry[] = [];
     private flushing: boolean = false
@@ -65,14 +73,8 @@ export class Logger {
      * Logs an audit log event.
      */
     public audit(action: AuditAction, data?: LogData, message?: string): void {
-        const logData: LogData = {
-            metadata: {
-                "audit_action": action,
-                ...data?.metadata ?? {},
-            },
-            ...data ?? {}
-        }
-        
+        const logData = buildAuditData(action, data);
+
         this.log('INFO', message ?? '', 'audit', null, null, logData)
     }
 
@@ -113,6 +115,15 @@ export class Logger {
         if(this.buffer.length >= MAX_BATCH_SIZE) {
             this.flushBuffer();
         }
+    }
+
+    /**
+     * Vacía el buffer ahora y espera a que termine (tests y cierres ordenados).
+     * Si ya hay un flush en curso espera a ese y después vacía lo que quedó.
+     */
+    public async flush(): Promise<void> {
+        while (this.flushing) await new Promise((r) => setTimeout(r, 5));
+        await this.flushBuffer();
     }
 
     private async flushBuffer(): Promise<void> {

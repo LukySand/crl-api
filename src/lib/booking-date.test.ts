@@ -13,6 +13,9 @@ import {
   DIAS_ADELANTE_ADMIN,
   HORAS_ANTES_CANCELAR,
   dentroDeVentanaCancelacion,
+  MINUTOS_PARA_PAGAR_RESERVA,
+  hayTiempoParaPagar,
+  corteHoldReservas,
 } from "./booking-date";
 
 test("parsea en UTC, sin correrse por el huso del server", () => {
@@ -152,4 +155,26 @@ test("sin el parámetro usa la constante de siempre", () => {
   expect(dentroDeVentanaCancelacion(LUNES, T19, ahora)).toBe(
     dentroDeVentanaCancelacion(LUNES, T19, ahora, HORAS_ANTES_CANCELAR),
   );
+});
+
+// --- Hold de reservas pagadas en el acto (D14) ------------------------------
+
+test("el hold son 5 minutos", () => {
+  expect(MINUTOS_PARA_PAGAR_RESERVA).toBe(5);
+});
+
+test("hayTiempoParaPagar: 6 minutos antes del turno alcanza, el borde de 5 es inclusivo, 4 no", () => {
+  expect(hayTiempoParaPagar(LUNES, T19, enClub("2026-08-10T18:54"))).toBe(true);
+  expect(hayTiempoParaPagar(LUNES, T19, enClub("2026-08-10T18:55"))).toBe(true);
+  expect(hayTiempoParaPagar(LUNES, T19, enClub("2026-08-10T18:56"))).toBe(false);
+});
+
+test("hayTiempoParaPagar con 0 minutos sólo pide que el inicio siga en el futuro (retome)", () => {
+  expect(hayTiempoParaPagar(LUNES, T19, enClub("2026-08-10T18:59"), 0)).toBe(true);
+  expect(hayTiempoParaPagar(LUNES, T19, enClub("2026-08-10T19:01"), 0)).toBe(false);
+});
+
+test("corteHoldReservas es ahora menos 5 minutos", () => {
+  const ahora = new Date("2026-08-10T12:00:00Z");
+  expect(corteHoldReservas(ahora).toISOString()).toBe("2026-08-10T11:55:00.000Z");
 });

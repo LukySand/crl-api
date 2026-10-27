@@ -7,7 +7,8 @@
  * por qué medio entró la plata.
  *
  * Los totales filtran por `paid_at` (cuándo entró la plata) y no por `due_date`:
- * una cuota de agosto pagada en septiembre es ingreso de septiembre.
+ * una cuota de agosto pagada en septiembre es ingreso de septiembre. Un reembolso
+ * es un egreso del mes en que ocurre (`refunded_at`), no del mes del cobro (D22).
  */
 import { Router, type Request, type Response } from "express";
 import { requireAuth, requireAdmin } from "../lib/auth";
@@ -15,7 +16,7 @@ import { todayInClub } from "../lib/booking-date";
 import { BUCKETS, esBucketValido, ventanaPorDefecto } from "../lib/payment-period";
 import {
   AGRUPACIONES,
-  CONCEPTOS,
+  CONCEPTO_KEY_RE,
   DIMENSIONES,
   FECHA_RE,
   calcularIngresos,
@@ -51,10 +52,10 @@ reportsRouter.get("/ingresos", async (req: Request, res: Response) => {
         error: `group tiene que ser uno de: ${AGRUPACIONES.join(", ")}`,
       });
     }
-    if (concept !== undefined && concept !== "" && !CONCEPTOS.includes(concept as any)) {
+    if (concept !== undefined && concept !== "" && !CONCEPTO_KEY_RE.test(concept)) {
       return res.status(400).json({
         success: false,
-        error: `concept tiene que ser uno de: ${CONCEPTOS.join(", ")}`,
+        error: "concept tiene que ser la clave de un tipo de cargo",
       });
     }
     for (const [nombre, valor] of [["from", from], ["to", to]] as const) {

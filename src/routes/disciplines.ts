@@ -4,7 +4,7 @@ import prisma from "../lib/prisma";
 import { requireAuth, requireAdmin, isAdmin, hasRole } from "../lib/auth";
 import { nombresDeRoles, rolesInclude } from "../lib/roles";
 import { TIME, toTime } from "../lib/time";
-import { periodoDe } from "../lib/payment-period";
+import { periodosDesdeElMesSiguiente } from "../lib/payment-period";
 
 export const disciplinesRouter = Router();
 
@@ -315,7 +315,7 @@ disciplinesRouter.delete(
           where: {
             enrollment: { discipline_id: id },
             status: { in: ["Pendiente", "EnRevision"] },
-            period: { gt: periodoDe(baja) },
+            period: periodosDesdeElMesSiguiente(baja),
           },
           data: { status: "Anulado" },
         }),

@@ -50,6 +50,8 @@ export interface SerieExport {
 export interface SerieRespuesta {
   buckets: string[];
   series: SerieExport[];
+  /** Reembolsos por bucket (D22). Ausente: no se agrega la columna. */
+  reembolsos?: number[];
 }
 
 export interface Totales {
@@ -59,6 +61,10 @@ export interface Totales {
   cantidad_pendiente: number;
   vencido: number;
   cantidad_vencida: number;
+  /** Egresos por reembolso y neto (D22). Ausentes: el resumen no los muestra. */
+  reembolsado?: number;
+  reembolsos?: number;
+  neto?: number;
 }
 
 export interface MorosoExport {
@@ -126,10 +132,14 @@ function seccionDeSerie(
   sinElegir: string,
 ): Seccion {
   const series = filtrarSeries(respuesta.series, claves);
+  // Los reembolsos van por bucket y no por serie: con series tildadas a mano no
+  // se pueden atribuir, así que sólo se muestran (y restan) cuando va todo.
+  const reembolsos = claves === null ? respuesta.reembolsos : undefined;
   const columnas: Columna[] = [
     { encabezado: "Período", tipo: "texto", ancho: 2 },
     ...series.map((s): Columna => ({ encabezado: s.clave, tipo: "moneda", ancho: 1.5 })),
-    { encabezado: "Total", tipo: "moneda", ancho: 1.5 },
+    ...(reembolsos ? [{ encabezado: "Reembolsos", tipo: "moneda", ancho: 1.5 } as Columna] : []),
+    { encabezado: reembolsos ? "Total neto" : "Total", tipo: "moneda", ancho: 1.5 },
   ];
 
   if (series.length === 0) {
@@ -144,12 +154,16 @@ function seccionDeSerie(
 
   const filas = respuesta.buckets.map((b, i): Celda[] => {
     const montos = series.map((s) => s.puntos[i] ?? 0);
-    return [etiquetaBucket(b, bucket), ...montos, montos.reduce((t, n) => t + n, 0)];
+    const reembolsado = reembolsos?.[i] ?? 0;
+    const neto = montos.reduce((t, n) => t + n, 0) - reembolsado;
+    return [etiquetaBucket(b, bucket), ...montos, ...(reembolsos ? [reembolsado] : []), neto];
   });
+  const totalReembolsos = reembolsos?.reduce((t, n) => t + n, 0) ?? 0;
   const totales: Celda[] = [
     "Total",
     ...series.map((s) => s.total),
-    series.reduce((t, s) => t + s.total, 0),
+    ...(reembolsos ? [totalReembolsos] : []),
+    series.reduce((t, s) => t + s.total, 0) - totalReembolsos,
   ];
   return { hoja, titulo, columnas, filas, totales };
 }
@@ -185,6 +199,12 @@ export function armarReporte(entrada: {
     ],
     filas: [
       ["Cobrado", totales.cobros, totales.cobrado],
+      ...(totales.reembolsado === undefined
+        ? []
+        : [
+            ["Reembolsado", totales.reembolsos ?? 0, totales.reembolsado] as Celda[],
+            ["Ingreso neto", null, totales.neto ?? totales.cobrado - totales.reembolsado] as Celda[],
+          ]),
       ["Pendiente de cobro", totales.cantidad_pendiente, totales.pendiente],
       ["Vencido", totales.cantidad_vencida, totales.vencido],
     ],

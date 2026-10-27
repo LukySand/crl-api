@@ -6,6 +6,7 @@
  */
 import { expect, test } from "bun:test";
 import { z } from "zod";
+import { METODOS_MANUALES } from "../lib/cobro";
 
 // Espejo del createSchema de bookings.ts. Si se desincroniza, este test deja de
 // proteger nada — está acá porque el schema real no se exporta.
@@ -21,6 +22,7 @@ const createSchema = z.object({
   user_id: z.uuid("user_id inválido").optional(),
   amount: amountSchema.optional(),
   status: z.enum(["Pendiente", "Confirmada"]).optional(),
+  method: z.enum(METODOS_MANUALES).optional(),
 });
 
 const base = { schedule_id: 1, date: "2026-08-17" };
@@ -65,4 +67,11 @@ test("status sólo admite Pendiente o Confirmada, nunca Cancelada", () => {
 test("la fecha tiene que ser YYYY-MM-DD", () => {
   expect(createSchema.safeParse({ ...base, date: "17/08/2026" }).success).toBe(false);
   expect(createSchema.safeParse({ ...base, date: "2026-8-7" }).success).toBe(false);
+});
+
+test("method acepta los métodos manuales y rechaza MercadoPago", () => {
+  for (const method of METODOS_MANUALES) {
+    expect(createSchema.safeParse({ ...base, method }).success).toBe(true);
+  }
+  expect(createSchema.safeParse({ ...base, method: "MercadoPago" }).success).toBe(false);
 });
