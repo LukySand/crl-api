@@ -8,7 +8,7 @@ import prisma from "../lib/prisma";
 import { isAdmin, requireAdmin, requireAuth } from "../lib/auth";
 import { auditar } from "../lib/audit";
 import { syncPayment } from "../lib/payment-sync";
-import { PENDING_VIEJO_MS, resolverFueraDeMP, VENTANA_REINTENTO_MS } from "../lib/refunds";
+import { PENDING_VIEJO_MS, reembolsarItem, resolverFueraDeMP, VENTANA_REINTENTO_MS } from "../lib/refunds";
 import { logger } from "../lib/logger";
 
 export const transactionsRouter = Router();
@@ -139,6 +139,54 @@ transactionsRouter.post("/refunds/:id/resolver", requireAdmin, async (req: Reque
   } catch (error) {
     console.error("Resolve refund error:", error);
     return res.status(500).json({ success: false, error: "Error al resolver el reembolso" });
+  }
+});
+
+/**
+ * POST /api/transactions/refunds/:id/reintentar — la gestión reintenta a mano un reembolso
+ * `failed`/`rejected` (o un `pending` abandonado), tenga o no `payment_id` (duplicados y monto
+ * inconsistente no lo tienen). Re-ejecuta la MISMA fila con su clave de idempotencia: nunca crea otra.
+ * 404 si no existe; 409 si está aprobado, resuelto o en curso; 502 si MP vuelve a fallar.
+ */
+transactionsRouter.post("/refunds/:id/reintentar", requireAdmin, async (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    const refund = Number.isInteger(id) && id >= 1
+      ? await prisma.refund.findUnique({
+          where: { id },
+          select: { status: true, transaction_id: true, payment_id: true, amount: true, reason: true, mp_payment_id: true },
+        })
+      : null;
+    if (!refund) return res.status(404).json({ success: false, error: "Reembolso no encontrado" });
+    if (refund.status === "approved" || refund.status === "resolved_offline") {
+      return res.status(409).json({ success: false, error: "Ese reembolso ya está aprobado o resuelto" });
+    }
+    const r = await reembolsarItem({
+      transaccionId: refund.transaction_id,
+      filaId: refund.payment_id,
+      motivo: refund.reason ?? "reintento",
+      actor: req.user!.id,
+      persona: true,
+      duplicado: refund.mp_payment_id ? { mpPaymentId: refund.mp_payment_id, monto: refund.amount.toString() } : undefined,
+    });
+    auditar(req, "update", "refund", id, { despues: { operacion: "reembolso.reintentar", estado: r.estado } });
+    if (r.estado === "approved") return res.json({ success: true, reembolso: { id, estado: "aprobado" } });
+    if (r.estado === "en_curso" || r.estado === "ya_reembolsado" || r.estado === "resuelto") {
+      const error = {
+        en_curso: "Hay un reembolso en curso",
+        ya_reembolsado: "Ese reembolso ya está aprobado o resuelto",
+        resuelto: "Ese reembolso ya está aprobado o resuelto",
+      }[r.estado];
+      return res.status(409).json({ success: false, error });
+    }
+    return res.status(502).json({
+      success: false,
+      error: "Mercado Pago no pudo procesar el reembolso",
+      reembolso: { id, estado: r.estado },
+    });
+  } catch (error) {
+    console.error("Retry refund error:", error);
+    return res.status(500).json({ success: false, error: "Error al reintentar el reembolso" });
   }
 });
 

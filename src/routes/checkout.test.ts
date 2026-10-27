@@ -310,6 +310,35 @@ test("pago duplicado: 4xx queda rejected, no se reintenta solo y una persona lo 
   expect(await liqDe(liqId)).toMatchObject({ status: "Aprobado", mp_payment_id: mpId });
 });
 
+test("pago duplicado rechazado: la gestion lo reintenta por /refunds/:id/reintentar contra el DUPLICADO, misma clave", async () => {
+  const { fila, liqId, mpId } = await checkoutDeUna();
+  const admin = await makeUser({ roles: ["Administrador"] });
+  const dup = `${mpId}-dup`;
+  pagoMP(mpId, liqId);
+  await webhook(mpId);
+  pagoMP(dup, liqId);
+  stub.fallarReembolsos(400, { error: "bad_request" });
+  try {
+    expect(await webhook(dup)).toBe(200);
+  } finally {
+    stub.fallarReembolsos(null);
+  }
+  const clave = `duplicado:${dup}`;
+  const refund = await prisma.refund.findUniqueOrThrow({ where: { idempotency_key: clave } });
+  expect(refund.status).toBe("rejected");
+  const antes = await liqDe(liqId);
+
+  const r = await api("POST", `/api/transactions/refunds/${refund.id}/reintentar`, { token: admin.token });
+  expect(r.status).toBe(200);
+  expect(reembolsosDe(mpId)).toEqual([]);
+  expect(reembolsosDe(dup).map((x) => x.key)).toEqual([clave, clave]);
+  expect(await prisma.refund.findUniqueOrThrow({ where: { id: refund.id } })).toMatchObject({ status: "approved" });
+  expect(await prisma.refund.count({ where: { transaction_id: liqId } })).toBe(1);
+  expect(await liqDe(liqId)).toMatchObject({ status: "Aprobado", mp_payment_id: mpId, raw: antes?.raw });
+  expect((await prisma.payment.findUnique({ where: { id: fila.id } }))?.status).toBe("Pagado");
+  expect((await api("POST", `/api/transactions/refunds/${refund.id}/reintentar`, { token: admin.token })).status).toBe(409);
+});
+
 test("pago duplicado: si MP avisa que ya lo devolvio, no se concilia contra el cobro legitimo", async () => {
   const { fila, liqId, mpId } = await checkoutDeUna();
   const dup = `${mpId}-dup`;
