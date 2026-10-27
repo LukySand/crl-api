@@ -19,6 +19,7 @@ import { settingsRouter } from "./routes/settings";
 import { transactionsRouter } from "./routes/transactions";
 import { webhooksRouter } from "./routes/webhooks";
 import { chargeTypesRouter, recurringTemplatesRouter } from "./routes/charge-catalog";
+import { sponsorsRouter } from "./routes/sponsors";
 
 // ponytail: sin listen ni cron, así los tests montan la app en un puerto libre.
 export function createApp() {
@@ -50,5 +51,6 @@ export function createApp() {
   app.use("/api/recurring-templates", recurringTemplatesRouter);
   app.use("/api/transactions", transactionsRouter);
   app.use("/api/webhooks", webhooksRouter);
+  app.use("/api/sponsors", sponsorsRouter);
   return app;
 }
