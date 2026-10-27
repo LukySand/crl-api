@@ -163,3 +163,31 @@ describe("escritores", () => {
     expect(buffer.subarray(0, 5).toString()).toBe("%PDF-");
   });
 });
+
+describe("reembolsos en el export (D22)", () => {
+  const conReembolsos = { ...canchas, reembolsos: [500, 0] };
+
+  test("columna Reembolsos y total neto cuando van todas las series", () => {
+    const { columnas, filas, totales } = armarReporte(entrada({ canchas: conReembolsos })).secciones[1]!;
+    expect(columnas.map((c) => c.encabezado)).toEqual(["Período", "Cancha 1", "Cancha 2", "Reembolsos", "Total neto"]);
+    expect(filas).toEqual([
+      ["Agosto 2026", 2000, 0, 500, 1500],
+      ["Septiembre 2026", 3000, 1000, 0, 4000],
+    ]);
+    expect(totales).toEqual(["Total", 5000, 1000, 500, 5500]);
+  });
+
+  test("con series tildadas a mano no se atribuyen los reembolsos", () => {
+    const { columnas } = armarReporte(entrada({ canchas: conReembolsos, canchasElegidas: ["Cancha 1"] })).secciones[1]!;
+    expect(columnas.map((c) => c.encabezado)).toEqual(["Período", "Cancha 1", "Total"]);
+  });
+
+  test("el resumen suma reembolsado e ingreso neto sólo si vienen", () => {
+    const totales = { ...entrada().totales, reembolsado: 500, reembolsos: 1, neto: 9500 };
+    expect(armarReporte(entrada({ totales })).secciones[0]!.filas.slice(0, 3)).toEqual([
+      ["Cobrado", 7, 10000],
+      ["Reembolsado", 1, 500],
+      ["Ingreso neto", null, 9500],
+    ]);
+  });
+});

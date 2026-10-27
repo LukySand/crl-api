@@ -23,7 +23,22 @@ import {
   palabrasDeBusqueda,
   type QuienCobra,
 } from "../lib/cobro";
-import { refDisciplina, serializePayment, serializePayments } from "../lib/payment";
+import { auditar } from "../lib/audit";
+import { accionesPermitidas, CONCEPTO_CUOTA_SOCIAL, estadoCuota, type Accion } from "../lib/payment-rules";
+import {
+  crearLiquidacionMP,
+  esConflictoDeEscritura,
+  liquidacionViva,
+  PagoEnCurso,
+  puedePagarPor,
+  registrarCobroManual,
+  verificarOrdenDePago,
+} from "../lib/settlement";
+import { accessToken, createPreference } from "../lib/mercadopago";
+import { reembolsarItem } from "../lib/refunds";
+import type { PaymentMethod, PaymentStatus, Prisma, TransactionStatus } from "../../prisma/generated/client";
+import { emitirCargos } from "../lib/emission";
+import { refUnico, serializePayment, serializePayments, toNumber } from "../lib/payment";
 import {
   cursoEnPeriodo,
   esPeriodoValido,
@@ -102,12 +117,57 @@ const generateSchema = z.object({
   period: periodoSchema.default(() => periodoActual()),
 });
 
-const updateSchema = z.object({
-  // "confirmar" cobra, "rechazar" devuelve a Pendiente, "anular" da de baja la deuda.
-  action: z.enum(["confirmar", "rechazar", "anular"]),
-  method: z.enum(["Efectivo", "Transferencia", "MercadoPago"]).optional(),
-  notes: z.string().max(1000).optional(),
+// Filtros validados de GET /api/payments. El resto (status, concept, q, page…) se lee crudo.
+const listQuerySchema = z.object({
+  period: periodoSchema.optional(),
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "from debe ser YYYY-MM-DD").optional(),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "to debe ser YYYY-MM-DD").optional(),
+  estado: z.literal("vencida", "estado sólo admite 'vencida'").optional(),
+  discipline_id: z.coerce.number().int().positive("discipline_id debe ser un entero positivo").optional(),
+  method: z.enum(["Efectivo", "Transferencia", "MercadoPago", "MPFueraDeApp", "TarjetaConPosnet"], "method inválido").optional(),
 });
+
+const motivo = z.string().trim().min(3).max(500);
+const fechaIso = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Fecha YYYY-MM-DD");
+
+// `confirmar`/`rechazar` ya no existen (D23): el cobro va por /cobro. Unión discriminada
+// y estricta: cualquier otra acción o campo suelto es 400.
+const updateSchema = z.discriminatedUnion("action", [
+  z.object({ action: z.literal("anular"), reason: motivo }).strict(),
+  z.object({ action: z.literal("condonar"), reason: motivo }).strict(),
+  z
+    .object({
+      action: z.literal("editar"),
+      due_date: fechaIso.nullable().optional(),
+      amount: z.number().min(0.01).max(99_999_999.99).optional(),
+      name: z.string().trim().min(1).max(120).optional(),
+      // null o "" borran la descripción.
+      description: z
+        .string()
+        .max(2000)
+        .nullable()
+        .optional()
+        .transform((d) => (d === "" ? null : d)),
+    })
+    .strict()
+    .refine((b) => b.due_date !== undefined || b.amount !== undefined || b.name !== undefined || b.description !== undefined, {
+      message: "Indicá qué editar",
+    }),
+]);
+
+const deleteSchema = z.object({ reason: motivo }).strict();
+
+const createSchema = z
+  .object({
+    user_id: z.string().min(1),
+    concept: z.string().min(1).max(40),
+    name: z.string().trim().min(1).max(120).optional(),
+    description: z.string().max(2000).nullable().optional(),
+    amount: z.number().min(0.01).max(99_999_999.99).optional(),
+    due_date: fechaIso.nullable().optional(),
+    notes: z.string().max(1000).optional(),
+  })
+  .strict();
 
 const cobroSchema = z
   .object({
@@ -115,6 +175,8 @@ const cobroSchema = z
     notes: z.string().trim().max(1000).optional(),
   })
   .strict();
+
+const revertirSchema = z.object({ reason: z.string().trim().min(3).max(500) }).strict();
 
 const uploadSchema = z.object({
   file: z.instanceof(File, { message: "Falta el archivo" }),
@@ -131,31 +193,127 @@ async function readFormData(req: Request) {
   return request.formData();
 }
 
+const aDia = (d: Date | null) => (d ? d.toISOString().slice(0, 10) : null);
+
+/**
+ * Predicado único de "vencida" (D25): pendiente con vencimiento no nulo ya pasado.
+ * Lo comparten el filtro `estado=vencida` del listado y `/indicadores`.
+ * (`lt` deja afuera los NULL; las filas eliminadas son `Anulado`.)
+ */
+const whereVencida = (hoy: string): Prisma.PaymentWhereInput => ({
+  status: "Pendiente",
+  due_date: { lt: new Date(`${hoy}T00:00:00Z`) },
+});
+
+type LiqInfo = {
+  viva: boolean;
+  ultima: { method: PaymentMethod; status: TransactionStatus; con_reserva: boolean; created_at: Date } & Record<string, unknown> | null;
+};
+
+/** Última liquidación de cada fila (incluye las `Anulado`) y si alguna está viva (D8). */
+async function liquidacionesDe(ids: string[]) {
+  const out = new Map<string, LiqInfo>();
+  if (ids.length === 0) return out;
+  const items = await prisma.paymentTransactionItem.findMany({
+    where: { payment_id: { in: ids } },
+    select: {
+      payment_id: true,
+      transaction: {
+        select: {
+          id: true,
+          method: true,
+          status: true,
+          amount: true,
+          paid_at: true,
+          created_at: true,
+          expires_at: true,
+          voided_reason: true,
+          voided_at: true,
+          items: { select: { payment: { select: { concept: true } } } },
+        },
+      },
+    },
+  });
+  const ahora = Date.now();
+  for (const { payment_id, transaction: t } of items) {
+    const cur = out.get(payment_id) ?? { viva: false, ultima: null };
+    if (t.method === "MercadoPago" && t.status === "Pendiente" && t.expires_at && t.expires_at.getTime() > ahora) {
+      cur.viva = true;
+    }
+    if (!cur.ultima || t.created_at > cur.ultima.created_at) {
+      cur.ultima = {
+        id: t.id,
+        method: t.method,
+        status: t.status,
+        amount: toNumber(t.amount),
+        paid_at: t.paid_at,
+        created_at: t.created_at,
+        voided_reason: t.voided_reason,
+        voided_at: t.voided_at,
+        con_reserva: t.items.some((i) => i.payment.concept === "Reserva"),
+      };
+    }
+    out.set(payment_id, cur);
+  }
+  return out;
+}
+
+type FilaConLiq = { concept: string; status: PaymentStatus; deleted_at: Date | null };
+
+/** Acciones que la gestión puede hacer sobre la fila: misma regla que usan los endpoints. */
+function accionesDe(f: FilaConLiq, liq: LiqInfo | undefined): Accion[] {
+  return accionesPermitidas({
+    concept: f.concept,
+    status: f.status,
+    eliminado: f.deleted_at !== null,
+    liquidacion_viva: liq?.viva ?? false,
+    liquidacion: liq?.ultima ?? null,
+  });
+}
+
 /**
  * GET /api/payments — cuotas y cobros. La gestión ve todos; el resto, los propios.
  * Con `?propias=true` sólo los propios, también para gestión.
  * Filtros: ?status=Pendiente ?concept=Disciplina ?period=2026-09 ?user_id=... ?from=&to=
+ * Gestión además: ?q= (socio por nombre/apellido/DNI o nombre del cargo),
+ * ?estado=vencida (D25), ?eliminados=1 (incluye las bajas lógicas, D7),
+ * ?discipline_id= (cuotas de esa disciplina) y ?method= (cobros con ese medio de pago),
+ * ?page=&page_size= (agrega `hay_mas`; sin `page` devuelve todo, como antes),
+ * ?id= o ?ids=a,b (hasta 200 ids; también ve las bajas lógicas sólo con ?eliminados=1).
  *
  * `from`/`to` filtran por vencimiento, que es lo que le importa a un socio
  * mirando qué debe. Los reportes de ingresos filtran por fecha de cobro y viven
- * en /api/reports.
+ * en /api/reports. Cada fila trae además `estado`, `eliminado`, `tipo` y
+ * `liquidacion` (la última, incluso anulada); `acciones` sólo para gestión.
  */
 paymentsRouter.get("/", async (req: Request, res: Response) => {
   try {
-    const { status, concept, period, user_id, from, to } = req.query;
+    const { status, concept, user_id, q, eliminados, page, page_size, id, ids } = req.query;
     // Gestión ve todas salvo que pida `?propias=true` (ver veComoGestion).
     const admin = veComoGestion(req);
 
-    if (typeof period === "string" && !esPeriodoValido(period)) {
-      return res.status(400).json({ success: false, error: "El período debe ser YYYY-MM" });
+    const parsed = listQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues[0]!.message,
+        errors: formatErrors(parsed.error.issues),
+      });
     }
-    for (const [nombre, valor] of [["from", from], ["to", to]] as const) {
-      if (typeof valor === "string" && !/^\d{4}-\d{2}-\d{2}$/.test(valor)) {
-        return res
-          .status(400)
-          .json({ success: false, error: `${nombre} debe ser YYYY-MM-DD` });
-      }
-    }
+    const { period, from, to, estado, discipline_id, method } = parsed.data;
+    const paginar = typeof page === "string";
+    const nPagina = Math.max(1, Number.parseInt(String(page), 10) || 1);
+    const tamano = Math.min(200, Math.max(1, Number.parseInt(String(page_size), 10) || 50));
+    const palabras = admin ? palabrasDeBusqueda(q) : [];
+    // ?id= / ?ids=a,b (gestión): abre un cargo puntual con sus `acciones`, sin buscar por socio.
+    const porId = admin
+      ? [id, ids]
+          .flatMap((v) => (typeof v === "string" ? v.split(",") : []))
+          .map((v) => v.trim())
+          .filter(Boolean)
+          .slice(0, 200)
+      : [];
+    const hoy = todayInClub();
 
     const payments = await prisma.payment.findMany({
       where: {
@@ -163,21 +321,57 @@ paymentsRouter.get("/", async (req: Request, res: Response) => {
         ...(admin
           ? typeof user_id === "string" && { user_id }
           : { user_id: req.user!.id }),
+        // La baja lógica sólo se ve con ?eliminados=1 y sólo en el panel de gestión.
+        ...(!(admin && eliminados === "1") && { deleted_at: null }),
+        ...(estado === "vencida" && whereVencida(hoy)),
+        ...(porId.length > 0 && { id: { in: porId } }),
         ...(typeof status === "string" && { status: status as any }),
         ...(typeof concept === "string" && { concept: concept as any }),
-        ...(typeof period === "string" && { period }),
-        ...((typeof from === "string" || typeof to === "string") && {
+        ...(period !== undefined && { period }),
+        ...((from !== undefined || to !== undefined) && {
           due_date: {
-            ...(typeof from === "string" && { gte: new Date(`${from}T00:00:00Z`) }),
-            ...(typeof to === "string" && { lte: new Date(`${to}T00:00:00Z`) }),
+            ...(estado === "vencida" && { lt: new Date(`${hoy}T00:00:00Z`) }),
+            ...(from !== undefined && { gte: new Date(`${from}T00:00:00Z`) }),
+            ...(to !== undefined && { lte: new Date(`${to}T00:00:00Z`) }),
           },
         }),
+        ...(discipline_id !== undefined && { enrollment: { discipline_id } }),
+        ...(method !== undefined && { items: { some: { transaction: { method } } } }),
+        ...(palabras.length > 0 && {
+          AND: palabras.map((palabra) => ({
+            OR: [
+              { name: { contains: palabra } },
+              { user: { name: { contains: palabra } } },
+              { user: { last_name: { contains: palabra } } },
+              { user: { dni: { contains: palabra } } },
+            ],
+          })),
+        }),
       },
-      include: paymentInclude,
-      orderBy: [{ due_date: "desc" }],
+      include: { ...paymentInclude, type: { select: { key: true, name: true } } },
+      orderBy: [{ due_date: { sort: "desc", nulls: "last" } }, { created_at: "desc" }, { id: "asc" }],
+      ...(paginar && { skip: (nPagina - 1) * tamano, take: tamano + 1 }),
     });
 
-    return res.json({ success: true, payments: serializePayments(payments) });
+    const hayMas = paginar && payments.length > tamano;
+    const filas = hayMas ? payments.slice(0, tamano) : payments;
+    const liqs = await liquidacionesDe(filas.map((p) => p.id));
+
+    return res.json({
+      success: true,
+      payments: filas.map((p) => {
+        const liq = liqs.get(p.id);
+        return {
+          ...serializePayment(p),
+          estado: estadoCuota({ status: p.status, due_date: aDia(p.due_date) }, hoy),
+          eliminado: p.deleted_at !== null,
+          tipo: p.type,
+          liquidacion: liq?.ultima ?? null,
+          ...(admin && { acciones: accionesDe(p, liq) }),
+        };
+      }),
+      ...(paginar && { page: nPagina, page_size: tamano, hay_mas: hayMas }),
+    });
   } catch (error) {
     console.error("List payments error:", error);
     return res.status(500).json({ success: false, error: "Error al listar las cuotas" });
@@ -203,13 +397,13 @@ paymentsRouter.get("/resumen", async (req: Request, res: Response) => {
     const pendientes = await prisma.payment.findMany({
       where: { user_id: userId, status: { in: ["Pendiente", "EnRevision"] } },
       select: { amount: true, due_date: true, status: true },
-      orderBy: { due_date: "asc" },
+      orderBy: { due_date: { sort: "asc", nulls: "last" } },
     });
 
     const hoy = todayInClub();
     // "Vencido" se deriva acá y no se guarda: ver el comentario del modelo Payment.
     const vencidas = pendientes.filter(
-      (p) => p.due_date.toISOString().slice(0, 10) < hoy,
+      (p) => p.due_date != null && p.due_date.toISOString().slice(0, 10) < hoy,
     );
 
     const sumar = (filas: { amount: unknown }[]) =>
@@ -224,7 +418,7 @@ paymentsRouter.get("/resumen", async (req: Request, res: Response) => {
         cantidad_vencida: vencidas.length,
         // El vencimiento más próximo sin pagar. Reemplaza al "next_due_date" que
         // no se guarda en la fila: como consulta nunca queda desactualizado.
-        proximo_vencimiento: pendientes[0]?.due_date ?? null,
+        proximo_vencimiento: pendientes.find((p) => p.due_date)?.due_date ?? null,
       },
     });
   } catch (error) {
@@ -234,7 +428,86 @@ paymentsRouter.get("/resumen", async (req: Request, res: Response) => {
 });
 
 /**
- * POST /api/payments/generate — genera las cuotas de disciplina de un período.
+ * GET /api/payments/indicadores — cuotas sociales vencidas y socios afectados (D25).
+ * Sólo gestión. Misma consulta que el filtro `?concept=Socio&estado=vencida`, así que
+ * el contador y el listado enlazado no pueden discrepar. Va antes de "/:id".
+ */
+paymentsRouter.get("/indicadores", requireAdmin, async (_req: Request, res: Response) => {
+  try {
+    const grupos = await prisma.payment.groupBy({
+      by: ["user_id"],
+      where: { ...whereVencida(todayInClub()), concept: CONCEPTO_CUOTA_SOCIAL, deleted_at: null },
+      _count: { _all: true },
+    });
+    return res.json({
+      success: true,
+      cuotas_sociales_vencidas: grupos.reduce((n, g) => n + g._count._all, 0),
+      socios: grupos.length,
+    });
+  } catch (error) {
+    console.error("Payments indicators error:", error);
+    return res.status(500).json({ success: false, error: "Error al obtener los indicadores" });
+  }
+});
+
+/**
+ * POST /api/payments — cargo único para un socio (sin plantilla). `name` y `amount`
+ * salen del tipo si no vienen; sin monto en ninguno, 400. `Reserva` sólo nace con la
+ * reserva. Cada cargo lleva un `ref` `unico:{uuid}`: dos iguales están permitidos.
+ */
+paymentsRouter.post("/", requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const parsed = createSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: "Validación fallida",
+        errors: formatErrors(parsed.error.issues),
+      });
+    }
+    const d = parsed.data;
+    if (d.concept === "Reserva") {
+      return res.status(400).json({ success: false, error: "Una reserva se crea reservando, no como cargo" });
+    }
+    const [tipo, socio] = await Promise.all([
+      prisma.chargeType.findUnique({ where: { key: d.concept } }),
+      prisma.user.findUnique({ where: { id: d.user_id }, select: { id: true } }),
+    ]);
+    if (!tipo || !tipo.active) {
+      return res.status(400).json({ success: false, error: "Tipo de cargo inexistente o inactivo" });
+    }
+    if (!socio) return res.status(404).json({ success: false, error: "Socio no encontrado" });
+    const amount = d.amount ?? (tipo.suggested_amount ? toNumber(tipo.suggested_amount) : undefined);
+    if (amount === undefined) {
+      return res.status(400).json({ success: false, error: "Falta el monto", errors: { amount: "Obligatorio" } });
+    }
+
+    const creada = await prisma.payment.create({
+      data: {
+        user_id: d.user_id,
+        concept: d.concept,
+        name: d.name ?? tipo.name,
+        description: d.description ?? tipo.description,
+        amount,
+        due_date: d.due_date ? new Date(`${d.due_date}T00:00:00Z`) : null,
+        notes: d.notes,
+        ref: refUnico(),
+        created_by: req.user!.id,
+      },
+      include: paymentInclude,
+    });
+    auditar(req, "create", "payment", creada.id, {
+      despues: { user_id: d.user_id, concept: d.concept, amount, due_date: d.due_date ?? null },
+    });
+    return res.status(201).json({ success: true, payment: serializePayment(creada) });
+  } catch (error) {
+    console.error("Create payment error:", error);
+    return res.status(500).json({ success: false, error: "Error al crear el cargo" });
+  }
+});
+
+/**
+ * POST /api/payments/generate — dispara a mano el motor de emisión (lib/emission.ts).
  * Sólo gestión.
  *
  * Es idempotente: cada cuota lleva un `ref` único (disciplina:<enrollment>:<periodo>)
@@ -255,58 +528,19 @@ paymentsRouter.post("/generate", requireAdmin, async (req: Request, res: Respons
       });
     }
     const { period } = parsed.data;
-    // El día de vencimiento es un ajuste del club. Rige para las cuotas que se
-    // generan ahora: las ya generadas conservan su fecha.
-    const { payment_due_day } = await getAjustes();
-    const due = vencimientoDe(period, payment_due_day);
-
-    // Todas las inscripciones que tocaron el período, activas o ya dadas de baja:
-    // si el socio cursó marzo y se fue en abril, la cuota de marzo se le cobra
-    // igual. Por eso no se filtra por active.
-    const enrollments = await prisma.enrollment.findMany({
-      where: { discipline: { fee_id: { not: null } } },
-      select: {
-        id: true,
-        user_id: true,
-        created_at: true,
-        left_at: true,
-        discipline: {
-          select: { id: true, name: true, fee: { select: { id: true, amount: true } } },
-        },
-      },
-    });
-
-    const aCobrar = enrollments.filter((e) =>
-      cursoEnPeriodo(e.created_at, e.left_at, period),
-    );
-
-    const filas = aCobrar.map((e) => ({
-      user_id: e.user_id,
-      concept: "Disciplina" as const,
-      enrollment_id: e.id,
-      fee_id: e.discipline.fee!.id,
-      // Monto congelado: si mañana repuntan la tarifa de la disciplina, esta
-      // cuota sigue valiendo lo que valía el mes que se generó.
-      amount: e.discipline.fee!.amount,
-      period,
-      due_date: due,
-      ref: refDisciplina(e.id, period),
-    }));
-
-    // skipDuplicates se apoya en el unique de `ref`: las que ya existían no se
-    // tocan (pueden estar pagas) y sólo entran las nuevas.
-    const { count } = await prisma.payment.createMany({
-      data: filas,
-      skipDuplicates: true,
-    });
+    // Disparo manual del motor de emisión (D5). El período elegido fija el "hoy"
+    // del motor: el mes corriente usa el día real; otro mes, su día 1 (la gestión
+    // lo usa para reponer un mes puntual).
+    const hoy = period === periodoActual() ? todayInClub() : `${period}-01`;
+    const { generadas, candidatas } = await emitirCargos({ hoy });
 
     return res.status(201).json({
       success: true,
       period,
-      generadas: count,
-      candidatas: filas.length,
+      generadas,
+      candidatas,
       // La diferencia son las que ya existían de una corrida anterior.
-      omitidas: filas.length - count,
+      omitidas: candidatas - generadas,
     });
   } catch (error) {
     console.error("Generate payments error:", error);
@@ -361,7 +595,7 @@ paymentsRouter.get("/por-cobrar", async (req: Request, res: Response) => {
         }),
       },
       include: cobroInclude,
-      orderBy: [{ due_date: "asc" }, { created_at: "asc" }],
+      orderBy: [{ due_date: { sort: "asc", nulls: "last" } }, { created_at: "asc" }],
       take: LIMITE_POR_COBRAR,
     });
 
@@ -376,24 +610,289 @@ paymentsRouter.get("/por-cobrar", async (req: Request, res: Response) => {
   }
 });
 
+const MSG_SIN_PERMISO = "No tenés permisos para registrar cobros";
+
+const cobroMultipleSchema = cobroSchema.extend({
+  payment_ids: z.array(z.string().min(1)).min(1).max(50),
+});
+
 /**
- * POST /api/payments/:id/cobro — registra que el socio pagó en mano y deja la
- * cuota Pagada. Lo hace la gestión (efectivo o transferencia) o un profesor (sólo
- * efectivo, y sólo cuotas de disciplinas que dicta): ver `decidirCobro`.
- *
- * Queda quién lo registró (`registered_by`). La condición de estado va en el
- * UPDATE y no en un if previo, igual que en PATCH: dos cobros a la vez dejan uno.
+ * Cobro manual de una o varias filas (D10). Compartido por `/cobro` y `/:id/cobro`.
+ * Orden de chequeos: 403 permisos/deuda propia/regla de cobro → 400 socios distintos
+ * o Reserva mezclada → 409 cuotas → 409 orden_de_pago (P7) → 409 pago_en_curso → cobro.
+ */
+async function cobrarFilas(req: Request, res: Response, ids: string[], body: unknown, unico: boolean) {
+  const quien = quienCobra(req);
+  if (!quien.esGestion && !quien.esProfesor) {
+    return res.status(403).json({ success: false, error: MSG_SIN_PERMISO });
+  }
+
+  const parsed = cobroMultipleSchema.omit({ payment_ids: true }).safeParse(body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json({
+      success: false,
+      error: "Validación fallida",
+      errors: formatErrors(parsed.error.issues),
+    });
+  }
+
+  const filas = await prisma.payment.findMany({
+    where: { id: { in: ids } },
+    select: {
+      id: true,
+      user_id: true,
+      concept: true,
+      status: true,
+      amount: true,
+      due_date: true,
+      booking_id: true,
+      deleted_at: true,
+      enrollment: {
+        select: { discipline: { select: { professors: { select: { professor_id: true } } } } },
+      },
+    },
+  });
+  if (filas.length !== ids.length) {
+    return res.status(404).json({ success: false, error: "Cuota no encontrada" });
+  }
+  if (new Set(filas.map((f) => f.user_id)).size !== 1) {
+    return res.status(400).json({ success: false, error: "Las cuotas tienen que ser del mismo socio" });
+  }
+  if (filas[0]!.user_id === req.user!.id) {
+    return res.status(403).json({ success: false, error: "No podés registrar el cobro de tu propia deuda" });
+  }
+  if (filas.length > 1 && filas.some((f) => f.concept === "Reserva")) {
+    return res.status(400).json({ success: false, error: "Una reserva se cobra sola" });
+  }
+
+  let metodo: PaymentMethod = "Efectivo";
+  const noCobrables: { id: string; estado: string }[] = [];
+  for (const f of filas) {
+    const decision = decidirCobro(
+      quien,
+      {
+        concept: f.concept,
+        status: f.deleted_at ? "Anulado" : f.status,
+        esDeSuDisciplina:
+          f.enrollment?.discipline.professors.some((p) => p.professor_id === req.user!.id) ?? false,
+      },
+      parsed.data.method,
+    );
+    if (!decision.ok) {
+      if (decision.status === 403) {
+        return res.status(403).json({ success: false, error: decision.error });
+      }
+      noCobrables.push({
+        id: f.id,
+        estado: estadoCuota({
+          status: f.status,
+          due_date: f.due_date ? f.due_date.toISOString().slice(0, 10) : null,
+        }),
+      });
+      continue;
+    }
+    metodo = decision.method;
+  }
+  if (noCobrables.length > 0) {
+    return res.status(409).json({
+      success: false,
+      error: unico ? "Esa cuota ya fue cobrada o anulada" : "Hay cuotas que ya no se pueden cobrar",
+      cuotas: noCobrables,
+    });
+  }
+
+  const orden = await verificarOrdenDePago(filas[0]!.user_id, ids);
+  if (orden) {
+    return res
+      .status(409)
+      .json({ success: false, error: "Hay cuotas anteriores sin pagar", orden_de_pago: orden });
+  }
+
+  const viva = await liquidacionViva(ids);
+  if (viva) {
+    return res.status(409).json({
+      success: false,
+      error: "Hay un pago en curso para esta cuota",
+      pago_en_curso: {
+        id: viva.id,
+        vence: viva.expires_at?.toISOString() ?? null,
+        checkout_url: viva.checkout_url,
+      },
+    });
+  }
+
+  const r = await registrarCobroManual({
+    userId: filas[0]!.user_id,
+    method: metodo,
+    registeredBy: req.user!.id,
+    notes: parsed.data.notes,
+    filas: filas.map((f) => ({
+      id: f.id,
+      amount: f.amount,
+      concept: f.concept,
+      booking_id: f.booking_id,
+    })),
+  });
+  if (!r) {
+    return res.status(409).json({ success: false, error: "Esa cuota ya fue cobrada o anulada" });
+  }
+
+  auditar(req, "update", "liquidacion", r.liquidacionId, {
+    despues: { metodo, filas: ids, estado: "Aprobado" },
+  });
+
+  const payments = await prisma.payment.findMany({ where: { id: { in: ids } }, include: cobroInclude });
+  return res.json({
+    success: true,
+    liquidacion: { id: r.liquidacionId, status: "Aprobado" },
+    filas: ids,
+    payments: serializePayments(payments),
+    // Contrato de dev de `/:id/cobro`.
+    payment: payments[0] && serializePayment(payments[0]),
+  });
+}
+
+const HORAS_PARA_PAGAR = 24;
+
+const pagoEnCursoBody = (v: { id: string; expires_at: Date | null; checkout_url: string | null }) => ({
+  id: v.id,
+  vence: v.expires_at?.toISOString() ?? null,
+  checkout_url: v.checkout_url,
+});
+
+/**
+ * POST /api/payments/checkout { payment_ids } — el socio (o su tutor) paga cuotas con MP (D13).
+ * Orden: 400 → 404 → 400 socios distintos → 403 → 400 Reserva → 409 cuotas → 409 orden_de_pago
+ * → 409 pago_en_curso → 400 total 0 → 502. Va antes de "/:id".
+ */
+paymentsRouter.post("/checkout", async (req: Request, res: Response) => {
+  try {
+    const ids = z.array(z.string().min(1)).min(1).max(50).safeParse(req.body?.payment_ids);
+    if (!ids.success) {
+      return res.status(400).json({ success: false, error: "payment_ids es obligatorio" });
+    }
+    const unicos = [...new Set(ids.data)];
+    const filas = await prisma.payment.findMany({
+      where: { id: { in: unicos } },
+      select: { id: true, user_id: true, concept: true, status: true, amount: true, name: true, due_date: true, deleted_at: true },
+    });
+    if (filas.length !== unicos.length) {
+      return res.status(404).json({ success: false, error: "Cuota no encontrada" });
+    }
+    const deudorId = filas[0]!.user_id;
+    if (filas.some((f) => f.user_id !== deudorId)) {
+      return res.status(400).json({ success: false, error: "Las cuotas tienen que ser del mismo socio" });
+    }
+    if (!(await puedePagarPor({ id: req.user!.id, esGestion: isAdmin(req) }, deudorId))) {
+      return res.status(403).json({ success: false, error: "No podés pagar estas cuotas" });
+    }
+    if (filas.some((f) => f.concept === "Reserva")) {
+      return res.status(400).json({ success: false, error: "Una reserva se paga desde Mis reservas" });
+    }
+    const noPagables = filas.filter((f) => f.status !== "Pendiente" || f.deleted_at);
+    if (noPagables.length > 0) {
+      return res.status(409).json({
+        success: false,
+        error: "Hay cuotas que ya no se pueden pagar",
+        cuotas: noPagables.map((f) => ({
+          id: f.id,
+          estado: estadoCuota({ status: f.deleted_at ? "Anulado" : f.status, due_date: f.due_date ? f.due_date.toISOString().slice(0, 10) : null }),
+        })),
+      });
+    }
+    const orden = await verificarOrdenDePago(deudorId, unicos);
+    if (orden) {
+      return res.status(409).json({ success: false, error: "Hay cuotas anteriores sin pagar", orden_de_pago: orden });
+    }
+    const viva = await liquidacionViva(unicos);
+    if (viva) {
+      return res.status(409).json({ success: false, error: "Hay un pago en curso para esta cuota", pago_en_curso: pagoEnCursoBody(viva) });
+    }
+    const centavos = filas.reduce((acc, f) => acc + Math.round(Number(f.amount) * 100), 0);
+    if (centavos <= 0) {
+      return res.status(400).json({ success: false, error: "No hay nada para pagar" });
+    }
+    if (!accessToken()) {
+      return res.status(502).json({ success: false, error: "El pago con Mercado Pago no está disponible" });
+    }
+
+    const vence = new Date(Date.now() + HORAS_PARA_PAGAR * 3600_000);
+    const liq = await crearLiquidacionMP({ userId: req.user!.id, filas, expiresAt: vence });
+    try {
+      const pagador = await prisma.user.findUnique({ where: { id: req.user!.id }, select: { email: true } });
+      const pref = await createPreference({
+        externalReference: liq.id,
+        items: filas.map((f) => ({ title: f.name, quantity: 1, unit_price: Number(f.amount) })),
+        payerEmail: pagador?.email,
+        backUrlBase: process.env.MP_BACK_URL_BASE || "http://localhost:3000",
+        notificationUrl: process.env.MP_NOTIFICATION_URL || undefined,
+        expiresAt: vence,
+      });
+      await prisma.paymentTransaction.update({
+        where: { id: liq.id },
+        data: { mp_preference_id: pref.id, checkout_url: pref.init_point },
+      });
+      return res.status(201).json({
+        success: true,
+        pago: { id: liq.id, monto: liq.total.toFixed(2), vence: vence.toISOString() },
+        checkout_url: pref.init_point,
+      });
+    } catch (error) {
+      // MP falló: la liquidación no puede quedar viva bloqueando las filas.
+      await prisma.paymentTransaction.update({ where: { id: liq.id }, data: { status: "Cancelado" } });
+      console.error("Checkout Mercado Pago error:", error);
+      return res.status(502).json({ success: false, error: "No pudimos iniciar el pago con Mercado Pago" });
+    }
+  } catch (error) {
+    if (error instanceof PagoEnCurso) {
+      return res.status(409).json({ success: false, error: error.message, pago_en_curso: pagoEnCursoBody(error.viva) });
+    }
+    console.error("Checkout error:", error);
+    return res.status(500).json({ success: false, error: "Error al iniciar el pago" });
+  }
+});
+
+/**
+ * POST /api/payments/cobro — cobro manual de varias cuotas del mismo socio en una
+ * sola operación (una liquidación). Va antes de "/:id".
+ */
+paymentsRouter.post("/cobro", async (req: Request, res: Response) => {
+  try {
+    const ids = z.array(z.string().min(1)).min(1).max(50).safeParse(req.body?.payment_ids);
+    if (!ids.success) {
+      return res.status(400).json({ success: false, error: "payment_ids es obligatorio" });
+    }
+    const { payment_ids: _omitido, ...resto } = req.body;
+    return await cobrarFilas(req, res, [...new Set(ids.data)], resto, false);
+  } catch (error) {
+    console.error("Register manual collection error:", error);
+    return res.status(500).json({ success: false, error: "Error al registrar el cobro" });
+  }
+});
+
+/**
+ * POST /api/payments/:id/cobro — envoltorio de un solo id (contrato de dev). La
+ * gestión cobra por cualquier medio manual; un profesor, sólo efectivo y sólo
+ * cuotas de disciplinas que dicta: ver `decidirCobro`.
  */
 paymentsRouter.post("/:id/cobro", async (req: Request<{ id: string }>, res: Response) => {
   try {
-    const quien = quienCobra(req);
-    if (!quien.esGestion && !quien.esProfesor) {
-      return res
-        .status(403)
-        .json({ success: false, error: "No tenés permisos para registrar cobros" });
-    }
+    return await cobrarFilas(req, res, [req.params.id], req.body, true);
+  } catch (error) {
+    console.error("Register cash payment error:", error);
+    return res.status(500).json({ success: false, error: "Error al registrar el cobro" });
+  }
+});
 
-    const parsed = cobroSchema.safeParse(req.body ?? {});
+/**
+ * POST /api/payments/:id/revertir { reason } — deshace un cobro manual (D11/D22b).
+ * La liquidación pasa a `Anulado` (queda visible) y TODAS sus filas vuelven a
+ * `Pendiente`. Los cobros de MP se reembolsan; los que incluyen una reserva se
+ * deshacen cancelando la reserva.
+ */
+paymentsRouter.post("/:id/revertir", requireAdmin, async (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const parsed = revertirSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       return res.status(400).json({
         success: false,
@@ -404,73 +903,117 @@ paymentsRouter.post("/:id/cobro", async (req: Request<{ id: string }>, res: Resp
 
     const pago = await prisma.payment.findUnique({
       where: { id: req.params.id },
-      select: {
-        id: true,
-        concept: true,
-        status: true,
-        booking_id: true,
-        enrollment: {
-          select: {
-            discipline: { select: { professors: { select: { professor_id: true } } } },
-          },
-        },
-      },
+      select: { id: true, status: true },
     });
-    if (!pago) {
+    if (!pago) return res.status(404).json({ success: false, error: "Cuota no encontrada" });
+    if (pago.status !== "Pagado") {
+      return res.status(409).json({ success: false, error: "Esa cuota no está paga" });
+    }
+
+    const liq = await prisma.paymentTransaction.findFirst({
+      where: { status: "Aprobado", items: { some: { payment_id: pago.id } } },
+      orderBy: { created_at: "desc" },
+      select: { id: true, method: true, items: { select: { payment: { select: { id: true, concept: true } } } } },
+    });
+    if (!liq) {
+      return res.status(409).json({ success: false, error: "Esa cuota no tiene un cobro para revertir" });
+    }
+    if (liq.method === "MercadoPago") {
+      return res.status(409).json({ success: false, error: "Un cobro de Mercado Pago se reembolsa, no se revierte" });
+    }
+    if (liq.items.some((i) => i.payment.concept === "Reserva")) {
+      return res.status(409).json({ success: false, error: "Un cobro con reserva se deshace cancelando la reserva" });
+    }
+
+    const filas = liq.items.map((i) => i.payment.id);
+    let ok: boolean;
+    try {
+      ok = await prisma.$transaction(async (tx) => {
+        const { count } = await tx.paymentTransaction.updateMany({
+          where: { id: liq.id, status: "Aprobado" },
+          data: {
+            status: "Anulado",
+            voided_by: req.user!.id,
+            voided_reason: parsed.data.reason,
+            voided_at: new Date(),
+          },
+        });
+        if (count === 0) return false;
+        await tx.payment.updateMany({
+          where: { id: { in: filas }, status: "Pagado" },
+          data: { status: "Pendiente", method: null, paid_at: null, registered_by: null },
+        });
+        return true;
+      });
+    } catch (e) {
+      // Perdió la carrera contra otro revertir: mismo resultado que ver la liquidación ya anulada.
+      if (!esConflictoDeEscritura(e)) throw e;
+      ok = false;
+    }
+    if (!ok) {
+      return res.status(409).json({ success: false, error: "Ese cobro ya fue revertido" });
+    }
+
+    auditar(req, "update", "liquidacion", liq.id, {
+      motivo: parsed.data.reason,
+      antes: { estado: "Aprobado", filas },
+      despues: { estado: "Anulado" },
+    });
+    return res.json({ success: true, liquidacion: { id: liq.id, status: "Anulado" }, filas });
+  } catch (error) {
+    console.error("Revert collection error:", error);
+    return res.status(500).json({ success: false, error: "Error al revertir el cobro" });
+  }
+});
+
+/**
+ * GET /api/payments/:id/historial (gestión) — pagos y reembolsos de un cargo, del más nuevo al
+ * más viejo. Un "pago" es cada transacción que lo cubrió (con el monto de ESTE cargo, no el de
+ * la transacción entera); un "reembolso", cada Refund con payment_id = :id.
+ */
+paymentsRouter.get("/:id/historial", requireAdmin, async (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const payment = await prisma.payment.findUnique({
+      where: { id: req.params.id },
+      select: { id: true },
+    });
+    if (!payment) {
       return res.status(404).json({ success: false, error: "Cuota no encontrada" });
     }
-
-    const decision = decidirCobro(
-      quien,
-      {
-        concept: pago.concept,
-        status: pago.status,
-        esDeSuDisciplina:
-          pago.enrollment?.discipline.professors.some((p) => p.professor_id === req.user!.id) ?? false,
-      },
-      parsed.data.method,
-    );
-    if (!decision.ok) {
-      return res.status(decision.status).json({ success: false, error: decision.error });
-    }
-
-    const cobrada = await prisma.$transaction(async (tx) => {
-      const { count } = await tx.payment.updateMany({
-        where: { id: pago.id, status: { in: ["Pendiente", "EnRevision"] } },
-        data: {
-          status: "Pagado",
-          paid_at: new Date(),
-          method: decision.method,
-          registered_by: req.user!.id,
-          ...(parsed.data.notes !== undefined && { notes: parsed.data.notes }),
-        },
-      });
-      if (count === 0) return false;
-
-      // Una reserva Confirmada es una reserva paga: el cobro y el estado viajan
-      // juntos, como al confirmar la reserva en el otro sentido (bookings.ts).
-      if (pago.concept === "Reserva" && pago.booking_id) {
-        await tx.booking.updateMany({
-          where: { id: pago.booking_id, status: "Pendiente" },
-          data: { status: "Confirmada" },
-        });
-      }
-      return true;
-    });
-    if (!cobrada) {
-      return res
-        .status(409)
-        .json({ success: false, error: "Esa cuota ya fue cobrada o anulada" });
-    }
-
-    const payment = await prisma.payment.findUnique({
-      where: { id: pago.id },
-      include: cobroInclude,
-    });
-    return res.json({ success: true, payment: payment && serializePayment(payment) });
+    const [items, refunds] = await Promise.all([
+      prisma.paymentTransactionItem.findMany({
+        where: { payment_id: payment.id },
+        include: { transaction: true },
+      }),
+      prisma.refund.findMany({
+        where: { payment_id: payment.id },
+        include: { transaction: { select: { method: true } } },
+      }),
+    ]);
+    const historial = [
+      ...items.map((i) => ({
+        tipo: "pago" as const,
+        id: i.transaction_id,
+        fecha: i.transaction.paid_at ?? i.transaction.created_at,
+        method: i.transaction.method as PaymentMethod | null,
+        amount: toNumber(i.amount),
+        status: i.transaction.status as string,
+      })),
+      ...refunds.map((r) => ({
+        tipo: "reembolso" as const,
+        id: String(r.id),
+        fecha: r.refunded_at ?? r.created_at,
+        method: r.transaction.method as PaymentMethod | null,
+        amount: toNumber(r.amount),
+        status: r.status,
+      })),
+    ]
+      .sort((a, b) => b.fecha.getTime() - a.fecha.getTime())
+      .map((h) => ({ ...h, fecha: h.fecha.toISOString() }));
+    return res.json({ success: true, historial });
   } catch (error) {
-    console.error("Register cash payment error:", error);
-    return res.status(500).json({ success: false, error: "Error al registrar el cobro" });
+    console.error("Payment history error:", error);
+    return res.status(500).json({ success: false, error: "Error al obtener el historial" });
   }
 });
 
@@ -587,9 +1130,67 @@ paymentsRouter.post(
   },
 );
 
+/** Mensajes por acción cuando la fila no admite la mutación pedida. */
+const MSG_NO_PERMITIDA: Record<string, string> = {
+  anular: "Esa cuota no se puede anular",
+  condonar: "Esa cuota no se puede condonar",
+  editar: "Esa cuota no se puede editar",
+  eliminar: "Esa cuota no se puede eliminar",
+};
+
 /**
- * PATCH /api/payments/:id — la gestión confirma el cobro, rechaza un comprobante
- * o anula la deuda. Sólo gestión: quien debe no decide si pagó.
+ * Mutación de gestión de una fila: valida que `accion` esté en `accionesPermitidas`
+ * (misma regla que ve la UI), y aplica `data` con un `updateMany` guardado por el
+ * estado leído (el perdedor de una carrera recibe 409). Devuelve la fila actualizada.
+ */
+async function mutarFila(
+  req: Request<{ id: string }>,
+  res: Response,
+  accion: Accion,
+  data: Prisma.PaymentUpdateManyMutationInput,
+  auditoria: { motivo?: string; despues: unknown },
+) {
+  const fila = await prisma.payment.findUnique({
+    where: { id: req.params.id },
+    select: { id: true, concept: true, status: true, deleted_at: true, due_date: true, name: true, description: true, amount: true },
+  });
+  if (!fila) return res.status(404).json({ success: false, error: "Cuota no encontrada" });
+
+  const liq = (await liquidacionesDe([fila.id])).get(fila.id);
+  if (liq?.viva) {
+    return res.status(409).json({ success: false, error: "Hay un pago en curso para esta cuota" });
+  }
+  if (!accionesDe(fila, liq).includes(accion)) {
+    return res.status(409).json({ success: false, error: MSG_NO_PERMITIDA[accion] });
+  }
+
+  const { count } = await prisma.payment.updateMany({
+    where: { id: fila.id, status: fila.status, deleted_at: null },
+    data,
+  });
+  if (count === 0) {
+    return res.status(409).json({ success: false, error: "La cuota cambió de estado, actualizá y reintentá" });
+  }
+  auditar(req, "update", "payment", fila.id, {
+    motivo: auditoria.motivo,
+    antes: {
+      status: fila.status,
+      due_date: aDia(fila.due_date),
+      name: fila.name,
+      description: fila.description,
+      amount: toNumber(fila.amount),
+    },
+    despues: auditoria.despues,
+  });
+  const payment = await prisma.payment.findUnique({ where: { id: fila.id }, include: paymentInclude });
+  return res.json({ success: true, payment: payment && serializePayment(payment) });
+}
+
+/**
+ * PATCH /api/payments/:id — la gestión anula, condona o edita vencimiento, monto, nombre y
+ * descripción (`action: anular | condonar | editar`; editar sólo en `Pendiente`). Anular y condonar piden `reason` y sólo
+ * aplican a `Pendiente`/`EnRevision` que no sean `Reserva` (una `Pagado` es 409).
+ * El cobro va por /cobro; `confirmar`/`rechazar` ya no existen (D23).
  */
 paymentsRouter.patch(
   "/:id",
@@ -604,58 +1205,22 @@ paymentsRouter.patch(
           errors: formatErrors(parsed.error.issues),
         });
       }
-      const { action, method, notes } = parsed.data;
-
-      const data =
-        action === "confirmar"
-          ? {
-              status: "Pagado" as const,
-              paid_at: new Date(),
-              // Sin medio declarado se asume efectivo: es el mostrador del club.
-              method: method ?? ("Efectivo" as const),
-              registered_by: req.user!.id,
-            }
-          : action === "rechazar"
-            ? {
-                // Vuelve a deber. El comprobante queda adjunto a propósito: es la
-                // prueba de qué se rechazó.
-                status: "Pendiente" as const,
-                paid_at: null,
-                method: null,
-                registered_by: req.user!.id,
-              }
-            : {
-                status: "Anulado" as const,
-                registered_by: req.user!.id,
-              };
-
-      // La condición va en el UPDATE y no en un if previo, igual que al cancelar
-      // una reserva: dos confirmaciones en paralelo tienen que dejar una sola.
-      const { count } = await prisma.payment.updateMany({
-        where: {
-          id: req.params.id,
-          // Una cuota paga no se vuelve a tocar por esta vía: para revertir un
-          // cobro hace falta anularla explícitamente, no "confirmarla" de nuevo.
-          ...(action === "anular" ? {} : { status: { not: "Pagado" } }),
-        },
-        data: { ...data, ...(notes !== undefined && { notes }) },
-      });
-      if (count === 0) {
-        const existe = await prisma.payment.findUnique({
-          where: { id: req.params.id },
-          select: { id: true },
-        });
-        return existe
-          ? res.status(409).json({ success: false, error: "Esa cuota ya está paga" })
-          : res.status(404).json({ success: false, error: "Cuota no encontrada" });
+      const b = parsed.data;
+      if (b.action === "editar") {
+        // Sólo los campos presentes: `due_date: null` borra el vencimiento, ausente lo deja.
+        const { action: _accion, due_date, ...resto } = b;
+        const data: Prisma.PaymentUpdateManyMutationInput = resto;
+        if (due_date !== undefined) data.due_date = due_date ? new Date(`${due_date}T00:00:00Z`) : null;
+        return await mutarFila(req, res, "editar", data, { despues: b });
       }
-
-      const payment = await prisma.payment.findUnique({
-        where: { id: req.params.id },
-        include: paymentInclude,
-      });
-
-      return res.json({ success: true, payment: payment && serializePayment(payment) });
+      const status = b.action === "anular" ? "Anulado" : "Condonado";
+      return await mutarFila(
+        req,
+        res,
+        b.action,
+        { status, resolved_by: req.user!.id, resolved_reason: b.reason, resolved_at: new Date() },
+        { motivo: b.reason, despues: { status } },
+      );
     } catch (error) {
       console.error("Update payment error:", error);
       return res
@@ -664,3 +1229,104 @@ paymentsRouter.patch(
     }
   },
 );
+
+/**
+ * DELETE /api/payments/:id { reason } — baja lógica (D7): sólo `Pendiente`, no `Reserva`
+ * y sin pago en curso. Queda `Anulado` + `deleted_*`; el listado la oculta salvo `?eliminados=1`.
+ */
+paymentsRouter.delete("/:id", requireAdmin, async (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const parsed = deleteSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: "Validación fallida",
+        errors: formatErrors(parsed.error.issues),
+      });
+    }
+    return await mutarFila(
+      req,
+      res,
+      "eliminar",
+      {
+        status: "Anulado",
+        deleted_at: new Date(),
+        deleted_by: req.user!.id,
+        deleted_reason: parsed.data.reason,
+      },
+      { motivo: parsed.data.reason, despues: { status: "Anulado", eliminado: true } },
+    );
+  } catch (error) {
+    console.error("Delete payment error:", error);
+    return res.status(500).json({ success: false, error: "Error al eliminar la cuota" });
+  }
+});
+
+/**
+ * POST /api/payments/:id/reembolso { reason } — la gestión devuelve por Mercado Pago el cobro de
+ * una fila `Pagado` (D12). 400 si no se cobró por MP, 409 si no está `Pagado` / hay un reembolso
+ * en curso o ya hecho, 502 si MP falla (queda `failed` y el barrido reintenta, o `rejected`
+ * y sólo la gestión lo reintenta llamando de nuevo).
+ */
+paymentsRouter.post("/:id/reembolso", requireAdmin, async (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const parsed = revertirSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: "Validación fallida",
+        errors: formatErrors(parsed.error.issues),
+      });
+    }
+    const fila = await prisma.payment.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, status: true, method: true },
+    });
+    if (!fila) return res.status(404).json({ success: false, error: "Cuota no encontrada" });
+    if (fila.method !== "MercadoPago") {
+      return res.status(400).json({ success: false, error: "Esa cuota no se cobró por Mercado Pago" });
+    }
+    if (fila.status !== "Pagado") {
+      return res.status(409).json({ success: false, error: "Sólo se reembolsa una cuota pagada" });
+    }
+    // La liquidación MP que la saldó (la más reciente aprobada).
+    const item = await prisma.paymentTransactionItem.findFirst({
+      where: { payment_id: fila.id, transaction: { method: "MercadoPago", status: { in: ["Aprobado", "ReembolsadoParcial"] } } },
+      orderBy: { transaction: { created_at: "desc" } },
+      select: { transaction_id: true },
+    });
+    if (!item) return res.status(400).json({ success: false, error: "No hay un pago de Mercado Pago para reembolsar" });
+
+    const r = await reembolsarItem({
+      transaccionId: item.transaction_id,
+      filaId: fila.id,
+      motivo: parsed.data.reason,
+      actor: req.user!.id,
+      persona: true,
+    });
+    auditar(req, "update", "payment", fila.id, {
+      motivo: parsed.data.reason,
+      antes: { status: fila.status },
+      despues: { reembolso: r.estado, refund_id: r.refundId },
+    });
+    if (r.estado === "approved") {
+      return res.json({ success: true, reembolso: { id: r.refundId, estado: "aprobado" } });
+    }
+    if (r.estado === "en_curso" || r.estado === "ya_reembolsado" || r.estado === "resuelto") {
+      const error = {
+        en_curso: "Hay un reembolso en curso",
+        ya_reembolsado: "Esa cuota ya fue reembolsada",
+        resuelto: "Ese reembolso ya fue resuelto fuera de Mercado Pago",
+      }[r.estado];
+      return res.status(409).json({ success: false, error });
+    }
+    return res.status(502).json({
+      success: false,
+      error: "Mercado Pago no pudo procesar el reembolso",
+      reembolso: { id: r.refundId, estado: r.estado },
+    });
+  } catch (error) {
+    console.error("Refund payment error:", error);
+    return res.status(500).json({ success: false, error: "Error al reembolsar la cuota" });
+  }
+});

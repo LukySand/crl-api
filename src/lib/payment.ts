@@ -35,6 +35,19 @@ export function refSocio(userId: string, periodo: string): string {
   return `socio:${userId}:${periodo}`;
 }
 
+/** Cargo único cargado a mano por la gestión: una fila, un uuid. */
+export function refUnico(): string {
+  return `unico:${crypto.randomUUID()}`;
+}
+
+/**
+ * Cargo recurrente genérico: uno por tipo, socio y ciclo (D5). Para `Socio` da
+ * el mismo formato que `refSocio`, así lo ya generado en dev no se duplica.
+ */
+export function refRecurrente(key: string, userId: string, periodo: string): string {
+  return `${key.toLowerCase()}:${userId}:${periodo}`;
+}
+
 // ── Serialización de montos ──────────────────────────────────────────────
 
 /**

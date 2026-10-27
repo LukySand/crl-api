@@ -38,7 +38,8 @@ Sirve **solo** `/api/*`. El frontend vive en otro repo y le pega vía proxy.
 | Teléfonos | **libphonenumber-js** |
 | Env | **dotenv** |
 
-TypeScript en todo. Sin tests configurados.
+TypeScript en todo. Tests con `bun test`: los puros (reglas, fechas, cliente MP) corren sin base; los de ruta
+(`src/routes/*.test.ts`) necesitan la base de test (`bun run test:db`, ver Comandos).
 
 ---
 
@@ -123,6 +124,16 @@ Todos en `src/routes/auth.ts`, montados bajo `/api/auth` (salvo health).
 | GET | `/api/reports/morosos` | gestión | Quién debe y desde cuándo |
 | GET | `/api/reports/export` | gestión | Descarga Excel o PDF de lo que muestra la pantalla de reportes. `?format=xlsx\|pdf &bucket= &from= &to= &canchas= &disciplinas=` (los dos últimos se repiten una vez por nombre; ausente = todas, vacío = ninguna) |
 | GET | `/api/enrollments/export` | gestión o profe de esa disciplina | Lista de inscriptos para bajar o imprimir. `?discipline_id= &format=xlsx\|pdf`. Sin celular ni email a propósito (ver `lib/enrollment-export.ts`) |
+
+### Cuenta del socio
+
+| Método | Ruta | Guard | Qué hace |
+| --- | --- | --- | --- |
+| GET | `/api/socio/cuotas` | sesión | Cuotas propias (sin reservas ni bajas lógicas) → `{cuotas, deuda_total, vencidas}`. Antes emite los cargos que falten y concilia con MP |
+| GET | `/api/socio/cuotas/menor/:childId` | tutor | Lo mismo para un menor a cargo; el vínculo se verifica contra `Family` activa (403 si no) |
+| GET | `/api/socio/credential` | sesión | Credencial: `habilitada = rol Socio && active && cuotas_vencidas === 0` |
+| GET | `/api/socio/credential/menor/:childId` | tutor | Credencial de un menor a cargo |
+| GET | `/api/socio/historial-pagos` | sesión | Liquidaciones del socio (o que saldan filas suyas) con `cuotas`, `reembolsos` y `booking_id` |
 
 ### Ajustes del club
 
@@ -363,6 +374,9 @@ bun dev                 # :3001, hot reload
 | `bun run db:push` | Aplica el schema sin migración |
 | `bun run db:seed` | Siembra roles |
 | `docker compose up -d db` | Solo la base |
+| `bun run test:db` | Levanta/prepara la base de test (`db_test`); después `bun test <archivo>` |
+| `bun test src/lib` | Tests puros, sin base |
+| `bun run test:webhook` | Prueba el webhook de MP contra un server vivo (opcional) |
 
 En prod, `entrypoint.sh` corre `migrate deploy` + seed antes de arrancar.
 
@@ -392,9 +406,7 @@ reservas (`/api/bookings`), disciplinas (`/api/disciplines`), inscripciones
 (`/api/enrollments`), cuotas y cobros (`/api/payments`), reportes de ingresos
 (`/api/reports`) y postulación de sponsors (`/api/sponsors`).
 
-Falta: cuota de socio (el enum ya tiene el valor `Socio`, falta decidir dónde vive el monto
-vigente del club), Mercado Pago, publicaciones institucionales, locales adheridos con
-beneficios.
+Falta: publicaciones institucionales y locales adheridos con beneficios.
 
 ### Cuotas y pagos
 
@@ -416,8 +428,8 @@ Reglas que no se rompen:
 - **El pago viaja en la misma transacción que lo que lo origina.** Crear/cancelar una reserva,
   desinscribirse, dar de baja un socio o una disciplina: todo toca el pago en el mismo
   `$transaction`, por lo mismo que `status` y `active` de `Booking` nunca se separan.
-- **Lo ya `Pagado` no se anula nunca.** La plata entró de verdad; borrarla falsearía los
-  ingresos del mes. Las devoluciones no existen todavía.
+- **Lo ya `Pagado` no se anula a mano.** La plata entró de verdad; borrarla falsearía los
+  ingresos del mes. Sólo un reembolso (abajo) lo pasa a `Anulado`.
 
 Constantes en `src/lib/payment-period.ts` (nunca sueltas en un handler, igual que
 `booking-date.ts`): `DIA_VENCIMIENTO = 10`. `cursoEnPeriodo()` decide a quién le toca la cuota
@@ -432,6 +444,33 @@ quedaban fechados mañana: se caían de la ventana del reporte y volvían a mete
 la cancha de vóley sale $9.000/hora y la disciplina vóley $8.000/mes, y antes las dos podían
 terminar siendo la misma fila. El front tiene que pedir `GET /api/fees?kind=Disciplina` al
 elegir la cuota de una disciplina — el backend además lo valida.
+
+### Liquidaciones, reembolsos y emisión
+
+- **Una liquidación (`PaymentTransaction`) salda una o más filas** a través de
+  `PaymentTransactionItem`. Los cinco métodos (`MercadoPago`, `Efectivo`, `Transferencia`,
+  `MPFueraDeApp`, `TarjetaConPosnet`) pasan por `lib/settlement.ts`. Invariante: una fila
+  `Pagado` pertenece a exactamente una liquidación aprobada; nunca hay dos vivas sobre la misma
+  fila (`liquidacionViva`, `409 pago_en_curso`).
+- **Un reembolso deja la fila `Anulado`**, conservando `paid_at` y `method` (la plata entró y
+  salió: los reportes restan el egreso en el mes de `refunded_at`). `lib/refunds.ts`; un
+  reembolso fallido se reintenta cada 15 minutos o se resuelve a mano (`/api/transactions`).
+- **`Payment.concept` es FK a `charge_types.key`**: los tipos (`Reserva`, `Disciplina`, `Socio`
+  son de sistema) y las plantillas recurrentes viven en `/api/charge-types` y
+  `/api/recurring-templates`. `lib/emission.ts` emite el ciclo vigente; es idempotente por `ref`.
+- **Orden de pago:** una Cuota social no se paga antes que una pendiente anterior del mismo
+  socio (`409 orden_de_pago`, `lib/payment-rules.ts`). Las reservas nunca bloquean.
+- **La credencial sólo la bloquea una Cuota social `Pendiente` vencida** (`cuotasSocialesVencidas`).
+  `EnRevision` y `due_date` nulo no cuentan; otros conceptos tampoco.
+- **Mercado Pago:** `lib/mercadopago.ts` (cliente), `lib/payment-sync.ts` (webhook + conciliación;
+  `syncPendingPayments` también se llama al leer la cuenta del socio). Variables `MP_*` en
+  `.env.example`; sin `MP_ACCESS_TOKEN` el checkout responde 502 y el resto anda.
+- **Scheduler** (`lib/scheduler.ts`): emisión diaria, conciliación y reintento de reembolsos cada
+  15 minutos, y liberación de reservas sin pagar cada minuto. `DISABLE_CRON=true` lo apaga
+  (tests, segunda instancia).
+- **Raw SQL:** palabras reservadas de MySQL 8 (`system`, `rank`, `key`, `groups`, `payments`...)
+  siempre entre backticks. Un `P2034` (conflicto de escritura) se mapea a 409 con
+  `esConflictoDeEscritura`.
 
 ### Reglas temporales de las reservas
 

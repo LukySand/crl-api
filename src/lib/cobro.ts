@@ -5,14 +5,14 @@
  * acá es puro; las consultas y el UPDATE viven en `routes/payments.ts`.
  *
  * Quién puede cobrar qué:
- *  - La gestión cobra cualquier cuota pendiente, por efectivo o transferencia.
+ *  - La gestión cobra cualquier cuota pendiente, por cualquiera de los cuatro medios manuales (nunca MercadoPago).
  *  - Un profesor cobra sólo cuotas de **disciplina** de **su** disciplina, y
  *    siempre en efectivo. No registra reservas, cuota social ni otros cargos, ni
  *    elige el medio: es quien recibe la plata en la clase.
  *  - Un socio no cobra: quien debe no decide si pagó.
  */
 
-export const METODOS_MANUALES = ["Efectivo", "Transferencia"] as const;
+export const METODOS_MANUALES = ["Efectivo", "Transferencia", "MPFueraDeApp", "TarjetaConPosnet"] as const;
 export type MetodoManual = (typeof METODOS_MANUALES)[number];
 
 /** Cuántos resultados devuelve como mucho el listado "por cobrar". */
@@ -60,6 +60,10 @@ export function decidirCobro(
     return { ok: true, method: metodoPedido ?? "Efectivo" };
   }
 
+  if (pago.status === "EnRevision") {
+    // Comprobante presentado: la cierra la gestión (D10/D23).
+    return { ok: false, status: 403, error: "Esa cuota tiene un comprobante en revisión: la cobra la gestión" };
+  }
   if (pago.concept !== "Disciplina" || !pago.esDeSuDisciplina) {
     return {
       ok: false,

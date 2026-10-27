@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { decidirCobro, palabrasDeBusqueda, type PagoACobrar } from "./cobro";
+import { decidirCobro, METODOS_MANUALES, palabrasDeBusqueda, type PagoACobrar } from "./cobro";
 
 const gestion = { esGestion: true, esProfesor: false };
 const profe = { esGestion: false, esProfesor: true };
@@ -49,6 +49,25 @@ describe("decidirCobro — profesor", () => {
   test("no cobra reservas ni cuota social, aunque diga que es 'suya'", () => {
     expect(decidirCobro(profe, cuota({ concept: "Reserva" }), undefined)).toMatchObject({ ok: false, status: 403 });
     expect(decidirCobro(profe, cuota({ concept: "Socio" }), undefined)).toMatchObject({ ok: false, status: 403 });
+  });
+});
+
+describe("métodos manuales y EnRevision", () => {
+  test("la gestión acepta los cuatro métodos manuales", () => {
+    expect([...METODOS_MANUALES]).toEqual(["Efectivo", "Transferencia", "MPFueraDeApp", "TarjetaConPosnet"]);
+    for (const m of METODOS_MANUALES) {
+      expect(decidirCobro(gestion, cuota(), m)).toEqual({ ok: true, method: m });
+    }
+  });
+
+  test("el profesor rechaza cualquier método que no sea Efectivo", () => {
+    for (const m of ["Transferencia", "MPFueraDeApp", "TarjetaConPosnet"] as const) {
+      expect(decidirCobro(profe, cuota(), m)).toMatchObject({ ok: false, status: 403 });
+    }
+  });
+
+  test("el profesor no cobra una fila EnRevision", () => {
+    expect(decidirCobro(profe, cuota({ status: "EnRevision" }), undefined)).toMatchObject({ ok: false, status: 403 });
   });
 });
 

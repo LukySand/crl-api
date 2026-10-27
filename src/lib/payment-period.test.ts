@@ -15,6 +15,7 @@ import {
   periodoActual,
   periodoDe,
   periodoSiguiente,
+  periodosDesdeElMesSiguiente,
   rangoBuckets,
   vencimientoDe,
   ventanaPorDefecto,
@@ -261,4 +262,16 @@ test("el día de vencimiento es un parámetro y cae en el último día si el mes
   expect(vencimientoDe("2026-02", 28).toISOString().slice(0, 10)).toBe("2026-02-28");
   // Un valor mayor que el mes cae en su último día en vez de pasarse al siguiente.
   expect(vencimientoDe("2026-02", 31).toISOString().slice(0, 10)).toBe("2026-02-28");
+});
+
+test("la baja no toca el mes de la baja, en formato mensual ni diario (D21)", () => {
+  const { gte } = periodosDesdeElMesSiguiente(new Date("2026-10-20T12:00:00Z"));
+  expect(gte).toBe("2026-11");
+  // Comparación lexicográfica, igual que en la base.
+  for (const fuera of ["2026-10", "2026-10-15"]) expect(fuera >= gte).toBe(false);
+  for (const dentro of ["2026-11", "2026-11-03"]) expect(dentro >= gte).toBe(true);
+});
+
+test("la baja de diciembre salta a enero del año siguiente", () => {
+  expect(periodosDesdeElMesSiguiente(new Date("2026-12-31T12:00:00Z")).gte).toBe("2027-01");
 });

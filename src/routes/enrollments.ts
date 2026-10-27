@@ -3,7 +3,9 @@ import { z } from "zod";
 import prisma from "../lib/prisma";
 import { requireAuth, isAdmin, hasRole, veComoGestion } from "../lib/auth";
 import { nombresDeRoles, rolesInclude } from "../lib/roles";
-import { periodoDe } from "../lib/payment-period";
+import { emitirCargos } from "../lib/emission";
+import { logger } from "../lib/logger";
+import { periodosDesdeElMesSiguiente } from "../lib/payment-period";
 import { todayInClub } from "../lib/booking-date";
 import { armarListaInscriptos, slugDe } from "../lib/enrollment-export";
 import { aPdf, aXlsx, fechaHoraClub } from "../lib/report-export";
@@ -251,6 +253,9 @@ enrollmentsRouter.post("/", async (req: Request, res: Response) => {
       data: { user_id: targetId, discipline_id },
       include: enrollmentInclude,
     });
+    // Se cobra en el acto la cuota del ciclo vigente (D5). Si falla no se pierde
+    // la inscripción: el cron diario la repone.
+    await emitirCargos({ userId: targetId }).catch((e) => logger.error(e, "Emisión al inscribir falló"));
     return res.status(201).json({ success: true, enrollment: serialize(enrollment) });
   } catch (error: any) {
     if (error?.code === "P2002") {
@@ -304,7 +309,7 @@ enrollmentsRouter.delete("/:id", async (req: Request<{ id: string }>, res: Respo
         where: {
           enrollment_id: id,
           status: { in: ["Pendiente", "EnRevision"] },
-          period: { gt: periodoDe(baja) },
+          period: periodosDesdeElMesSiguiente(baja),
         },
         data: { status: "Anulado" },
       });
