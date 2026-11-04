@@ -3,7 +3,9 @@ import { z } from "zod";
 import prisma from "../lib/prisma";
 import { requireAuth, requireAdmin, readToken } from "../lib/auth";
 import { esGestion } from "../lib/roles";
-import { parseDate, todayInClub } from "../lib/booking-date";
+import { nowTimeInClub, parseDate, timeToHHMM, todayInClub } from "../lib/booking-date";
+import { normalizarBloqueo } from "../lib/schedule-block-db";
+import { calcularOcupacion } from "../lib/occupancy";
 
 export const placesRouter = Router();
 
@@ -51,6 +53,97 @@ placesRouter.get("/", async (req: Request, res: Response) => {
   } catch (error) {
     console.error("List places error:", error);
     return res.status(500).json({ success: false, error: "Error al listar espacios" });
+  }
+});
+
+/**
+ * GET /api/places/occupancy?date=YYYY-MM-DD — ocupación de cada espacio en un
+ * día (hoy si no viene `date`), para la gestión (#44).
+ *
+ * Por espacio: cuántos turnos hay, cuántos están reservados, tomados por una
+ * clase o cerrados por un bloqueo, y el detalle de cada turno (con quién
+ * reservó: la ruta es sólo de gestión). Si el día es hoy, además el turno en
+ * curso. La cuenta vive en `lib/occupancy.ts`.
+ *
+ * Pocas consultas para todos los espacios, no una por espacio: la pantalla de
+ * Espacios la repite cada 15 s y un N+1 acá se nota.
+ *
+ * Va antes de "/:id" a propósito: Express matchea por orden y si no tomaría
+ * "occupancy" como un id — mismo caso que /api/bookings/availability.
+ *
+ * ponytail: esta ruta ya había existido (commit ab1d896) y se perdió en un merge;
+ * el front la siguió llamando y caía en "/:id" → 400.
+ */
+placesRouter.get("/occupancy", requireAuth, requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const hoy = todayInClub();
+    const { date } = req.query;
+    if (date !== undefined && (typeof date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(date))) {
+      return res.status(400).json({ success: false, error: "La fecha debe ser YYYY-MM-DD" });
+    }
+    const fecha = (date as string | undefined) ?? hoy;
+    const dia = parseDate(fecha);
+    if (Number.isNaN(dia.getTime())) {
+      return res.status(400).json({ success: false, error: "Fecha inválida" });
+    }
+    const dayOfWeek = dia.getUTCDay();
+    const ahora = fecha === hoy ? nowTimeInClub() : null;
+
+    const [turnos, reservas, clases, bloqueos] = await Promise.all([
+      prisma.schedule.findMany({
+        where: { day_of_week: dayOfWeek },
+        select: { id: true, place_id: true, start_time: true, end_time: true },
+      }),
+      prisma.booking.findMany({
+        // active: true deja afuera las canceladas, que liberan el turno.
+        where: { date: dia, active: true },
+        select: {
+          id: true,
+          schedule_id: true,
+          status: true,
+          user: { select: { name: true, last_name: true } },
+        },
+      }),
+      prisma.disciplineSchedule.findMany({
+        where: { day_of_week: dayOfWeek, discipline: { active: true, place_id: { not: null } } },
+        select: {
+          start_time: true,
+          end_time: true,
+          discipline: { select: { name: true, place_id: true } },
+        },
+      }),
+      prisma.scheduleBlock.findMany({
+        where: { date_from: { lte: dia }, date_to: { gte: dia } },
+        orderBy: { id: "asc" },
+      }),
+    ]);
+
+    const occupancy = calcularOcupacion(fecha, ahora, {
+      turnos: turnos.map((t) => ({
+        id: t.id,
+        place_id: t.place_id,
+        start: timeToHHMM(t.start_time),
+        end: timeToHHMM(t.end_time),
+      })),
+      reservas: reservas.map((r) => ({
+        id: r.id,
+        schedule_id: r.schedule_id,
+        status: r.status,
+        socio: `${r.user.name} ${r.user.last_name}`,
+      })),
+      clases: clases.map((c) => ({
+        place_id: c.discipline.place_id!,
+        disciplina: c.discipline.name,
+        start: timeToHHMM(c.start_time),
+        end: timeToHHMM(c.end_time),
+      })),
+      bloqueos: bloqueos.map((b) => ({ ...normalizarBloqueo(b), place_id: b.place_id })),
+    });
+
+    return res.json({ success: true, date: fecha, now: ahora, occupancy });
+  } catch (error) {
+    console.error("Occupancy error:", error);
+    return res.status(500).json({ success: false, error: "Error al calcular la ocupación" });
   }
 });
 

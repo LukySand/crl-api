@@ -244,6 +244,12 @@ lunes 21 por mantenimiento". Modelo `ScheduleBlock`; la lógica pura vive en `li
 | POST | `/api/blocks` | gestión | `{place_id, from, to?, start_time?, end_time?, reason}`. Sin `to` es un día; sin franja, todo el día. **409 con `conflictos` si ya hay reservas vivas en ese rango**: no las cancela solo |
 | DELETE | `/api/blocks/:id` | gestión | Lo levanta: el espacio vuelve a poder reservarse |
 
+`GET /api/places/occupancy?date=` (gestión; sin `date` es hoy) cruza turnos, reservas, clases y
+bloqueos de **todos** los espacios en un día: por espacio, los contadores (`reservados`, `clases`,
+`bloqueados`, `ocupados`), el turno en curso si es hoy y `turnos: [{id, start, end, motivo, detalle,
+reserva}]`. Prioridad: bloqueo > reserva > clase. Lógica pura en `lib/occupancy.ts`. La usan las
+tarjetas de Espacios y la grilla hora × espacio del front (#44).
+
 `POST /api/bookings` responde 409 si el turno está bloqueado ese día (también para la gestión), y
 `GET /api/bookings/availability` suma `slots: [{id, ocupado, motivo: "reserva"|"bloqueo", detalle}]`,
 con el motivo del bloqueo en `detalle`. `taken` sigue siendo la lista plana e incluye los bloqueados.
